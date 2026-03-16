@@ -11,7 +11,7 @@ from lexer import tokenize, LexError
 from parser import parse, ParseError
 from syntax import *
 from pisa import *
-from codegen import compile_program, CodeGen, CodeGenError
+from codegen import compile_program, CodeGen, CodeGenError, peephole, remove_nops, program_stats
 
 
 class TestLexer(unittest.TestCase):
@@ -1498,6 +1498,286 @@ procedure main
         code = self._e2e(src)
         exchs = [li.instr for li in code if isinstance(li.instr, EXCH)]
         self.assertGreaterEqual(len(exchs), 2)
+
+
+class TestPeephole(unittest.TestCase):
+    """Unit tests for the peephole XORI-pair cancellation pass."""
+
+    def _li(self, instr, label=None):
+        return LabeledInstr(label, instr)
+
+    # --- Basic cancellation ---
+
+    def test_two_xori_same_reg_same_const_removed(self):
+        code = [self._li(XORI("r3", 1)), self._li(XORI("r3", 1))]
+        result = peephole(code)
+        self.assertEqual(result, [])
+
+    def test_single_xori_kept(self):
+        code = [self._li(XORI("r3", 1))]
+        result = peephole(code)
+        self.assertEqual(len(result), 1)
+
+    def test_xori_different_regs_kept(self):
+        code = [self._li(XORI("r3", 1)), self._li(XORI("r4", 1))]
+        result = peephole(code)
+        self.assertEqual(len(result), 2)
+
+    def test_xori_different_constants_kept(self):
+        code = [self._li(XORI("r3", 1)), self._li(XORI("r3", 2))]
+        result = peephole(code)
+        self.assertEqual(len(result), 2)
+
+    def test_xori_pair_with_intervening_instr_kept(self):
+        code = [
+            self._li(XORI("r3", 1)),
+            self._li(ADDI("r4", 1)),
+            self._li(XORI("r3", 1)),
+        ]
+        result = peephole(code)
+        self.assertEqual(len(result), 3)
+
+    # --- Label handling ---
+
+    def test_second_xori_labeled_pair_kept(self):
+        """If the second XORI has a label, the pair cannot be removed."""
+        code = [
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1), label="L1"),
+        ]
+        result = peephole(code)
+        self.assertEqual(len(result), 2)
+
+    def test_first_xori_labeled_label_forwarded(self):
+        """First XORI's label must be moved to the instruction after the pair."""
+        code = [
+            self._li(XORI("r3", 1), label="entry"),
+            self._li(XORI("r3", 1)),
+            self._li(BRA("target")),
+        ]
+        result = peephole(code)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].label, "entry")
+        self.assertIsInstance(result[0].instr, BRA)
+
+    def test_first_xori_labeled_no_successor(self):
+        """First XORI's label with no successor after pair: label is dropped safely."""
+        code = [
+            self._li(XORI("r3", 1), label="entry"),
+            self._li(XORI("r3", 1)),
+        ]
+        result = peephole(code)
+        self.assertEqual(result, [])
+
+    # --- Multiple pairs ---
+
+    def test_four_consecutive_xori_all_removed(self):
+        code = [
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1)),
+        ]
+        result = peephole(code)
+        self.assertEqual(result, [])
+
+    def test_two_separate_pairs_both_removed(self):
+        code = [
+            self._li(ADDI("r4", 5)),
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1)),
+            self._li(ADDI("r4", 3)),
+            self._li(XORI("r5", 1)),
+            self._li(XORI("r5", 1)),
+        ]
+        result = peephole(code)
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0].instr, ADDI)
+        self.assertIsInstance(result[1].instr, ADDI)
+
+    def test_surrounding_instructions_preserved(self):
+        code = [
+            self._li(BRA("foo")),
+            self._li(XORI("r3", 1)),
+            self._li(XORI("r3", 1)),
+            self._li(BEQ("r3", "r0", "bar")),
+        ]
+        result = peephole(code)
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0].instr, BRA)
+        self.assertIsInstance(result[1].instr, BEQ)
+
+    def test_empty_list(self):
+        self.assertEqual(peephole([]), [])
+
+    # --- Integration: if with skip then-body produces fewer instructions ---
+
+    def test_if_skip_then_has_no_xori_pair(self):
+        """compile_program applies peephole; if-skip-then produces no consecutive XORIs."""
+        src = "int x\nprocedure main\n  if x = 0 then skip else x += 1 fi x = 0"
+        code = compile_program(parse(tokenize(src)))
+        instrs = [li.instr for li in code]
+        for i in range(len(instrs) - 1):
+            if isinstance(instrs[i], XORI) and isinstance(instrs[i + 1], XORI):
+                if (instrs[i].rd == instrs[i + 1].rd
+                        and instrs[i].c == instrs[i + 1].c
+                        and code[i + 1].label is None):
+                    self.fail(f"Consecutive XORI pair found at positions {i},{i+1}")
+
+    def test_if_skip_then_fewer_instrs_than_raw(self):
+        """After peephole, an if with skip body is shorter than without it."""
+        src = "int x\nprocedure main\n  if x = 0 then skip else x += 1 fi x = 0"
+        prog = parse(tokenize(src))
+        from codegen import CodeGen
+        cg = CodeGen()
+        raw = cg.gen_program(prog)
+        optimized = compile_program(prog)
+        self.assertLess(len(optimized), len(raw))
+
+
+class TestRemoveNops(unittest.TestCase):
+    """Unit tests for the NOP-removal pass."""
+
+    def _li(self, instr, label=None):
+        return LabeledInstr(label, instr)
+
+    # --- Unlabeled NOPs dropped ---
+
+    def test_addi_zero_unlabeled_removed(self):
+        code = [self._li(ADDI("r0", 0)), self._li(BRA("foo"))]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0].instr, BRA)
+
+    def test_subi_zero_unlabeled_removed(self):
+        code = [self._li(SUBI("r5", 0)), self._li(ADDI("r5", 1))]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+
+    def test_xori_zero_unlabeled_removed(self):
+        code = [self._li(XORI("r3", 0)), self._li(BRA("L1"))]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+
+    def test_nonzero_addi_kept(self):
+        code = [self._li(ADDI("r3", 1)), self._li(BRA("L1"))]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 2)
+
+    # --- Labeled NOPs: label forwarded ---
+
+    def test_labeled_nop_label_forwarded_to_next(self):
+        code = [
+            self._li(ADDI("r0", 0), label="entry"),
+            self._li(BRA("target")),
+        ]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].label, "entry")
+        self.assertIsInstance(result[0].instr, BRA)
+
+    def test_labeled_nop_at_end_kept(self):
+        """NOP at end of program can't be removed (no successor to carry label)."""
+        code = [self._li(ADDI("r0", 0), label="finish")]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+
+    def test_branch_to_nop_retargeted(self):
+        """Branch targets pointing at removed NOPs are rewritten to successor label."""
+        code = [
+            self._li(BRA("nop_label")),
+            self._li(ADDI("r0", 0), label="nop_label"),
+            self._li(BRA("real"), label="real"),
+        ]
+        result = remove_nops(code)
+        # The BRA should now point to "real"
+        bra = result[0].instr
+        self.assertIsInstance(bra, BRA)
+        self.assertEqual(bra.label, "real")
+
+    def test_multiple_unlabeled_nops_all_removed(self):
+        code = [
+            self._li(ADDI("r0", 0)),
+            self._li(SUBI("r0", 0)),
+            self._li(XORI("r0", 0)),
+            self._li(BRA("end")),
+        ]
+        result = remove_nops(code)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0].instr, BRA)
+
+    def test_empty_list(self):
+        self.assertEqual(remove_nops([]), [])
+
+    # --- Integration ---
+
+    def test_compile_program_no_zero_addi(self):
+        """compile_program output should contain no unlabeled ADDI r0 0 instructions."""
+        src = "int x\nprocedure main\n  x += 1"
+        code = compile_program(parse(tokenize(src)))
+        for li in code:
+            if (isinstance(li.instr, ADDI)
+                    and li.instr.rd == "r0"
+                    and li.instr.c == 0
+                    and li.label is None):
+                self.fail(f"Unlabeled ADDI r0 0 found in compiled output")
+
+
+class TestProgramStats(unittest.TestCase):
+    """Unit tests for program_stats()."""
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def test_data_words_count(self):
+        src = "int x\nint y\nprocedure main\n  skip"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertEqual(stats["data_words"], 2)
+
+    def test_data_words_array(self):
+        src = "int a[4]\nprocedure main\n  skip"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertEqual(stats["data_words"], 4)
+
+    def test_code_instructions_positive(self):
+        src = "int x\nprocedure main\n  x += 1"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertGreater(stats["code_instructions"], 0)
+
+    def test_labeled_instructions_positive(self):
+        src = "int x\nprocedure main\n  x += 1"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertGreater(stats["labeled_instructions"], 0)
+
+    def test_registers_used_positive(self):
+        src = "int x\nprocedure main\n  x += 1"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertGreater(stats["registers_used"], 0)
+
+    def test_total_is_sum(self):
+        src = "int x\nprocedure main\n  x += 1"
+        code = self._compile(src)
+        stats = program_stats(code)
+        self.assertEqual(stats["total"], len(code))
+
+    def test_if_program_has_more_instrs_than_skip(self):
+        src_skip = "int x\nprocedure main\n  skip"
+        src_if = "int x\nprocedure main\n  if x = 0 then x += 1 else skip fi x != 0"
+        stats_skip = program_stats(self._compile(src_skip))
+        stats_if = program_stats(self._compile(src_if))
+        self.assertGreater(stats_if["code_instructions"], stats_skip["code_instructions"])
+
+    def test_more_vars_means_more_data_words(self):
+        src1 = "int x\nprocedure main\n  skip"
+        src3 = "int x\nint y\nint z\nprocedure main\n  skip"
+        s1 = program_stats(self._compile(src1))
+        s3 = program_stats(self._compile(src3))
+        self.assertEqual(s3["data_words"] - s1["data_words"], 2)
 
 
 if __name__ == "__main__":

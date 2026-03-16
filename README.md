@@ -20,7 +20,7 @@ Program inversion follows the rules from:
 - PISA interpreter with Pendulum branch semantics and software call stack
 - Program inverter: given P, produces P⁻¹ (the semantic inverse) at the AST level
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
-- 219 tests (all passing)
+- 283 tests (all passing)
 
 ## Requirements
 
