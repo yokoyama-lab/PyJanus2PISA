@@ -34,6 +34,9 @@ class CodeGen:
         self._var_sizes: Dict[str, int] = {}    # variable name → size
         self._total_vars = 0
         self._proc_names: List[str] = []
+        # Procedures to be inlined.  Value is (ProcDecl, can_uncall).
+        # can_uncall=True means the body is branch-free and safe to reverse.
+        self._inline_procs: Dict[str, Tuple['ProcDecl', bool]] = {}
 
     def fresh_label(self, prefix: str = "L") -> str:
         self._label_counter += 1
@@ -773,11 +776,24 @@ class CodeGen:
         return code
 
     def _gen_call(self, stmt: Call) -> List[LabeledInstr]:
-        """Generate procedure call (Fig. 5): BRA f."""
+        """Generate procedure call (Fig. 5): BRA f, or inline the body."""
+        if stmt.proc in self._inline_procs:
+            proc, _can_uncall = self._inline_procs[stmt.proc]
+            return self.gen_stmt(proc.body)
         return [self._emit(BRA(stmt.proc))]
 
     def _gen_uncall(self, stmt: Uncall) -> List[LabeledInstr]:
-        """Generate procedure uncall (Fig. 5): RBRA f."""
+        """Generate procedure uncall (Fig. 5): RBRA f, or inline the body.
+
+        Note: in this interpreter RBRA executes the procedure body forward
+        (via software call stack), so inlining simply emits gen_stmt(body).
+        The semantic inverse is already captured at the Janus level by
+        invert_program(), which inverts every procedure body.
+        """
+        if stmt.proc in self._inline_procs:
+            proc, can_uncall = self._inline_procs[stmt.proc]
+            if can_uncall:
+                return self.gen_stmt(proc.body)
         return [self._emit(RBRA(stmt.proc))]
 
     def _gen_if(self, stmt: If) -> List[LabeledInstr]:
@@ -1023,10 +1039,39 @@ class CodeGen:
         call_depth = _compute_call_depth(prog)
         stack_offset = offset + max(call_depth * 2, 4)
 
-        # 2. Procedure code (skip unreachable procedures)
+        # 2. Identify inlinable procedures before generating any code.
+        #
+        #    A procedure f is inlinable when the call overhead (9 instructions
+        #    for f_top/f_bot + prologue) can be eliminated:
+        #      - call-only inline:  call_count ≤ 1 AND uncall_count == 0
+        #        (body may contain any statements; no reversal needed)
+        #      - full inline:       call_count ≤ 1 AND uncall_count ≤ 1
+        #                           AND body is branch-free (safe to reverse)
+        #
+        #    main is never inlined (it is the entry point).
         reachable = _reachable_procs(prog)
+        total_call_counts: Dict[str, Tuple[int, int]] = {}
         for proc in prog.procs:
-            if proc.name in reachable:
+            for name, (c, u) in _count_all_calls(proc.body).items():
+                tc, tu = total_call_counts.get(name, (0, 0))
+                total_call_counts[name] = (tc + c, tu + u)
+
+        proc_map = {p.name: p for p in prog.procs}
+        for name in reachable:
+            if name == prog.main_proc or name not in proc_map:
+                continue
+            proc = proc_map[name]
+            c, u = total_call_counts.get(name, (0, 0))
+            if c <= 1 and u == 0:
+                # Call-only inline: body executed forward only.
+                self._inline_procs[name] = (proc, False)
+            elif c <= 1 and u <= 1 and _is_simple_for_inline(proc.body):
+                # Full inline: body executed forward for both call and uncall.
+                self._inline_procs[name] = (proc, True)
+
+        # 3. Procedure code (skip dead and inlined procedures)
+        for proc in prog.procs:
+            if proc.name in reachable and proc.name not in self._inline_procs:
                 proc_code = self.gen_proc(proc)
                 code.extend(proc_code)
 
@@ -1143,6 +1188,49 @@ def _reachable_procs(prog: Program) -> set:
 
     visit(prog.main_proc)
     return reachable
+
+
+def _count_all_calls(stmt) -> Dict[str, Tuple[int, int]]:
+    """Return {proc: (call_count, uncall_count)} for every Call/Uncall in stmt."""
+    counts: Dict[str, Tuple[int, int]] = {}
+
+    def merge(name: str, dc: int, du: int) -> None:
+        c, u = counts.get(name, (0, 0))
+        counts[name] = (c + dc, u + du)
+
+    def visit(s) -> None:
+        from syntax import Call, Uncall, Seq, If, From
+        if isinstance(s, Call):
+            merge(s.proc, 1, 0)
+        elif isinstance(s, Uncall):
+            merge(s.proc, 0, 1)
+        elif isinstance(s, Seq):
+            for sub in s.stmts:
+                visit(sub)
+        elif isinstance(s, If):
+            visit(s.then_)
+            visit(s.else_)
+        elif isinstance(s, From):
+            visit(s.do_)
+            visit(s.loop_)
+
+    visit(stmt)
+    return counts
+
+
+def _is_simple_for_inline(stmt) -> bool:
+    """Return True if stmt contains no control flow or calls.
+
+    A 'simple' body contains only Skip, AssignVar, AssignArr, Swap, Print
+    (and Seq thereof).  Safe to inline for both call and uncall because
+    only linear data instructions are generated (no branch labels).
+    """
+    from syntax import Skip, AssignVar, AssignArr, Swap, Print, Seq
+    if isinstance(stmt, (Skip, AssignVar, AssignArr, Swap, Print)):
+        return True
+    if isinstance(stmt, Seq):
+        return all(_is_simple_for_inline(s) for s in stmt.stmts)
+    return False  # If, From, Call, Uncall → not safe to reverse naively
 
 
 def _compute_call_depth(prog: Program) -> int:

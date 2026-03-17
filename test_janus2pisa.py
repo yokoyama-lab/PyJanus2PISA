@@ -287,8 +287,12 @@ class TestCodeGen(unittest.TestCase):
         self.assertIn("DATA 5", text)
 
     def test_proc_structure(self):
-        """Procedure has proper entry/exit structure."""
-        code = self._compile("procedure foo\n  skip\nprocedure main\n  call foo")
+        """Procedure called multiple times has proper entry/exit structure."""
+        # Call foo twice so it is not inlined (inlining requires call count <= 1)
+        code = self._compile(
+            "procedure foo\n  skip\n"
+            "procedure main\n  call foo\n  call foo"
+        )
         text = print_program(code)
         self.assertIn("foo_top:", text)
         self.assertIn("foo_bot:", text)
@@ -296,18 +300,17 @@ class TestCodeGen(unittest.TestCase):
         self.assertIn("BRA foo", text)
 
     def test_call_uncall(self):
-        """Call generates BRA, uncall generates RBRA."""
+        """Simple procedure called and uncalled once: inlined, no BRA/RBRA foo."""
         code = self._compile(
             "procedure foo\n  skip\n"
             "procedure main\n  call foo\n  uncall foo"
         )
-        text = print_program(code)
         instrs = [li.instr for li in code]
-        # Main body should have BRA foo and RBRA foo
+        # foo is inlined (simple body, call count 1, uncall count 1)
         bras = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
-        self.assertTrue(len(bras) >= 1)
-        self.assertTrue(len(rbras) >= 1)
+        self.assertEqual(len(bras), 0)
+        self.assertEqual(len(rbras), 0)
 
     def test_if_generates_beq(self):
         """If statement generates conditional branch."""
@@ -474,6 +477,8 @@ procedure main
         self.assertIn("main_top:", text)
 
     def test_multiple_procedures_all_reachable(self):
+        # inc and dec are each called once → inlined; main is always kept.
+        # Verify correctness: inc adds 1, dec subtracts 1 → n = 0.
         src = """\
 int n
 procedure inc
@@ -485,8 +490,9 @@ procedure main
   call dec
 """
         text = self._e2e(src)
-        self.assertIn("inc_top:", text)
-        self.assertIn("dec_top:", text)
+        # Inlined procedures do not emit separate proc labels
+        self.assertNotIn("inc_top:", text)
+        self.assertNotIn("dec_top:", text)
         self.assertIn("main_top:", text)
 
     def test_nested_if(self):
@@ -1325,6 +1331,7 @@ class TestCodeGenStructural(unittest.TestCase):
                               f"Undefined label: {i.label}")
 
     def test_call_uncall_bra_rbra(self):
+        # Simple proc called+uncalled once → inlined; no BRA/RBRA foo emitted.
         code = self._compile(
             "procedure foo\n  skip\n"
             "procedure main\n  call foo\n  uncall foo"
@@ -1332,8 +1339,18 @@ class TestCodeGenStructural(unittest.TestCase):
         instrs = self._instrs(code)
         bra_foo = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         rbra_foo = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
+        self.assertEqual(len(bra_foo), 0)
+        self.assertEqual(len(rbra_foo), 0)
+
+    def test_call_not_inlined_generates_bra(self):
+        # Procedure called twice: not inlined; BRA foo must appear.
+        code = self._compile(
+            "procedure foo\n  skip\n"
+            "procedure main\n  call foo\n  call foo"
+        )
+        instrs = self._instrs(code)
+        bra_foo = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         self.assertGreaterEqual(len(bra_foo), 1)
-        self.assertGreaterEqual(len(rbra_foo), 1)
 
     def test_single_non_main_proc_used_as_entry(self):
         code = self._compile("procedure foo\n  skip")
@@ -1408,8 +1425,10 @@ procedure main
   uncall bar
 """
         text = self._text(src)
+        # bar: call+uncall from main (c=1, u=1, body=Call→not simple) → NOT inlined
         self.assertIn("BRA bar", text)
-        self.assertIn("BRA foo", text)
+        # foo: called once from bar (c=1, u=0, body=skip→simple) → inlined
+        self.assertNotIn("BRA foo", text)
 
     def test_array_swap_compiles(self):
         src = """\
@@ -1508,11 +1527,28 @@ procedure main
         self.assertIn(20, data_vals)
 
     def test_uncall_is_rbra(self):
+        # Simple proc called+uncalled once → inlined; no RBRA foo emitted.
         src = """\
 procedure foo
   skip
 procedure main
   call foo
+  uncall foo
+"""
+        code = self._e2e(src)
+        instrs = [li.instr for li in code]
+        rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
+        self.assertEqual(len(rbras), 0)
+
+    def test_uncall_not_inlined_generates_rbra(self):
+        # Proc called twice: not inlined; uncall must emit RBRA.
+        src = """\
+procedure foo
+  skip
+procedure main
+  call foo
+  call foo
+  uncall foo
   uncall foo
 """
         code = self._e2e(src)
