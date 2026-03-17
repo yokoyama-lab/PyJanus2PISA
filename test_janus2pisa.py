@@ -468,6 +468,23 @@ procedure main
   uncall inc
 """
         text = self._e2e(src)
+        # inc and main are reachable from main; dec is dead and must be eliminated
+        self.assertIn("inc_top:", text)
+        self.assertNotIn("dec_top:", text)   # dead procedure removed
+        self.assertIn("main_top:", text)
+
+    def test_multiple_procedures_all_reachable(self):
+        src = """\
+int n
+procedure inc
+  n += 1
+procedure dec
+  n -= 1
+procedure main
+  call inc
+  call dec
+"""
+        text = self._e2e(src)
         self.assertIn("inc_top:", text)
         self.assertIn("dec_top:", text)
         self.assertIn("main_top:", text)
@@ -1113,13 +1130,23 @@ class TestCodeGenStatements(unittest.TestCase):
 
     def test_seq_combines_stmts(self):
         cg = self._cg(['x'])
+        # Constant RHS: optimizer uses ADDI/SUBI directly (no ADD/SUB needed)
         code = cg.gen_stmt(Seq([
             AssignVar('x', '+=', Const(1)),
             AssignVar('x', '-=', Const(1)),
         ]))
         types = self._itypes(code)
-        self.assertIn("ADD", types)
-        self.assertIn("SUB", types)
+        self.assertIn("ADDI", types)
+        self.assertIn("SUBI", types)
+        # Variable RHS: ADD/SUB are used
+        cg2 = self._cg(['x', 'y'])
+        code2 = cg2.gen_stmt(Seq([
+            AssignVar('x', '+=', Var('y')),
+            AssignVar('x', '-=', Var('y')),
+        ]))
+        types2 = self._itypes(code2)
+        self.assertIn("ADD", types2)
+        self.assertIn("SUB", types2)
 
     def test_if_generates_beq_and_bne(self):
         cg = self._cg(['x'])

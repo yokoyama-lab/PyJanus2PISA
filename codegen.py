@@ -377,6 +377,31 @@ class CodeGen:
         """Generate code for x ⊕= e (Fig. 6)."""
         offset = self._var_offset(stmt.var)
 
+        # Fast path: constant RHS avoids a register and two instructions.
+        # x += k  →  EXCH rd ra; ADDI rd k; EXCH rd ra  (no re needed)
+        if isinstance(stmt.expr, Const):
+            k = stmt.expr.value
+            ra = self.reg.alloc()
+            rd = self.reg.alloc()
+            code = []
+            code.append(self._emit(ADDI(ra, offset)))
+            code.append(self._emit(EXCH(rd, ra)))
+            if k != 0:
+                if stmt.op == '+=':
+                    code.append(self._emit(ADDI(rd, k)))
+                elif stmt.op == '-=':
+                    code.append(self._emit(SUBI(rd, k)))
+                elif stmt.op == '^=':
+                    code.append(self._emit(XORI(rd, k)))
+                else:
+                    raise CodeGenError(f"Unknown assign op: {stmt.op}")
+            code.append(self._emit(EXCH(rd, ra)))
+            code.append(self._emit(SUBI(ra, offset)))
+            self.reg.free_reg(ra)
+            self.reg.free_reg(rd)
+            return code
+
+        # General path: evaluate e → re, apply, unevaluate.
         # 1. Evaluate e → re
         eval_code, re = self.gen_expr(stmt.expr)
 
@@ -458,13 +483,78 @@ class CodeGen:
         """Unevaluate binary operation.
 
         We re-evaluate the operands, undo the operation, then unevaluate operands.
+        For arithmetic ops (+, -, ^) with a constant operand, we skip the register
+        load/unload and use an immediate instruction directly (saves 2 instructions).
         """
-        # Re-evaluate left and right to get their values
+        op = expr.op
+
+        # Fast path for arithmetic with constant operand(s).
+        # Avoids allocating a register and two instructions per const operand.
+        if op in ('+', '-', '^'):
+            left_is_const = isinstance(expr.left, Const)
+            right_is_const = isinstance(expr.right, Const)
+
+            if left_is_const or right_is_const:
+                code = []
+                # Load the non-const side (if any) into a register
+                if not left_is_const:
+                    left_code, rl = self.gen_expr(expr.left)
+                    code.extend(left_code)
+                else:
+                    rl = None
+                if not right_is_const:
+                    right_code, rr = self.gen_expr(expr.right)
+                    code.extend(right_code)
+                else:
+                    rr = None
+
+                kl = expr.left.value  if left_is_const  else None
+                kr = expr.right.value if right_is_const else None
+
+                # Undo: result = left op right  →  result -= right, result -= left  (for +)
+                if op == '+':
+                    # result -= right
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(SUBI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rr)))
+                    # result -= left
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rl)))
+                elif op == '-':
+                    # result = left - right  →  result += right; result -= left
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(ADDI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(ADD(result_reg, rr)))
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rl)))
+                elif op == '^':
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(XORI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(XOR(result_reg, rr)))
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(XORI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(XOR(result_reg, rl)))
+
+                # Unevaluate non-const operands
+                if rr is not None:
+                    code.extend(self._gen_uneval_expr(expr.right, rr))
+                if rl is not None:
+                    code.extend(self._gen_uneval_expr(expr.left, rl))
+                self.reg.free_reg(result_reg)
+                return code
+
+        # General path: re-evaluate left and right to get their values
         left_code, rl = self.gen_expr(expr.left)
         right_code, rr = self.gen_expr(expr.right)
         code = list(left_code) + list(right_code)
-
-        op = expr.op
 
         # Undo the operation on result_reg
         if op == '+':
@@ -814,7 +904,7 @@ class CodeGen:
         code.extend(uneval_entry)
         code.extend(self._clear_garbage())
         # rt should be nonzero (assertion holds)
-        code.append(self._emit(XORI(rt, 1)))  # clear rt (assuming boolean)
+        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
 
         # entry_do label: start of do body
         code_do = self.gen_stmt(stmt.do_)
@@ -839,7 +929,7 @@ class CodeGen:
 
         # Branch on result
         code.append(self._emit(BEQ(rt, "r0", loop_body)))
-        code.append(self._emit(XORI(rt, 1)))
+        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
         code.append(self._emit(BRA(exit_label)))
 
         # --- Loop body ---
@@ -857,7 +947,7 @@ class CodeGen:
         loop_code.extend(self._clear_garbage())
         # rt = 1 ^ eval(e1). Since e1 is false on re-entry, eval(e1)=0 → rt=1.
         # Flip rt back to 0 so the invariant rt=0 at from_test is maintained.
-        loop_code.append(self._emit(XORI(rt, 1)))
+        loop_code.append(self._emit(XOR(rt, rt)))  # clear rt (safe for non-boolean)
 
         loop_code.append(self._emit(BRA(entry_do)))
         code.extend(loop_code)
@@ -933,10 +1023,12 @@ class CodeGen:
         call_depth = _compute_call_depth(prog)
         stack_offset = offset + max(call_depth * 2, 4)
 
-        # 2. Procedure code
+        # 2. Procedure code (skip unreachable procedures)
+        reachable = _reachable_procs(prog)
         for proc in prog.procs:
-            proc_code = self.gen_proc(proc)
-            code.extend(proc_code)
+            if proc.name in reachable:
+                proc_code = self.gen_proc(proc)
+                code.extend(proc_code)
 
         # 3. Entry/exit
         code.append(self._emit(START(), "start"))
@@ -949,31 +1041,57 @@ class CodeGen:
         return code
 
 
-def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
-    """Remove pairs of consecutive XORI rd c that cancel each other.
+def _cancels(a: Instr, b: Instr) -> bool:
+    """Return True if instructions a and b are mutual inverses and cancel.
 
-    Two consecutive XORI rd c instructions with no label on the second one
-    are mutual inverses and can both be dropped.
+    Pairs detected:
+      XORI rd c  ; XORI rd c    (XOR with same constant, self-inverse)
+      ADDI rd c  ; SUBI rd c    (add then subtract same constant)
+      SUBI rd c  ; ADDI rd c    (subtract then add same constant)
+      ADD  rd rs ; SUB  rd rs   (add then subtract same register)
+      SUB  rd rs ; ADD  rd rs   (subtract then add same register)
+      XOR  rd rs ; XOR  rd rs   (XOR same register, self-inverse)
+      NEG  rd    ; NEG  rd      (negate twice)
+    """
+    if isinstance(a, XORI) and isinstance(b, XORI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, ADDI) and isinstance(b, SUBI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, SUBI) and isinstance(b, ADDI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, ADD) and isinstance(b, SUB):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, SUB) and isinstance(b, ADD):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, XOR) and isinstance(b, XOR):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, NEG) and isinstance(b, NEG):
+        return a.rd == b.rd
+    return False
+
+
+def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Remove adjacent cancelling instruction pairs.
+
+    Two consecutive instructions that are mutual inverses with no label on
+    the second one are both dropped.  The first instruction's label (if any)
+    is forwarded to the next surviving instruction.
     """
     result = []
     i = 0
     while i < len(code):
         cur = code[i]
         if (i + 1 < len(code)
-                and isinstance(cur.instr, XORI)
-                and isinstance(code[i + 1].instr, XORI)
-                and cur.instr.rd == code[i + 1].instr.rd
-                and cur.instr.c == code[i + 1].instr.c
+                and _cancels(cur.instr, code[i + 1].instr)
                 and code[i + 1].label is None):
-            # Both XORI cancel: skip them; forward the first's label if any
+            # Both cancel: skip them; forward the first's label if any
             if cur.label is not None and i + 2 < len(code):
-                # Attach skipped label to the next surviving instruction
                 next_li = code[i + 2]
                 if next_li.label is None:
                     code[i + 2] = LabeledInstr(cur.label, next_li.instr)
                 else:
-                    # Both have labels; keep a no-op to carry the label
-                    result.append(LabeledInstr(cur.label, XORI(cur.instr.rd, 0)))
+                    # Both have labels; keep a NOP to carry the first label
+                    result.append(LabeledInstr(cur.label, XORI(cur.instr.rd if hasattr(cur.instr, 'rd') else 'r0', 0)))
             i += 2
             continue
         result.append(cur)
@@ -996,6 +1114,22 @@ def _collect_calls(stmt) -> set:
     if isinstance(stmt, From):
         return _collect_calls(stmt.do_) | _collect_calls(stmt.loop_)
     return set()
+
+
+def _reachable_procs(prog: Program) -> set:
+    """Return the set of procedure names reachable from main (including main)."""
+    call_graph = {p.name: _collect_calls(p.body) for p in prog.procs}
+    reachable = set()
+
+    def visit(name: str):
+        if name in reachable:
+            return
+        reachable.add(name)
+        for callee in call_graph.get(name, set()):
+            visit(callee)
+
+    visit(prog.main_proc)
+    return reachable
 
 
 def _compute_call_depth(prog: Program) -> int:
