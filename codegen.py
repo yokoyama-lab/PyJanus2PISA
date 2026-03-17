@@ -1271,10 +1271,39 @@ def program_stats(code: List[LabeledInstr]) -> Dict[str, int]:
     }
 
 
+def remove_unused_labels(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Strip labels not referenced by any branch instruction.
+
+    Unreferenced labels have no effect on execution.  The 'start' label is
+    always preserved because the PISA runtime uses it to locate the entry
+    point.  Procedure-related labels (name, name_top, name_bot) are kept
+    naturally because they are referenced by BRA/RBRA instructions.
+    """
+    _ALWAYS_KEEP = frozenset({'start', 'finish'})
+
+    referenced: set = set()
+    for li in code:
+        t = _get_branch_target(li.instr)
+        if t:
+            referenced.add(t)
+
+    return [
+        LabeledInstr(
+            li.label if (li.label is None
+                         or li.label in referenced
+                         or li.label in _ALWAYS_KEEP)
+                     else None,
+            li.instr,
+        )
+        for li in code
+    ]
+
+
 def compile_program(prog: Program) -> List[LabeledInstr]:
     """Compile a Janus Program AST to PISA instructions."""
     cg = CodeGen()
     code = cg.gen_program(prog)
     code = peephole(code)
     code = remove_nops(code)
+    code = remove_unused_labels(code)
     return code
