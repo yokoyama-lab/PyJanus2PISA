@@ -1052,6 +1052,7 @@ def _cancels(a: Instr, b: Instr) -> bool:
       SUB  rd rs ; ADD  rd rs   (subtract then add same register)
       XOR  rd rs ; XOR  rd rs   (XOR same register, self-inverse)
       NEG  rd    ; NEG  rd      (negate twice)
+      EXCH rd rs ; EXCH rd rs   (swap is self-inverse)
     """
     if isinstance(a, XORI) and isinstance(b, XORI):
         return a.rd == b.rd and a.c == b.c
@@ -1067,16 +1068,13 @@ def _cancels(a: Instr, b: Instr) -> bool:
         return a.rd == b.rd and a.rs == b.rs
     if isinstance(a, NEG) and isinstance(b, NEG):
         return a.rd == b.rd
+    if isinstance(a, EXCH) and isinstance(b, EXCH):
+        return a.rd == b.rd and a.rs == b.rs
     return False
 
 
-def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
-    """Remove adjacent cancelling instruction pairs.
-
-    Two consecutive instructions that are mutual inverses with no label on
-    the second one are both dropped.  The first instruction's label (if any)
-    is forwarded to the next surviving instruction.
-    """
+def _peephole_pass(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Single pass of the peephole optimiser."""
     result = []
     i = 0
     while i < len(code):
@@ -1097,6 +1095,21 @@ def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
         result.append(cur)
         i += 1
     return result
+
+
+def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Remove adjacent cancelling instruction pairs, iterated to fixed point.
+
+    Iterating is necessary so that cancelling a pair can expose a new pair:
+    e.g.  SUBI ra c; ADDI ra c  cancels, then reveals  EXCH rd ra; EXCH rd ra
+    which enables store-block fusion for consecutive same-variable assignments.
+    """
+    while True:
+        new_code = _peephole_pass(code)
+        if len(new_code) == len(code):
+            break
+        code = new_code
+    return code
 
 
 def _collect_calls(stmt) -> set:
