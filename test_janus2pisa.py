@@ -1835,5 +1835,108 @@ class TestProgramStats(unittest.TestCase):
         self.assertEqual(s3["data_words"] - s1["data_words"], 2)
 
 
+class TestSelfReferenceAssign(unittest.TestCase):
+    """Opt S: x op= x  specialization (no eval/uneval overhead)."""
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def _run(self, src):
+        from pisa_interp import PISAMachine
+        code = self._compile(src)
+        m = PISAMachine(code)
+        m.run()
+        return dict(m.mem)
+
+    def test_double_x(self):
+        """x += x doubles x."""
+        mem = self._run("int x\nprocedure main\n  x += 5\n  x += x")
+        self.assertEqual(mem.get(0, 0), 10)
+
+    def test_zero_via_minus(self):
+        """x -= x zeroes x regardless of initial value."""
+        mem = self._run("int x\nprocedure main\n  x += 7\n  x -= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+    def test_zero_via_xor(self):
+        """x ^= x zeroes x."""
+        mem = self._run("int x\nprocedure main\n  x += 3\n  x ^= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+    def test_self_ref_fewer_instrs_than_general(self):
+        """x += x (self-ref) generates fewer data instructions than x += y (general)."""
+        src_self = "int x\nprocedure main\n  x += x"
+        src_gen  = "int x\nint y\nprocedure main\n  x += y"
+        s_self = program_stats(self._compile(src_self))["code_instructions"]
+        s_gen  = program_stats(self._compile(src_gen))["code_instructions"]
+        self.assertLess(s_self, s_gen)
+
+    def test_self_ref_roundtrip(self):
+        """Round-trip: x += x followed by x -= x restores x = 0."""
+        mem = self._run("int x\nprocedure main\n  x += 3\n  x += x\n  x -= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+
+class TestInlineSizeLimit(unittest.TestCase):
+    """Opt M: full-inline is skipped when body is too large."""
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def _text(self, src):
+        return print_program(self._compile(src))
+
+    def test_small_body_full_inline(self):
+        """Simple 1-stmt proc (body ≈ 3 instr): inlined for call+uncall."""
+        text = self._text(
+            "int x\nprocedure inc\n  x += 1\n"
+            "procedure main\n  call inc\n  uncall inc"
+        )
+        self.assertNotIn("inc_top:", text)
+
+    def test_large_body_not_full_inline(self):
+        """4-stmt proc (body ≈ 12 instr): NOT inlined when call+uncall
+        because 2*12 > 12+11 (no code-size benefit)."""
+        text = self._text(
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big\n  uncall big"
+        )
+        self.assertIn("big_top:", text)
+
+    def test_large_body_call_only_still_inlined(self):
+        """Call-only (u=0) always saves the 9-instr overhead, no size limit."""
+        text = self._text(
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big"
+        )
+        self.assertNotIn("big_top:", text)
+
+    def test_correctness_large_body_round_trip(self):
+        """Round-trip via invert_program: big is not inlined but still correct.
+
+        P: call big (x: 0→10).
+        P⁻¹: uncall big (= RBRA big in this interpreter → runs inverted body
+             x -= 4; x -= 3; x -= 2; x -= 1 forward: x: 10→0).
+        """
+        from pisa_interp import PISAMachine
+        from inverse import invert_program
+        src = (
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big"
+        )
+        prog = parse(tokenize(src))
+        # Forward: x = 0 → 10
+        fwd_code = self._compile(src)
+        m_fwd = PISAMachine(fwd_code)
+        m_fwd.run()
+        self.assertEqual(m_fwd.mem.get(0, 0), 10)
+        # Inverse: x = 10 → 0
+        inv_code = compile_program(invert_program(prog))
+        m_inv = PISAMachine(inv_code)
+        m_inv.mem[0] = 10
+        m_inv.run()
+        self.assertEqual(m_inv.mem.get(0, 0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

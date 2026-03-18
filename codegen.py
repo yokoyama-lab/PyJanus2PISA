@@ -380,6 +380,28 @@ class CodeGen:
         """Generate code for x ⊕= e (Fig. 6)."""
         offset = self._var_offset(stmt.var)
 
+        # Self-reference: x op= x.  Avoids the full eval/uneval cycle entirely.
+        #   x += x  →  EXCH rd ra; ADD rd rd; EXCH rd ra  (double in-place)
+        #   x -= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
+        #   x ^= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
+        if isinstance(stmt.expr, Var) and stmt.expr.name == stmt.var:
+            ra = self.reg.alloc()
+            rd = self.reg.alloc()
+            code = []
+            code.append(self._emit(ADDI(ra, offset)))
+            code.append(self._emit(EXCH(rd, ra)))
+            if stmt.op == '+=':
+                code.append(self._emit(ADD(rd, rd)))
+            elif stmt.op in ('-=', '^='):
+                code.append(self._emit(XOR(rd, rd)))
+            else:
+                raise CodeGenError(f"Unknown assign op: {stmt.op}")
+            code.append(self._emit(EXCH(rd, ra)))
+            code.append(self._emit(SUBI(ra, offset)))
+            self.reg.free_reg(ra)
+            self.reg.free_reg(rd)
+            return code
+
         # Fast path: constant RHS avoids a register and two instructions.
         # x += k  →  EXCH rd ra; ADDI rd k; EXCH rd ra  (no re needed)
         if isinstance(stmt.expr, Const):
@@ -1065,8 +1087,12 @@ class CodeGen:
             if c <= 1 and u == 0:
                 # Call-only inline: body executed forward only.
                 self._inline_procs[name] = (proc, False)
-            elif c <= 1 and u <= 1 and _is_simple_for_inline(proc.body):
+            elif (c <= 1 and u <= 1
+                  and _is_simple_for_inline(proc.body)
+                  and _estimate_inline_cost(proc.body) <= _FULL_INLINE_LIMIT):
                 # Full inline: body executed forward for both call and uncall.
+                # Size limit prevents code growth when the body is large enough
+                # that emitting it twice costs more than the call overhead.
                 self._inline_procs[name] = (proc, True)
 
         # 3. Procedure code (skip dead and inlined procedures)
@@ -1216,6 +1242,37 @@ def _count_all_calls(stmt) -> Dict[str, Tuple[int, int]]:
 
     visit(stmt)
     return counts
+
+
+_FULL_INLINE_LIMIT = 10
+"""Max estimated instruction count for the full-inline (call+uncall) case.
+
+Without inlining: body_size + 11 instructions (9 overhead + 1 BRA + 1 RBRA).
+With inlining:    2 * body_size instructions (body emitted twice).
+Break-even at body_size = 11; inlining wins when body_size <= 10.
+"""
+
+
+def _estimate_inline_cost(stmt) -> int:
+    """Estimate the instruction count of a statement body for inlining decisions.
+
+    Uses conservative (over) estimates to avoid unexpected code growth.
+    """
+    if isinstance(stmt, (Skip, Print)):
+        return 0
+    if isinstance(stmt, AssignVar):
+        if isinstance(stmt.expr, Var) and stmt.expr.name == stmt.var:
+            return 3   # self-reference fast path: EXCH + op + EXCH
+        if isinstance(stmt.expr, Const):
+            return 3   # const fast path: EXCH + ADDI/SUBI/XORI + EXCH
+        return 14      # general: eval + op + uneval
+    if isinstance(stmt, AssignArr):
+        return 15
+    if isinstance(stmt, Swap):
+        return 8
+    if isinstance(stmt, Seq):
+        return sum(_estimate_inline_cost(s) for s in stmt.stmts)
+    return 9999        # If, From, Call, Uncall: large; _is_simple_for_inline already rejects them
 
 
 def _is_simple_for_inline(stmt) -> bool:
