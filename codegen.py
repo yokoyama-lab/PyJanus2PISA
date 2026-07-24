@@ -651,9 +651,17 @@ class CodeGen:
             self.reg.free_reg(sub_re)
             self.reg.free_reg(rl_copy)
         elif op in ('||', '|'):
+            # ORX zeroes its source register; copy rl and rr to temps to preserve
+            # their values for the subsequent uneval calls (same pattern as && / &).
+            rl_copy = self.reg.alloc()
+            rr_copy = self.reg.alloc()
             sub_re = self.reg.alloc()
-            code.append(self._emit(ORX(sub_re, rl)))
-            code.append(self._emit(ORX(sub_re, rr)))
+            code.append(self._emit(XOR(rl_copy, rl)))      # rl_copy = rl_val (rl unchanged)
+            code.append(self._emit(ORX(sub_re, rl_copy)))  # sub_re |= rl_copy; rl_copy = 0
+            self.reg.free_reg(rl_copy)
+            code.append(self._emit(XOR(rr_copy, rr)))      # rr_copy = rr_val (rr unchanged)
+            code.append(self._emit(ORX(sub_re, rr_copy)))  # sub_re |= rr_copy; rr_copy = 0
+            self.reg.free_reg(rr_copy)
             code.append(self._emit(XOR(result_reg, sub_re)))
             code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
             self.reg.free_reg(sub_re)
@@ -902,7 +910,7 @@ class CodeGen:
         # statement.
         code.append(self._emit(BRA(assert_true), end_label))  # Pendulum pair second
         self.reg.free_reg(rt)
-        code.append(self._emit(XORI(rt, 1)))                   # clear rt (= 0) after exit
+        code.append(self._emit(XOR(rt, rt)))                    # clear rt (= 0) after exit
 
         return code
 
