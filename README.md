@@ -21,13 +21,57 @@ Program inversion follows the rules from:
 - Program inverter: given P, produces P⁻¹ (the semantic inverse) at the AST level
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
 - Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
-- 295 tests (all passing)
+- Multiplication by a compile-time constant, compiled to a branch-free shift-and-add chain
+- 312 tests (all passing)
 
 On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
 
 ### Limitations
 
-- Multiplication (`*`) is not yet supported by the PISA code generator (parser accepts it; `CodeGenError` is raised at codegen time).
+- Multiplication requires one operand to be a compile-time constant, at most 16 bits wide. PISA has no `MUL` instruction, and a data-dependent multiply loop could not be inverted by the straight-line reversal used for expression unevaluation. `variable * variable` raises `CodeGenError`.
+- Division (`/`) and modulo (`%`) are not supported by the code generator.
+- Procedures take no parameters; all variables are global.
+
+### Known issue: `uncall`
+
+`uncall f` currently compiles to `RBRA f`, which the bundled PISA interpreter executes **forward** — so `uncall f` behaves like `call f` rather than running `f` backwards. The round-trip tests do not catch this because `invert_program` inverts *every* procedure body, so the two inversions cancel; whole-program inversion is therefore correct, but a source program that uses `uncall` directly is miscompiled.
+
+Confirmed by differential testing against PyJanus (see below): for
+
+```janus
+int x
+procedure bump
+  x += 1
+procedure main
+  uncall bump
+```
+
+this compiler yields `x = 1` where the Janus semantics (and PyJanus) give `x = -1`.
+
+Fixing it means either giving the interpreter a Pendulum direction bit so `RBRA` really runs code backwards, or emitting an inverted companion procedure `f⁻¹` for each uncalled `f` and compiling `uncall f` as a call to it. The second option is local to `codegen.py` and can reuse `invert_stmt` from `inverse.py`, but it also requires `invert_program` to stop inverting callee bodies.
+
+## Cross-checking against PyJanus
+
+`tools/pyjanus_crosscheck.py` runs the same program through this compiler (→ PISA → PISA interpreter) and through the [PyJanus](https://github.com/yokoyama-lab/PyJanus) interpreter, then compares the final store.
+
+```bash
+python3 tools/pyjanus_crosscheck.py --pyjanus ~/dev/github.com/yokoyama-lab/PyJanus
+```
+
+The two projects share statement syntax but differ in declarations, so the tool translates the source (`emit_jana2014`): PyJanus's `jana2014` dialect has no global variables, so each global is threaded through every procedure as a call-by-reference parameter and declared locally in `main`.
+
+The **common subset** that cross-checks cleanly is:
+
+| Construct | Notes |
+|---|---|
+| `x += e`, `x -= e`, `x ^= e` | identical syntax |
+| `x <=> y`, `a[i] <=> b[j]` | identical syntax |
+| `if e1 then S1 else S2 fi e2` | identical; `e2` must genuinely discriminate the branches, which PyJanus checks at runtime and this compiler does not |
+| `from e1 do S1 loop S2 until e2` | identical |
+| arrays, constant multiplication | identical |
+| `call f` / `uncall f` | needs the parameter-threading shim; `uncall` currently diverges (see above) |
+
+Outside the subset: procedure parameters, local declarations, `print`, and division/modulo.
 
 ## Requirements
 

@@ -1938,5 +1938,109 @@ class TestInlineSizeLimit(unittest.TestCase):
         self.assertEqual(m_inv.mem.get(0, 0), 0)
 
 
+class TestConstantMultiplication(unittest.TestCase):
+    """Multiplication by a compile-time constant (shift-and-add).
+
+    PISA has no MUL instruction, and a data-dependent multiply loop cannot be
+    reversed by the straight-line _reverse_code machinery.  Multiplication is
+    therefore supported only when one operand is a constant, which compiles to
+    a branch-free shift-and-add chain.
+    """
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def _run(self, src):
+        from pisa_interp import PISAMachine
+        m = PISAMachine(self._compile(src))
+        m.run()
+        return dict(m.mem)
+
+    def _mul(self, k, yval=5):
+        """Run `x += y * k` with y = yval; return x."""
+        src = f"int x\nint y\nprocedure main\n  y += {yval}\n  x += y * {k}"
+        return self._run(src).get(0, 0)
+
+    def test_const_times_const_folds(self):
+        self.assertEqual(self._run("int x\nprocedure main\n  x += 3 * 4").get(0, 0), 12)
+
+    def test_multiply_by_zero(self):
+        self.assertEqual(self._mul(0), 0)
+
+    def test_multiply_by_one(self):
+        self.assertEqual(self._mul(1), 5)
+
+    def test_multiply_by_two(self):
+        self.assertEqual(self._mul(2), 10)
+
+    def test_multiply_by_three(self):
+        self.assertEqual(self._mul(3), 15)
+
+    def test_multiply_by_ten(self):
+        self.assertEqual(self._mul(10), 50)
+
+    def test_multiply_by_large_power_of_two(self):
+        self.assertEqual(self._mul(1024, yval=3), 3072)
+
+    def test_multiply_non_power_of_two(self):
+        self.assertEqual(self._mul(100, yval=7), 700)
+
+    def test_multiply_negative_constant(self):
+        self.assertEqual(self._mul(-3), -15)
+
+    def test_constant_on_left(self):
+        src = "int x\nint y\nprocedure main\n  y += 6\n  x += 3 * y"
+        self.assertEqual(self._run(src).get(0, 0), 18)
+
+    def test_multiply_in_subexpression(self):
+        """Multiplication composes with other operators."""
+        src = "int x\nint y\nprocedure main\n  y += 4\n  x += y * 3 + 2"
+        self.assertEqual(self._run(src).get(0, 0), 14)
+
+    def test_roundtrip_add_then_sub(self):
+        """x += y*3 followed by x -= y*3 restores x = 0 (uneval path)."""
+        src = "int x\nint y\nprocedure main\n  y += 5\n  x += y * 3\n  x -= y * 3"
+        self.assertEqual(self._run(src).get(0, 0), 0)
+
+    def test_source_operand_preserved(self):
+        """y is unchanged by x += y * k."""
+        mem = self._run("int x\nint y\nprocedure main\n  y += 5\n  x += y * 3")
+        self.assertEqual(mem.get(1, 0), 5)
+
+    def test_inverse_program_roundtrip(self):
+        """P⁻¹(P(σ)) = σ for a program using constant multiplication."""
+        from pisa_interp import PISAMachine
+        from inverse import invert_program
+        src = "int x\nint y\nprocedure main\n  y += 5\n  x += y * 7"
+        prog = parse(tokenize(src))
+        m_fwd = PISAMachine(self._compile(src))
+        m_fwd.run()
+        self.assertEqual(m_fwd.mem.get(0, 0), 35)
+        m_inv = PISAMachine(compile_program(invert_program(prog)))
+        m_inv.mem[0] = 35
+        m_inv.mem[1] = 5
+        m_inv.run()
+        self.assertEqual(m_inv.mem.get(0, 0), 0)
+        self.assertEqual(m_inv.mem.get(1, 0), 0)
+
+    def test_shift_and_add_is_logarithmic(self):
+        """*1024 must not unroll into 1024 additions, and each extra bit is O(1)."""
+        def n(k):
+            return program_stats(self._compile(
+                f"int x\nint y\nprocedure main\n  x += y * {k}"))["code_instructions"]
+        self.assertLess(n(1024), 200)
+        # Doubling the multiplier adds one bit, hence a constant number of
+        # instructions — not twice as many.
+        self.assertLessEqual(n(1024) - n(512), 10)
+
+    def test_variable_times_variable_still_raises(self):
+        with self.assertRaises(CodeGenError):
+            self._compile("int x\nint y\nprocedure main\n  x += x * y")
+
+    def test_constant_too_large_raises(self):
+        with self.assertRaises(CodeGenError):
+            self._compile("int x\nint y\nprocedure main\n  x += y * 1000000000")
+
+
 if __name__ == "__main__":
     unittest.main()

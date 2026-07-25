@@ -129,6 +129,84 @@ class CodeGen:
         self.reg.commit_reg(rd)
         return code, rd
 
+    # Largest constant multiplier accepted, as a bit width.  The shift-and-add
+    # chain costs one register and two instructions per bit, so an unbounded
+    # multiplier would exhaust the 29 general-purpose registers.
+    MUL_MAX_BITS = 16
+
+    @staticmethod
+    def _const_value(expr: Expr) -> Optional[int]:
+        """Evaluate expr at compile time, or return None if it is not constant.
+
+        Needed because the parser desugars unary minus to `0 - e`, so a literal
+        like -3 reaches codegen as a BinOp rather than a Const.
+        """
+        if isinstance(expr, Const):
+            return expr.value
+        if isinstance(expr, BinOp):
+            lv = CodeGen._const_value(expr.left)
+            rv = CodeGen._const_value(expr.right)
+            if lv is None or rv is None:
+                return None
+            op = expr.op
+            if op == '+': return lv + rv
+            if op == '-': return lv - rv
+            if op == '*': return lv * rv
+            if op == '^': return lv ^ rv
+            if op == '&': return lv & rv
+            if op == '|': return lv | rv
+        return None
+
+    def _split_const_mul(self, expr: BinOp, rl: str, rr: str) -> Tuple[str, int]:
+        """For a multiplication, return (value register, constant multiplier).
+
+        PISA has no MUL instruction, and a data-dependent multiply loop cannot
+        be inverted by the straight-line _reverse_code machinery, so at least
+        one operand must be a compile-time constant.
+        """
+        k = self._const_value(expr.right)
+        if k is not None:
+            return rl, k
+        k = self._const_value(expr.left)
+        if k is not None:
+            return rr, k
+        raise CodeGenError(
+            "Multiplication requires a constant operand; "
+            "variable * variable is not supported in PISA codegen"
+        )
+
+    def _gen_const_mul(self, rv: str, k: int) -> Tuple[List[LabeledInstr], str, List[str]]:
+        """Emit `re = rv * k` for a compile-time constant k (shift-and-add).
+
+        `rv` is only read, never written, so the caller's value survives.
+        Returns (code, re, temps), where each temp holds rv*2^i; the caller
+        disposes of them (marks them garbage, or reverses the code to zero
+        them).  Doubling uses a fresh zeroed register and two ADDs rather than
+        `ADD p p`, which is not reversible on PISA.
+        """
+        if abs(k) >= (1 << self.MUL_MAX_BITS):
+            raise CodeGenError(
+                f"Multiplier {k} exceeds {self.MUL_MAX_BITS}-bit limit "
+                f"for constant multiplication"
+            )
+        code: List[LabeledInstr] = []
+        re = self.reg.alloc()
+        temps: List[str] = []
+        n, p = abs(k), rv
+        while n:
+            if n & 1:
+                code.append(self._emit(ADD(re, p)))
+            n >>= 1
+            if n:
+                q = self.reg.alloc()
+                code.append(self._emit(ADD(q, p)))
+                code.append(self._emit(ADD(q, p)))  # q = 2p
+                temps.append(q)
+                p = q
+        if k < 0:
+            code.append(self._emit(NEG(re)))
+        return code, re, temps
+
     def _gen_binop(self, expr: BinOp) -> Tuple[List[LabeledInstr], str]:
         """Generate code for binary operation."""
         # Constant folding: evaluate at compile time when both operands are constants
@@ -148,6 +226,7 @@ class CodeGen:
             elif op == '||': folded = int(bool(lv) or bool(rv))
             elif op == '&':  folded = lv & rv
             elif op == '|':  folded = lv | rv
+            elif op == '*':  folded = lv * rv
             if folded is not None:
                 return self._gen_const(Const(folded))
 
@@ -177,10 +256,15 @@ class CodeGen:
             return code, rl
 
         if op == '*':
-            # PISA doesn't have MUL; we'd need a subroutine.
-            # For now, use repeated addition (only for small constants).
-            # Simple approach: multiply subroutine or error.
-            raise CodeGenError("Multiplication not yet supported in PISA codegen")
+            rv, k = self._split_const_mul(expr, rl, rr)
+            mul_code, re, temps = self._gen_const_mul(rv, k)
+            code.extend(mul_code)
+            for t in temps:
+                self.reg.to_garbage(t)
+            self.reg.to_garbage(rl)
+            self.reg.to_garbage(rr)
+            self.reg.commit_reg(re)
+            return code, re
 
         if op in ('=', '!='):
             # x = y  →  !(x < y) && !(y < x)
@@ -593,6 +677,17 @@ class CodeGen:
         elif op == '^':
             code.append(self._emit(XOR(result_reg, rr)))
             code.append(self._emit(XOR(result_reg, rl)))
+        elif op == '*':
+            # Recompute the product into a temp, subtract it to zero result_reg,
+            # then run the product code backwards to zero the temp and its chain.
+            rv, k = self._split_const_mul(expr, rl, rr)
+            mul_code, sub_re, temps = self._gen_const_mul(rv, k)
+            code.extend(mul_code)
+            code.append(self._emit(SUB(result_reg, sub_re)))
+            code.extend(self._reverse_code(mul_code))
+            for t in temps:
+                self.reg.free_reg(t)
+            self.reg.free_reg(sub_re)
         elif op == '<':
             sub_re = self.reg.alloc()
             code.append(self._emit(SLTX(sub_re, rl, rr)))
