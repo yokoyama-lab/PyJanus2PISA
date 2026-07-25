@@ -50,6 +50,35 @@ this compiler yields `x = 1` where the Janus semantics (and PyJanus) give `x = -
 
 Fixing it means either giving the interpreter a Pendulum direction bit so `RBRA` really runs code backwards, or emitting an inverted companion procedure `f⁻¹` for each uncalled `f` and compiling `uncall f` as a call to it. The second option is local to `codegen.py` and can reuse `invert_stmt` from `inverse.py`, but it also requires `invert_program` to stop inverting callee bodies.
 
+## Machine-checked correctness (Rocq)
+
+`rocq/` contains a Rocq 9.1 development proving **semantic preservation** for the
+straight-line fragment of the translation — the PISA counterpart of the
+whole-translator correctness that the PyJanus development leaves open:
+
+```coq
+Theorem compile_spec : forall st sigma sigma' m,
+  exec st sigma sigma' -> wf_stmt st ->
+  models m sigma -> clean_above scratch m ->
+  models (run (compile st) m) sigma' /\ regs (run (compile st) m) = regs m.
+```
+
+The second conjunct is *cleanliness*: the register file afterwards is equal to
+the one before, so no garbage is left — the "clean" of Axelsen's clean
+translation, and what makes the compiled code reversible on the machine
+(`compile_reversible`). Also proved: every PISA instruction has a local inverse
+(`step_invert`), and the emitted code is well-formed, i.e. never `ADD rd rd`
+(`wf_compile`).
+
+Covered: `skip`, `x op= e`, `x <=> y`, sequencing, expressions over `+ - ^`.
+Not yet: control flow, procedures, arrays. No `Admitted`; the only axiom is
+functional extensionality. See `rocq/MANIFEST.md` for the exact scope, side
+conditions, and next milestones.
+
+```bash
+cd rocq && make      # Rocq Prover 9.1.1
+```
+
 ## Cross-checking against PyJanus
 
 `tools/pyjanus_crosscheck.py` runs the same program through this compiler (→ PISA → PISA interpreter) and through the [PyJanus](https://github.com/yokoyama-lab/PyJanus) interpreter, then compares the final store.
