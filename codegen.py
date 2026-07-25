@@ -34,6 +34,9 @@ class CodeGen:
         self._var_sizes: Dict[str, int] = {}    # variable name → size
         self._total_vars = 0
         self._proc_names: List[str] = []
+        # Procedures to be inlined.  Value is (ProcDecl, can_uncall).
+        # can_uncall=True means the body is branch-free and safe to reverse.
+        self._inline_procs: Dict[str, Tuple['ProcDecl', bool]] = {}
 
     def fresh_label(self, prefix: str = "L") -> str:
         self._label_counter += 1
@@ -377,6 +380,53 @@ class CodeGen:
         """Generate code for x ⊕= e (Fig. 6)."""
         offset = self._var_offset(stmt.var)
 
+        # Self-reference: x op= x.  Avoids the full eval/uneval cycle entirely.
+        #   x += x  →  EXCH rd ra; ADD rd rd; EXCH rd ra  (double in-place)
+        #   x -= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
+        #   x ^= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
+        if isinstance(stmt.expr, Var) and stmt.expr.name == stmt.var:
+            ra = self.reg.alloc()
+            rd = self.reg.alloc()
+            code = []
+            code.append(self._emit(ADDI(ra, offset)))
+            code.append(self._emit(EXCH(rd, ra)))
+            if stmt.op == '+=':
+                code.append(self._emit(ADD(rd, rd)))
+            elif stmt.op in ('-=', '^='):
+                code.append(self._emit(XOR(rd, rd)))
+            else:
+                raise CodeGenError(f"Unknown assign op: {stmt.op}")
+            code.append(self._emit(EXCH(rd, ra)))
+            code.append(self._emit(SUBI(ra, offset)))
+            self.reg.free_reg(ra)
+            self.reg.free_reg(rd)
+            return code
+
+        # Fast path: constant RHS avoids a register and two instructions.
+        # x += k  →  EXCH rd ra; ADDI rd k; EXCH rd ra  (no re needed)
+        if isinstance(stmt.expr, Const):
+            k = stmt.expr.value
+            ra = self.reg.alloc()
+            rd = self.reg.alloc()
+            code = []
+            code.append(self._emit(ADDI(ra, offset)))
+            code.append(self._emit(EXCH(rd, ra)))
+            if k != 0:
+                if stmt.op == '+=':
+                    code.append(self._emit(ADDI(rd, k)))
+                elif stmt.op == '-=':
+                    code.append(self._emit(SUBI(rd, k)))
+                elif stmt.op == '^=':
+                    code.append(self._emit(XORI(rd, k)))
+                else:
+                    raise CodeGenError(f"Unknown assign op: {stmt.op}")
+            code.append(self._emit(EXCH(rd, ra)))
+            code.append(self._emit(SUBI(ra, offset)))
+            self.reg.free_reg(ra)
+            self.reg.free_reg(rd)
+            return code
+
+        # General path: evaluate e → re, apply, unevaluate.
         # 1. Evaluate e → re
         eval_code, re = self.gen_expr(stmt.expr)
 
@@ -458,13 +508,78 @@ class CodeGen:
         """Unevaluate binary operation.
 
         We re-evaluate the operands, undo the operation, then unevaluate operands.
+        For arithmetic ops (+, -, ^) with a constant operand, we skip the register
+        load/unload and use an immediate instruction directly (saves 2 instructions).
         """
-        # Re-evaluate left and right to get their values
+        op = expr.op
+
+        # Fast path for arithmetic with constant operand(s).
+        # Avoids allocating a register and two instructions per const operand.
+        if op in ('+', '-', '^'):
+            left_is_const = isinstance(expr.left, Const)
+            right_is_const = isinstance(expr.right, Const)
+
+            if left_is_const or right_is_const:
+                code = []
+                # Load the non-const side (if any) into a register
+                if not left_is_const:
+                    left_code, rl = self.gen_expr(expr.left)
+                    code.extend(left_code)
+                else:
+                    rl = None
+                if not right_is_const:
+                    right_code, rr = self.gen_expr(expr.right)
+                    code.extend(right_code)
+                else:
+                    rr = None
+
+                kl = expr.left.value  if left_is_const  else None
+                kr = expr.right.value if right_is_const else None
+
+                # Undo: result = left op right  →  result -= right, result -= left  (for +)
+                if op == '+':
+                    # result -= right
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(SUBI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rr)))
+                    # result -= left
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rl)))
+                elif op == '-':
+                    # result = left - right  →  result += right; result -= left
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(ADDI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(ADD(result_reg, rr)))
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(SUB(result_reg, rl)))
+                elif op == '^':
+                    if rr is None:
+                        if kr != 0: code.append(self._emit(XORI(result_reg, kr)))
+                    else:
+                        code.append(self._emit(XOR(result_reg, rr)))
+                    if rl is None:
+                        if kl != 0: code.append(self._emit(XORI(result_reg, kl)))
+                    else:
+                        code.append(self._emit(XOR(result_reg, rl)))
+
+                # Unevaluate non-const operands
+                if rr is not None:
+                    code.extend(self._gen_uneval_expr(expr.right, rr))
+                if rl is not None:
+                    code.extend(self._gen_uneval_expr(expr.left, rl))
+                self.reg.free_reg(result_reg)
+                return code
+
+        # General path: re-evaluate left and right to get their values
         left_code, rl = self.gen_expr(expr.left)
         right_code, rr = self.gen_expr(expr.right)
         code = list(left_code) + list(right_code)
-
-        op = expr.op
 
         # Undo the operation on result_reg
         if op == '+':
@@ -536,9 +651,17 @@ class CodeGen:
             self.reg.free_reg(sub_re)
             self.reg.free_reg(rl_copy)
         elif op in ('||', '|'):
+            # ORX zeroes its source register; copy rl and rr to temps to preserve
+            # their values for the subsequent uneval calls (same pattern as && / &).
+            rl_copy = self.reg.alloc()
+            rr_copy = self.reg.alloc()
             sub_re = self.reg.alloc()
-            code.append(self._emit(ORX(sub_re, rl)))
-            code.append(self._emit(ORX(sub_re, rr)))
+            code.append(self._emit(XOR(rl_copy, rl)))      # rl_copy = rl_val (rl unchanged)
+            code.append(self._emit(ORX(sub_re, rl_copy)))  # sub_re |= rl_copy; rl_copy = 0
+            self.reg.free_reg(rl_copy)
+            code.append(self._emit(XOR(rr_copy, rr)))      # rr_copy = rr_val (rr unchanged)
+            code.append(self._emit(ORX(sub_re, rr_copy)))  # sub_re |= rr_copy; rr_copy = 0
+            self.reg.free_reg(rr_copy)
             code.append(self._emit(XOR(result_reg, sub_re)))
             code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
             self.reg.free_reg(sub_re)
@@ -683,11 +806,24 @@ class CodeGen:
         return code
 
     def _gen_call(self, stmt: Call) -> List[LabeledInstr]:
-        """Generate procedure call (Fig. 5): BRA f."""
+        """Generate procedure call (Fig. 5): BRA f, or inline the body."""
+        if stmt.proc in self._inline_procs:
+            proc, _can_uncall = self._inline_procs[stmt.proc]
+            return self.gen_stmt(proc.body)
         return [self._emit(BRA(stmt.proc))]
 
     def _gen_uncall(self, stmt: Uncall) -> List[LabeledInstr]:
-        """Generate procedure uncall (Fig. 5): RBRA f."""
+        """Generate procedure uncall (Fig. 5): RBRA f, or inline the body.
+
+        Note: in this interpreter RBRA executes the procedure body forward
+        (via software call stack), so inlining simply emits gen_stmt(body).
+        The semantic inverse is already captured at the Janus level by
+        invert_program(), which inverts every procedure body.
+        """
+        if stmt.proc in self._inline_procs:
+            proc, can_uncall = self._inline_procs[stmt.proc]
+            if can_uncall:
+                return self.gen_stmt(proc.body)
         return [self._emit(RBRA(stmt.proc))]
 
     def _gen_if(self, stmt: If) -> List[LabeledInstr]:
@@ -774,7 +910,7 @@ class CodeGen:
         # statement.
         code.append(self._emit(BRA(assert_true), end_label))  # Pendulum pair second
         self.reg.free_reg(rt)
-        code.append(self._emit(XORI(rt, 1)))                   # clear rt (= 0) after exit
+        code.append(self._emit(XOR(rt, rt)))                    # clear rt (= 0) after exit
 
         return code
 
@@ -814,7 +950,7 @@ class CodeGen:
         code.extend(uneval_entry)
         code.extend(self._clear_garbage())
         # rt should be nonzero (assertion holds)
-        code.append(self._emit(XORI(rt, 1)))  # clear rt (assuming boolean)
+        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
 
         # entry_do label: start of do body
         code_do = self.gen_stmt(stmt.do_)
@@ -839,7 +975,7 @@ class CodeGen:
 
         # Branch on result
         code.append(self._emit(BEQ(rt, "r0", loop_body)))
-        code.append(self._emit(XORI(rt, 1)))
+        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
         code.append(self._emit(BRA(exit_label)))
 
         # --- Loop body ---
@@ -857,7 +993,7 @@ class CodeGen:
         loop_code.extend(self._clear_garbage())
         # rt = 1 ^ eval(e1). Since e1 is false on re-entry, eval(e1)=0 → rt=1.
         # Flip rt back to 0 so the invariant rt=0 at from_test is maintained.
-        loop_code.append(self._emit(XORI(rt, 1)))
+        loop_code.append(self._emit(XOR(rt, rt)))  # clear rt (safe for non-boolean)
 
         loop_code.append(self._emit(BRA(entry_do)))
         code.extend(loop_code)
@@ -933,10 +1069,45 @@ class CodeGen:
         call_depth = _compute_call_depth(prog)
         stack_offset = offset + max(call_depth * 2, 4)
 
-        # 2. Procedure code
+        # 2. Identify inlinable procedures before generating any code.
+        #
+        #    A procedure f is inlinable when the call overhead (9 instructions
+        #    for f_top/f_bot + prologue) can be eliminated:
+        #      - call-only inline:  call_count ≤ 1 AND uncall_count == 0
+        #        (body may contain any statements; no reversal needed)
+        #      - full inline:       call_count ≤ 1 AND uncall_count ≤ 1
+        #                           AND body is branch-free (safe to reverse)
+        #
+        #    main is never inlined (it is the entry point).
+        reachable = _reachable_procs(prog)
+        total_call_counts: Dict[str, Tuple[int, int]] = {}
         for proc in prog.procs:
-            proc_code = self.gen_proc(proc)
-            code.extend(proc_code)
+            for name, (c, u) in _count_all_calls(proc.body).items():
+                tc, tu = total_call_counts.get(name, (0, 0))
+                total_call_counts[name] = (tc + c, tu + u)
+
+        proc_map = {p.name: p for p in prog.procs}
+        for name in reachable:
+            if name == prog.main_proc or name not in proc_map:
+                continue
+            proc = proc_map[name]
+            c, u = total_call_counts.get(name, (0, 0))
+            if c <= 1 and u == 0:
+                # Call-only inline: body executed forward only.
+                self._inline_procs[name] = (proc, False)
+            elif (c <= 1 and u <= 1
+                  and _is_simple_for_inline(proc.body)
+                  and _estimate_inline_cost(proc.body) <= _FULL_INLINE_LIMIT):
+                # Full inline: body executed forward for both call and uncall.
+                # Size limit prevents code growth when the body is large enough
+                # that emitting it twice costs more than the call overhead.
+                self._inline_procs[name] = (proc, True)
+
+        # 3. Procedure code (skip dead and inlined procedures)
+        for proc in prog.procs:
+            if proc.name in reachable and proc.name not in self._inline_procs:
+                proc_code = self.gen_proc(proc)
+                code.extend(proc_code)
 
         # 3. Entry/exit
         code.append(self._emit(START(), "start"))
@@ -949,36 +1120,75 @@ class CodeGen:
         return code
 
 
-def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
-    """Remove pairs of consecutive XORI rd c that cancel each other.
+def _cancels(a: Instr, b: Instr) -> bool:
+    """Return True if instructions a and b are mutual inverses and cancel.
 
-    Two consecutive XORI rd c instructions with no label on the second one
-    are mutual inverses and can both be dropped.
+    Pairs detected:
+      XORI rd c  ; XORI rd c    (XOR with same constant, self-inverse)
+      ADDI rd c  ; SUBI rd c    (add then subtract same constant)
+      SUBI rd c  ; ADDI rd c    (subtract then add same constant)
+      ADD  rd rs ; SUB  rd rs   (add then subtract same register)
+      SUB  rd rs ; ADD  rd rs   (subtract then add same register)
+      XOR  rd rs ; XOR  rd rs   (XOR same register, self-inverse)
+      NEG  rd    ; NEG  rd      (negate twice)
+      EXCH rd rs ; EXCH rd rs   (swap is self-inverse)
     """
+    if isinstance(a, XORI) and isinstance(b, XORI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, ADDI) and isinstance(b, SUBI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, SUBI) and isinstance(b, ADDI):
+        return a.rd == b.rd and a.c == b.c
+    if isinstance(a, ADD) and isinstance(b, SUB):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, SUB) and isinstance(b, ADD):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, XOR) and isinstance(b, XOR):
+        return a.rd == b.rd and a.rs == b.rs
+    if isinstance(a, NEG) and isinstance(b, NEG):
+        return a.rd == b.rd
+    if isinstance(a, EXCH) and isinstance(b, EXCH):
+        return a.rd == b.rd and a.rs == b.rs
+    return False
+
+
+def _peephole_pass(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Single pass of the peephole optimiser."""
     result = []
     i = 0
     while i < len(code):
         cur = code[i]
         if (i + 1 < len(code)
-                and isinstance(cur.instr, XORI)
-                and isinstance(code[i + 1].instr, XORI)
-                and cur.instr.rd == code[i + 1].instr.rd
-                and cur.instr.c == code[i + 1].instr.c
+                and _cancels(cur.instr, code[i + 1].instr)
                 and code[i + 1].label is None):
-            # Both XORI cancel: skip them; forward the first's label if any
+            # Both cancel: skip them; forward the first's label if any
             if cur.label is not None and i + 2 < len(code):
-                # Attach skipped label to the next surviving instruction
                 next_li = code[i + 2]
                 if next_li.label is None:
                     code[i + 2] = LabeledInstr(cur.label, next_li.instr)
                 else:
-                    # Both have labels; keep a no-op to carry the label
-                    result.append(LabeledInstr(cur.label, XORI(cur.instr.rd, 0)))
+                    # Both have labels; keep a NOP to carry the first label
+                    result.append(LabeledInstr(cur.label, XORI(cur.instr.rd if hasattr(cur.instr, 'rd') else 'r0', 0)))
             i += 2
             continue
         result.append(cur)
         i += 1
     return result
+
+
+def peephole(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Remove adjacent cancelling instruction pairs, iterated to fixed point.
+
+    Iterating is necessary so that cancelling a pair can expose a new pair:
+    e.g.  SUBI ra c; ADDI ra c  cancels, then reveals  EXCH rd ra; EXCH rd ra
+    which enables store-block fusion for consecutive same-variable assignments.
+    """
+    while True:
+        new_code = _peephole_pass(code)
+        if len(new_code) == len(code):
+            break
+        code = new_code
+    return code
 
 
 def _collect_calls(stmt) -> set:
@@ -996,6 +1206,96 @@ def _collect_calls(stmt) -> set:
     if isinstance(stmt, From):
         return _collect_calls(stmt.do_) | _collect_calls(stmt.loop_)
     return set()
+
+
+def _reachable_procs(prog: Program) -> set:
+    """Return the set of procedure names reachable from main (including main)."""
+    call_graph = {p.name: _collect_calls(p.body) for p in prog.procs}
+    reachable = set()
+
+    def visit(name: str):
+        if name in reachable:
+            return
+        reachable.add(name)
+        for callee in call_graph.get(name, set()):
+            visit(callee)
+
+    visit(prog.main_proc)
+    return reachable
+
+
+def _count_all_calls(stmt) -> Dict[str, Tuple[int, int]]:
+    """Return {proc: (call_count, uncall_count)} for every Call/Uncall in stmt."""
+    counts: Dict[str, Tuple[int, int]] = {}
+
+    def merge(name: str, dc: int, du: int) -> None:
+        c, u = counts.get(name, (0, 0))
+        counts[name] = (c + dc, u + du)
+
+    def visit(s) -> None:
+        from syntax import Call, Uncall, Seq, If, From
+        if isinstance(s, Call):
+            merge(s.proc, 1, 0)
+        elif isinstance(s, Uncall):
+            merge(s.proc, 0, 1)
+        elif isinstance(s, Seq):
+            for sub in s.stmts:
+                visit(sub)
+        elif isinstance(s, If):
+            visit(s.then_)
+            visit(s.else_)
+        elif isinstance(s, From):
+            visit(s.do_)
+            visit(s.loop_)
+
+    visit(stmt)
+    return counts
+
+
+_FULL_INLINE_LIMIT = 10
+"""Max estimated instruction count for the full-inline (call+uncall) case.
+
+Without inlining: body_size + 11 instructions (9 overhead + 1 BRA + 1 RBRA).
+With inlining:    2 * body_size instructions (body emitted twice).
+Break-even at body_size = 11; inlining wins when body_size <= 10.
+"""
+
+
+def _estimate_inline_cost(stmt) -> int:
+    """Estimate the instruction count of a statement body for inlining decisions.
+
+    Uses conservative (over) estimates to avoid unexpected code growth.
+    """
+    if isinstance(stmt, (Skip, Print)):
+        return 0
+    if isinstance(stmt, AssignVar):
+        if isinstance(stmt.expr, Var) and stmt.expr.name == stmt.var:
+            return 3   # self-reference fast path: EXCH + op + EXCH
+        if isinstance(stmt.expr, Const):
+            return 3   # const fast path: EXCH + ADDI/SUBI/XORI + EXCH
+        return 14      # general: eval + op + uneval
+    if isinstance(stmt, AssignArr):
+        return 15
+    if isinstance(stmt, Swap):
+        return 8
+    if isinstance(stmt, Seq):
+        return sum(_estimate_inline_cost(s) for s in stmt.stmts)
+    return 9999        # If, From, Call, Uncall: large; _is_simple_for_inline already rejects them
+
+
+def _is_simple_for_inline(stmt) -> bool:
+    """Return True if stmt contains no control flow or calls.
+
+    A 'simple' body contains only Skip, AssignVar, AssignArr, Swap, Print
+    (and Seq thereof).  Safe to inline for both call and uncall because
+    only linear data instructions are generated (no branch labels).
+    """
+    from syntax import Skip, AssignVar, AssignArr, Swap, Print, Seq
+    if isinstance(stmt, (Skip, AssignVar, AssignArr, Swap, Print)):
+        return True
+    if isinstance(stmt, Seq):
+        return all(_is_simple_for_inline(s) for s in stmt.stmts)
+    return False  # If, From, Call, Uncall → not safe to reverse naively
 
 
 def _compute_call_depth(prog: Program) -> int:
@@ -1124,10 +1424,39 @@ def program_stats(code: List[LabeledInstr]) -> Dict[str, int]:
     }
 
 
+def remove_unused_labels(code: List[LabeledInstr]) -> List[LabeledInstr]:
+    """Strip labels not referenced by any branch instruction.
+
+    Unreferenced labels have no effect on execution.  The 'start' label is
+    always preserved because the PISA runtime uses it to locate the entry
+    point.  Procedure-related labels (name, name_top, name_bot) are kept
+    naturally because they are referenced by BRA/RBRA instructions.
+    """
+    _ALWAYS_KEEP = frozenset({'start', 'finish'})
+
+    referenced: set = set()
+    for li in code:
+        t = _get_branch_target(li.instr)
+        if t:
+            referenced.add(t)
+
+    return [
+        LabeledInstr(
+            li.label if (li.label is None
+                         or li.label in referenced
+                         or li.label in _ALWAYS_KEEP)
+                     else None,
+            li.instr,
+        )
+        for li in code
+    ]
+
+
 def compile_program(prog: Program) -> List[LabeledInstr]:
     """Compile a Janus Program AST to PISA instructions."""
     cg = CodeGen()
     code = cg.gen_program(prog)
     code = peephole(code)
     code = remove_nops(code)
+    code = remove_unused_labels(code)
     return code

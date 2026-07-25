@@ -287,8 +287,12 @@ class TestCodeGen(unittest.TestCase):
         self.assertIn("DATA 5", text)
 
     def test_proc_structure(self):
-        """Procedure has proper entry/exit structure."""
-        code = self._compile("procedure foo\n  skip\nprocedure main\n  call foo")
+        """Procedure called multiple times has proper entry/exit structure."""
+        # Call foo twice so it is not inlined (inlining requires call count <= 1)
+        code = self._compile(
+            "procedure foo\n  skip\n"
+            "procedure main\n  call foo\n  call foo"
+        )
         text = print_program(code)
         self.assertIn("foo_top:", text)
         self.assertIn("foo_bot:", text)
@@ -296,18 +300,17 @@ class TestCodeGen(unittest.TestCase):
         self.assertIn("BRA foo", text)
 
     def test_call_uncall(self):
-        """Call generates BRA, uncall generates RBRA."""
+        """Simple procedure called and uncalled once: inlined, no BRA/RBRA foo."""
         code = self._compile(
             "procedure foo\n  skip\n"
             "procedure main\n  call foo\n  uncall foo"
         )
-        text = print_program(code)
         instrs = [li.instr for li in code]
-        # Main body should have BRA foo and RBRA foo
+        # foo is inlined (simple body, call count 1, uncall count 1)
         bras = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
-        self.assertTrue(len(bras) >= 1)
-        self.assertTrue(len(rbras) >= 1)
+        self.assertEqual(len(bras), 0)
+        self.assertEqual(len(rbras), 0)
 
     def test_if_generates_beq(self):
         """If statement generates conditional branch."""
@@ -468,8 +471,28 @@ procedure main
   uncall inc
 """
         text = self._e2e(src)
+        # inc and main are reachable from main; dec is dead and must be eliminated
         self.assertIn("inc_top:", text)
-        self.assertIn("dec_top:", text)
+        self.assertNotIn("dec_top:", text)   # dead procedure removed
+        self.assertIn("main_top:", text)
+
+    def test_multiple_procedures_all_reachable(self):
+        # inc and dec are each called once → inlined; main is always kept.
+        # Verify correctness: inc adds 1, dec subtracts 1 → n = 0.
+        src = """\
+int n
+procedure inc
+  n += 1
+procedure dec
+  n -= 1
+procedure main
+  call inc
+  call dec
+"""
+        text = self._e2e(src)
+        # Inlined procedures do not emit separate proc labels
+        self.assertNotIn("inc_top:", text)
+        self.assertNotIn("dec_top:", text)
         self.assertIn("main_top:", text)
 
     def test_nested_if(self):
@@ -1113,13 +1136,23 @@ class TestCodeGenStatements(unittest.TestCase):
 
     def test_seq_combines_stmts(self):
         cg = self._cg(['x'])
+        # Constant RHS: optimizer uses ADDI/SUBI directly (no ADD/SUB needed)
         code = cg.gen_stmt(Seq([
             AssignVar('x', '+=', Const(1)),
             AssignVar('x', '-=', Const(1)),
         ]))
         types = self._itypes(code)
-        self.assertIn("ADD", types)
-        self.assertIn("SUB", types)
+        self.assertIn("ADDI", types)
+        self.assertIn("SUBI", types)
+        # Variable RHS: ADD/SUB are used
+        cg2 = self._cg(['x', 'y'])
+        code2 = cg2.gen_stmt(Seq([
+            AssignVar('x', '+=', Var('y')),
+            AssignVar('x', '-=', Var('y')),
+        ]))
+        types2 = self._itypes(code2)
+        self.assertIn("ADD", types2)
+        self.assertIn("SUB", types2)
 
     def test_if_generates_beq_and_bne(self):
         cg = self._cg(['x'])
@@ -1298,6 +1331,7 @@ class TestCodeGenStructural(unittest.TestCase):
                               f"Undefined label: {i.label}")
 
     def test_call_uncall_bra_rbra(self):
+        # Simple proc called+uncalled once → inlined; no BRA/RBRA foo emitted.
         code = self._compile(
             "procedure foo\n  skip\n"
             "procedure main\n  call foo\n  uncall foo"
@@ -1305,8 +1339,18 @@ class TestCodeGenStructural(unittest.TestCase):
         instrs = self._instrs(code)
         bra_foo = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         rbra_foo = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
+        self.assertEqual(len(bra_foo), 0)
+        self.assertEqual(len(rbra_foo), 0)
+
+    def test_call_not_inlined_generates_bra(self):
+        # Procedure called twice: not inlined; BRA foo must appear.
+        code = self._compile(
+            "procedure foo\n  skip\n"
+            "procedure main\n  call foo\n  call foo"
+        )
+        instrs = self._instrs(code)
+        bra_foo = [i for i in instrs if isinstance(i, BRA) and i.label == "foo"]
         self.assertGreaterEqual(len(bra_foo), 1)
-        self.assertGreaterEqual(len(rbra_foo), 1)
 
     def test_single_non_main_proc_used_as_entry(self):
         code = self._compile("procedure foo\n  skip")
@@ -1381,8 +1425,10 @@ procedure main
   uncall bar
 """
         text = self._text(src)
+        # bar: call+uncall from main (c=1, u=1, body=Call→not simple) → NOT inlined
         self.assertIn("BRA bar", text)
-        self.assertIn("BRA foo", text)
+        # foo: called once from bar (c=1, u=0, body=skip→simple) → inlined
+        self.assertNotIn("BRA foo", text)
 
     def test_array_swap_compiles(self):
         src = """\
@@ -1481,11 +1527,28 @@ procedure main
         self.assertIn(20, data_vals)
 
     def test_uncall_is_rbra(self):
+        # Simple proc called+uncalled once → inlined; no RBRA foo emitted.
         src = """\
 procedure foo
   skip
 procedure main
   call foo
+  uncall foo
+"""
+        code = self._e2e(src)
+        instrs = [li.instr for li in code]
+        rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
+        self.assertEqual(len(rbras), 0)
+
+    def test_uncall_not_inlined_generates_rbra(self):
+        # Proc called twice: not inlined; uncall must emit RBRA.
+        src = """\
+procedure foo
+  skip
+procedure main
+  call foo
+  call foo
+  uncall foo
   uncall foo
 """
         code = self._e2e(src)
@@ -1770,6 +1833,109 @@ class TestProgramStats(unittest.TestCase):
         s1 = program_stats(self._compile(src1))
         s3 = program_stats(self._compile(src3))
         self.assertEqual(s3["data_words"] - s1["data_words"], 2)
+
+
+class TestSelfReferenceAssign(unittest.TestCase):
+    """Opt S: x op= x  specialization (no eval/uneval overhead)."""
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def _run(self, src):
+        from pisa_interp import PISAMachine
+        code = self._compile(src)
+        m = PISAMachine(code)
+        m.run()
+        return dict(m.mem)
+
+    def test_double_x(self):
+        """x += x doubles x."""
+        mem = self._run("int x\nprocedure main\n  x += 5\n  x += x")
+        self.assertEqual(mem.get(0, 0), 10)
+
+    def test_zero_via_minus(self):
+        """x -= x zeroes x regardless of initial value."""
+        mem = self._run("int x\nprocedure main\n  x += 7\n  x -= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+    def test_zero_via_xor(self):
+        """x ^= x zeroes x."""
+        mem = self._run("int x\nprocedure main\n  x += 3\n  x ^= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+    def test_self_ref_fewer_instrs_than_general(self):
+        """x += x (self-ref) generates fewer data instructions than x += y (general)."""
+        src_self = "int x\nprocedure main\n  x += x"
+        src_gen  = "int x\nint y\nprocedure main\n  x += y"
+        s_self = program_stats(self._compile(src_self))["code_instructions"]
+        s_gen  = program_stats(self._compile(src_gen))["code_instructions"]
+        self.assertLess(s_self, s_gen)
+
+    def test_self_ref_roundtrip(self):
+        """Round-trip: x += x followed by x -= x restores x = 0."""
+        mem = self._run("int x\nprocedure main\n  x += 3\n  x += x\n  x -= x")
+        self.assertEqual(mem.get(0, 0), 0)
+
+
+class TestInlineSizeLimit(unittest.TestCase):
+    """Opt M: full-inline is skipped when body is too large."""
+
+    def _compile(self, src):
+        return compile_program(parse(tokenize(src)))
+
+    def _text(self, src):
+        return print_program(self._compile(src))
+
+    def test_small_body_full_inline(self):
+        """Simple 1-stmt proc (body ≈ 3 instr): inlined for call+uncall."""
+        text = self._text(
+            "int x\nprocedure inc\n  x += 1\n"
+            "procedure main\n  call inc\n  uncall inc"
+        )
+        self.assertNotIn("inc_top:", text)
+
+    def test_large_body_not_full_inline(self):
+        """4-stmt proc (body ≈ 12 instr): NOT inlined when call+uncall
+        because 2*12 > 12+11 (no code-size benefit)."""
+        text = self._text(
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big\n  uncall big"
+        )
+        self.assertIn("big_top:", text)
+
+    def test_large_body_call_only_still_inlined(self):
+        """Call-only (u=0) always saves the 9-instr overhead, no size limit."""
+        text = self._text(
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big"
+        )
+        self.assertNotIn("big_top:", text)
+
+    def test_correctness_large_body_round_trip(self):
+        """Round-trip via invert_program: big is not inlined but still correct.
+
+        P: call big (x: 0→10).
+        P⁻¹: uncall big (= RBRA big in this interpreter → runs inverted body
+             x -= 4; x -= 3; x -= 2; x -= 1 forward: x: 10→0).
+        """
+        from pisa_interp import PISAMachine
+        from inverse import invert_program
+        src = (
+            "int x\nprocedure big\n  x += 1\n  x += 2\n  x += 3\n  x += 4\n"
+            "procedure main\n  call big"
+        )
+        prog = parse(tokenize(src))
+        # Forward: x = 0 → 10
+        fwd_code = self._compile(src)
+        m_fwd = PISAMachine(fwd_code)
+        m_fwd.run()
+        self.assertEqual(m_fwd.mem.get(0, 0), 10)
+        # Inverse: x = 10 → 0
+        inv_code = compile_program(invert_program(prog))
+        m_inv = PISAMachine(inv_code)
+        m_inv.mem[0] = 10
+        m_inv.run()
+        self.assertEqual(m_inv.mem.get(0, 0), 0)
 
 
 if __name__ == "__main__":
