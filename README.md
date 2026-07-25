@@ -20,7 +20,14 @@ Program inversion follows the rules from:
 - PISA interpreter with Pendulum branch semantics and software call stack
 - Program inverter: given P, produces P⁻¹ (the semantic inverse) at the AST level
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
-- 283 tests (all passing)
+- Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
+- 295 tests (all passing)
+
+On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
+
+### Limitations
+
+- Multiplication (`*`) is not yet supported by the PISA code generator (parser accepts it; `CodeGenError` is raised at codegen time).
 
 ## Requirements
 
