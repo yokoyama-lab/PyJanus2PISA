@@ -272,6 +272,16 @@ python3 -m pytest test_janus2pisa.py test_inverse.py test_pisa_interp.py -v
 - Axelsen, H. B., Glück, R., and Yokoyama, T. "Reversible Machine Code and Its Abstract Processor Architecture." *CSR 2007*.
 - Yokoyama, T. and Glück, R. "A Reversible Programming Language and Its Invertible Self-Interpreter." *PEPM 2007*.
 
+### Related: the RC3 reversible compiler line (Janus via HSSA)
+
+A contemporary alternative route for compiling Janus is the RC3 compiler
+collection (TH Mittelhessen), which lowers reversible languages through the
+partially reversible intermediate language **HSSA** (hybrid SSA) rather than
+directly to a reversible ISA as done here:
+
+- Gail, L. and Meyer, U. "Connecting Reversible and Classical Computing Through Hybrid SSA." *RC 2024*, LNCS, pp. 161–178. DOI: 10.1007/978-3-031-62076-8_11. (Compiles Janus to HSSA.)
+- Gail, L., Meyer, U., and Schönhals, T. "Compiling Roopl++ to HSSA." *RC 2026*, LNCS, to appear. (Extends the same pipeline to the object-oriented reversible language ROOPL++, adding managed dynamic memory to HSSA.)
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).
