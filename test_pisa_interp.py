@@ -128,10 +128,16 @@ procedure main
         self.assertEqual(m.get_var(0), 10)
 
     def test_if_else_branch(self):
-        """if x = 1 then x += 10 else x -= 1 fi x = -1; x starts at 0."""
+        """if x = 1 then x += 10 else x -= 1 fi x = 11; x starts at 0.
+
+        The exit assertion must discriminate the branches: it holds after the
+        then branch (0+1 -> 11) and fails after the else branch (0 -> -1).
+        Written as `fi x = -1` this program is invalid Janus — PyJanus reports
+        "Assertion failed: should be false" — and is now rejected here too.
+        """
         src = """int x
 procedure main
-  if x = 1 then x += 10 else x -= 1 fi x = -1"""
+  if x = 1 then x += 10 else x -= 1 fi x = 11"""
         m = compile_and_run(src)
         self.assertEqual(m.get_var(0), -1)
 

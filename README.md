@@ -22,7 +22,7 @@ Program inversion follows the rules from:
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
 - Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
 - Multiplication by a compile-time constant, compiled to a branch-free shift-and-add chain
-- 323 tests (all passing)
+- 330 tests (all passing)
 
 On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
 
@@ -56,14 +56,30 @@ bookkeeping the prologue's `SWAPBR` perturbs, so the second call to any
 procedure fell through to whatever instruction physically followed it — which
 happened to be harmless for the old layouts and looped forever for new ones.
 
-### Known issue: `if` exit assertions are not checked
+### `if` exit assertions are checked
 
 For `if e1 then S1 else S2 fi e2`, Janus requires `e2` to hold on exit exactly
-when `e1` held on entry. This compiler does not enforce it: `_gen_if` evaluates
-`e2` only on the else path and then discards the value, and on the then path the
-`BNE` skips the evaluation entirely (`codegen.py` says so outright: "For correct
-Janus programs eval(fi) = 1"). PyJanus reports a runtime assertion failure; this
-compiler silently produces a result, and reversibility is lost:
+when `e1` held on entry. The branch flag is `1` on the then path and `0` on the
+else path, and `eval(e2)` is XORed into it on **both** paths, so the flag ends at
+`0` precisely when the assertion holds. A correct program therefore leaves no
+garbage; a violated assertion leaves the discrepancy in the flag, and the
+interpreter reports it at `FINISH`:
+
+```
+PISAError: garbage left in registers at FINISH (r3=1); the program is not
+reversible — most likely an `if` exit assertion that does not hold on the path
+taken
+```
+
+This ties the check to the *cleanliness* invariant proved in `rocq/Compile.v`
+(`clean_above`): a clean translation is garbage-free, so leftover garbage means
+the source program was not reversible. Set `machine.check_clean = False` to
+inspect a broken program's final state instead of raising.
+
+Previously `e2` was evaluated only on the else path and then discarded — the
+then path skipped it with a `BNE` — so the assertion was never checked. The
+program below ran silently to `x = 1`, and its inverse mapped `1` to `-1`
+instead of back to `0`:
 
 ```janus
 int x
@@ -71,12 +87,7 @@ procedure main
   if x = 0 then x += 1 else x += 2 fi x = 5
 ```
 
-runs to `x = 1`, and its inverse maps `1` to `-1` rather than back to `0`.
-
-Fixing it properly means implementing the Pendulum merge faithfully: evaluate
-`e2` on both paths and XOR it into the branch flag, which is then 0 exactly when
-the assertion holds, and treat a nonzero flag (equivalently, any garbage left in
-a register at `FINISH`) as the error it is.
+PyJanus reports "Assertion failed" for the same program; the two now agree.
 
 ## Machine-checked correctness (Rocq)
 

@@ -980,13 +980,24 @@ class CodeGen:
         then_code = self.gen_stmt(stmt.then_)
         code.extend(then_code)
 
-        # --- Assert e2 (true path) ---
+        # --- Assert e2 (both paths) ---
+        #
+        # rt is the path flag here: 1 on the then path, 0 on the else path.
+        # XORing eval(e2) into it leaves 0 exactly when the assertion holds
+        # (then requires e2 true, else requires e2 false), so a *correct*
+        # program leaves rt clean and a violated assertion leaves garbage,
+        # which the interpreter reports at FINISH.
+        #
+        # e2 is evaluated on BOTH paths.  It used to be skipped on the then
+        # path by a `BNE rt r0 assert_true`, which meant the assertion was
+        # never checked at all and reversibility was silently lost.
         code.append(self._emit(XORI(rt, 1)))
-        code.append(self._emit(BNE(rt, "r0", assert_true), assert_label))
 
         # Evaluate assertion
         eval_fi, re2 = self.gen_expr(stmt.fi)
         code.extend(eval_fi)
+        code[-len(eval_fi)] = LabeledInstr(assert_label, code[-len(eval_fi)].instr) \
+            if eval_fi else code[-1]
         code.append(self._emit(XOR(rt, re2)))
         uneval_fi = self._gen_uneval_expr(stmt.fi, re2)
         code.extend(uneval_fi)
@@ -1007,13 +1018,12 @@ class CodeGen:
 
         # --- End ---
         # The Pendulum pair (assert_true: BRA end_label / end_label: BRA assert_true)
-        # exits via pc = end_label + 1.  Both TRUE and FALSE paths leave rt = eval(fi)
-        # in the assertion register.  For correct Janus programs eval(fi) = 1, so rt = 1.
-        # Clear rt back to 0 so it is zero when the register is recycled by the next
-        # statement.
+        # exits via pc = end_label + 1.  Both paths leave rt = flag XOR eval(e2),
+        # which is 0 for a correct program — so rt needs no clearing, and any
+        # nonzero value left here is a genuine assertion violation rather than
+        # something to be wiped.
         code.append(self._emit(BRA(assert_true), end_label))  # Pendulum pair second
         self.reg.free_reg(rt)
-        code.append(self._emit(XOR(rt, rt)))                    # clear rt (= 0) after exit
 
         return code
 

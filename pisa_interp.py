@@ -119,6 +119,10 @@ class PISAMachine:
 
         # ---- software call stack ----
         self._call_stack: List[Tuple[int, int]] = []  # (return pc, saved br)
+        # Fail at FINISH if any scratch register is dirty (see
+        # _assert_no_garbage).  Settable so callers can inspect a broken
+        # program's final state instead of getting an exception.
+        self.check_clean: bool = True
 
         # direction bit (tracked but not used for pc control here)
         self.dir = 1
@@ -245,6 +249,28 @@ class PISAMachine:
     # Main execution loop
     # ------------------------------------------------------------------
 
+    # General-purpose registers; r0/r1/r2 are reserved (zero, stack pointer,
+    # return offset) and are not expected to be clear at FINISH.
+    _GP_REGS = tuple(f"r{i}" for i in range(3, 32))
+
+    def _assert_no_garbage(self) -> None:
+        """Fail if any general-purpose register is dirty when the program halts.
+
+        A clean translation is garbage-free: every scratch register the compiler
+        touches is restored to 0 (this is `clean_above` in rocq/Compile.v).  So
+        leftover garbage means the program was not reversible — in practice, a
+        violated `fi` assertion, which `_gen_if` leaves in the branch flag.
+        """
+        dirty = [(r, self._read_reg(r)) for r in self._GP_REGS
+                 if self._read_reg(r) != 0]
+        if dirty:
+            detail = ", ".join(f"{r}={v}" for r, v in dirty)
+            raise PISAError(
+                f"garbage left in registers at FINISH ({detail}); "
+                f"the program is not reversible — most likely an `if` exit "
+                f"assertion that does not hold on the path taken"
+            )
+
     def run(self, max_steps: int = 10_000_000) -> Dict[int, int]:
         """Run from START to FINISH; return final memory state."""
         pc = self._start_pc
@@ -261,6 +287,8 @@ class PISAMachine:
 
             # ---- FINISH: halt ----
             if isinstance(instr, FINISH):
+                if self.check_clean:
+                    self._assert_no_garbage()
                 return dict(self.mem)
 
             # ================================================================

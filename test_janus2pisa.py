@@ -509,7 +509,6 @@ procedure main
 """
         text = self._e2e(src)
         self.assertIn("BEQ", text)
-        self.assertIn("BNE", text)
 
 
 class TestLexerEdgeCases(unittest.TestCase):
@@ -1169,8 +1168,10 @@ class TestCodeGenStatements(unittest.TestCase):
         )
         code = cg.gen_stmt(stmt)
         types = self._itypes(code)
+        # BEQ is the entry test.  There is no BNE: the exit assertion used to be
+        # skipped by one, which meant it was never checked (see TestIfAssertion).
         self.assertIn("BEQ", types)
-        self.assertIn("BNE", types)
+        self.assertNotIn("BNE", types)
 
     def test_from_generates_bra_and_beq(self):
         cg = self._cg(['x'])
@@ -1302,14 +1303,13 @@ class TestCodeGenStructural(unittest.TestCase):
                    if isinstance(i, ADDI) and i.rd == 'r1']
         self.assertTrue(any(i.c > 0 for i in addi_r1))
 
-    def test_if_has_beq_and_bne(self):
+    def test_if_has_beq_entry_test(self):
         code = self._compile(
             "int x\nprocedure main\n"
             "  if x = 0 then skip else skip fi x != 0"
         )
         types = self._itypes(code)
         self.assertIn("BEQ", types)
-        self.assertIn("BNE", types)
 
     def test_from_has_multiple_bra(self):
         code = self._compile(
@@ -2130,6 +2130,76 @@ class TestUncallSemantics(unittest.TestCase):
         bump = next(p for p in inv.procs if p.name == "bump")
         body = bump.body.stmts[0] if isinstance(bump.body, Seq) else bump.body
         self.assertEqual(body.op, "+=")   # NOT inverted
+
+
+class TestIfAssertion(unittest.TestCase):
+    """`fi e2` must discriminate the branches, and a violation must be reported.
+
+    Regression tests for the second bug found by differential testing against
+    PyJanus: the exit assertion was evaluated only on the else path and then
+    discarded, so an ill-formed `if` ran silently and reversibility was lost.
+    Now `rt = flag XOR eval(e2)` is 0 exactly when the assertion holds, and a
+    nonzero value survives to FINISH where the interpreter reports it.
+    """
+
+    def _run(self, src, check_clean=True):
+        from pisa_interp import PISAMachine
+        m = PISAMachine(compile_program(parse(tokenize(src))))
+        m.check_clean = check_clean
+        m.run()
+        return m
+
+    THEN = ("int x\nint y\nprocedure main\n"
+            "  if x = 0 then\n    y += 1\n  else\n    y += 2\n  fi y = 1")
+    ELSE = ("int x\nint y\nprocedure main\n  x += 5\n"
+            "  if x = 0 then\n    y += 1\n  else\n    y += 2\n  fi y = 1")
+    BAD  = ("int x\nprocedure main\n"
+            "  if x = 0 then\n    x += 1\n  else\n    x += 2\n  fi x = 5")
+
+    def test_valid_then_path(self):
+        self.assertEqual(self._run(self.THEN).mem.get(1, 0), 1)
+
+    def test_valid_else_path(self):
+        self.assertEqual(self._run(self.ELSE).mem.get(1, 0), 2)
+
+    def test_violated_assertion_is_reported(self):
+        from pisa_interp import PISAError
+        with self.assertRaises(PISAError) as ctx:
+            self._run(self.BAD)
+        self.assertIn("not reversible", str(ctx.exception))
+
+    def test_violated_assertion_leaves_the_flag_dirty(self):
+        """With the check disabled, the branch flag holds the discrepancy."""
+        m = self._run(self.BAD, check_clean=False)
+        self.assertNotEqual(m._read_reg("r3"), 0)
+
+    def test_valid_program_leaves_no_garbage(self):
+        m = self._run(self.THEN)
+        for r in range(3, 32):
+            self.assertEqual(m._read_reg(f"r{r}"), 0, f"r{r} dirty")
+
+    def test_assertion_evaluated_on_both_paths(self):
+        """The then path must not skip the assertion (it used to)."""
+        from pisa_interp import PISAMachine
+        code = compile_program(parse(tokenize(self.THEN)))
+        m = PISAMachine(code)
+        m.run()
+        # then path taken (x = 0), and the flag still came out clean, which is
+        # only possible if e2 was actually evaluated and XORed in
+        self.assertEqual(m._read_reg("r3"), 0)
+
+    def test_if_roundtrip_still_reversible(self):
+        """A well-formed if is still invertible end to end."""
+        from pisa_interp import PISAMachine
+        from inverse import invert_program
+        prog = parse(tokenize(self.THEN))
+        m_fwd = PISAMachine(compile_program(prog))
+        m_fwd.run()
+        self.assertEqual(m_fwd.mem.get(1, 0), 1)
+        m_inv = PISAMachine(compile_program(invert_program(prog)))
+        m_inv.mem[1] = 1
+        m_inv.run()
+        self.assertEqual(m_inv.mem.get(1, 0), 0)
 
 
 if __name__ == "__main__":
