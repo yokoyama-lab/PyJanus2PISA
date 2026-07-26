@@ -1265,16 +1265,19 @@ def _cancels(a: Instr, b: Instr) -> bool:
         return a.rd == b.rd and a.c == b.c
     if isinstance(a, SUBI) and isinstance(b, ADDI):
         return a.rd == b.rd and a.c == b.c
+    # Register pairs cancel only with DISTINCT operands: XOR r r clears r
+    # (its pair's net effect is r := 0, not identity), ADD r r doubles, and
+    # EXCH r r is not self-inverse.  See rocq/Opt.v (`cancels_undo`).
     if isinstance(a, ADD) and isinstance(b, SUB):
-        return a.rd == b.rd and a.rs == b.rs
+        return a.rd == b.rd and a.rs == b.rs and a.rd != a.rs
     if isinstance(a, SUB) and isinstance(b, ADD):
-        return a.rd == b.rd and a.rs == b.rs
+        return a.rd == b.rd and a.rs == b.rs and a.rd != a.rs
     if isinstance(a, XOR) and isinstance(b, XOR):
-        return a.rd == b.rd and a.rs == b.rs
+        return a.rd == b.rd and a.rs == b.rs and a.rd != a.rs
     if isinstance(a, NEG) and isinstance(b, NEG):
         return a.rd == b.rd
     if isinstance(a, EXCH) and isinstance(b, EXCH):
-        return a.rd == b.rd and a.rs == b.rs
+        return a.rd == b.rd and a.rs == b.rs and a.rd != a.rs
     return False
 
 

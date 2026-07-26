@@ -2202,5 +2202,39 @@ class TestIfAssertion(unittest.TestCase):
         self.assertEqual(m_inv.mem.get(1, 0), 0)
 
 
+class TestPeepholeAliasedPairs(unittest.TestCase):
+    """Aliased register pairs are NOT mutual inverses and must not cancel.
+
+    XOR r r clears r; a second XOR r r is a no-op on 0.  The pair's net effect
+    is r := 0, so deleting both would leave r dirty.  Likewise ADD r r doubles
+    (SUB r r zeroes), and EXCH r r is not self-inverse.  Only pairs with
+    distinct operand registers may cancel.
+    """
+
+    def test_xor_self_pair_not_cancelled(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr(None, XOR("r3", "r3")),
+                LabeledInstr(None, XOR("r3", "r3"))]
+        self.assertEqual(len(_peephole_pass(code)), 2)
+
+    def test_add_sub_self_pair_not_cancelled(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr(None, ADD("r3", "r3")),
+                LabeledInstr(None, SUB("r3", "r3"))]
+        self.assertEqual(len(_peephole_pass(code)), 2)
+
+    def test_exch_self_pair_not_cancelled(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr(None, EXCH("r3", "r3")),
+                LabeledInstr(None, EXCH("r3", "r3"))]
+        self.assertEqual(len(_peephole_pass(code)), 2)
+
+    def test_distinct_pairs_still_cancel(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr(None, ADD("r3", "r4")),
+                LabeledInstr(None, SUB("r3", "r4"))]
+        self.assertEqual(_peephole_pass(code), [])
+
+
 if __name__ == "__main__":
     unittest.main()
