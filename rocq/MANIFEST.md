@@ -21,6 +21,7 @@ counterpart of the "whole-translator semantic preservation" that
 | `compile_reversible` | Compile.v | `run (invert_code (compile st)) (run (compile st) s) = s` |
 | `peephole_run`, `remove_nops_run`, `optimize_run` | Opt.v | the optimizer passes preserve `run`, for all straight-line code |
 | `cancels_undo` | Opt.v | a cancelling pair is exactly a well-formed instruction followed by its inverse |
+| `strip_exec` | LOpt.v | `remove_unused_labels` preserves execution, on a PC-based labeled-code machine (axiom-free) |
 
 ### The main theorem
 
@@ -79,9 +80,12 @@ the right operand's code is run, used, and then cancelled by `run_invert_code`.
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole` and `remove_nops` are DONE for straight-line
    code (Opt.v: `optimize_run`; writing the proof exposed and fixed an unsound
-   cancellation of aliased pairs like `XOR r r ; XOR r r` in `_cancels`).
-   Remaining: label handling (`remove_unused_labels`, label preservation in
-   `_peephole_pass`) — no labels in the model yet — and procedure inlining.
+   cancellation of aliased pairs like `XOR r r ; XOR r r` in `_cancels`), and
+   `remove_unused_labels` is DONE (LOpt.v: `strip_exec`, axiom-free, on the
+   first PC-based labeled-code model — direct branches only; Pendulum
+   RBRA/`br`/SWAPBR remain milestone 1). Remaining: the label *forwarding*
+   inside `_peephole_pass` (a label moves onto the line after a cancelled
+   pair), and procedure inlining.
 
 Before starting any of these, read "Related existing formalization" below: the
 framework there may supply most of milestones 1–2 for free.

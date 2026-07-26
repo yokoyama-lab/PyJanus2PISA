@@ -110,10 +110,12 @@ translation, and what makes the compiled code reversible on the machine
 (`wf_compile`).
 
 Covered: `skip`, `x op= e`, `x <=> y`, sequencing, expressions over `+ - ^`,
-and the optimizer passes `peephole` / `remove_nops` (`Opt.v`: they preserve
+and the optimizer passes: `peephole` / `remove_nops` (`Opt.v`: they preserve
 `run` on all straight-line code — writing that proof exposed an unsound
 cancellation of aliased pairs like `XOR r r ; XOR r r` in `_cancels`, now
-fixed). Not yet: control flow, procedures, arrays, label handling, inlining. No `Admitted`; the only axiom is
+fixed) and `remove_unused_labels` (`LOpt.v`: `strip_exec`, axiom-free, on a
+PC-based labeled-code machine with direct branches). Not yet: control flow
+compilation, procedures, arrays, peephole label forwarding, inlining. No `Admitted`; the only axiom is
 functional extensionality. See `rocq/MANIFEST.md` for the exact scope, side
 conditions, and next milestones.
 
