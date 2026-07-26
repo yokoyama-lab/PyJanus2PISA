@@ -1638,13 +1638,15 @@ class TestPeephole(unittest.TestCase):
         self.assertIsInstance(result[0].instr, BRA)
 
     def test_first_xori_labeled_no_successor(self):
-        """First XORI's label with no successor after pair: label is dropped safely."""
+        """A labeled pair with no successor is KEPT: cancelling it would drop
+        the label and leave any branch to it dangling."""
         code = [
             _li(XORI("r3", 1), label="entry"),
             _li(XORI("r3", 1)),
         ]
         result = peephole(code)
-        self.assertEqual(result, [])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].label, "entry")
 
     # --- Multiple pairs ---
 
@@ -2234,6 +2236,33 @@ class TestPeepholeAliasedPairs(unittest.TestCase):
         code = [LabeledInstr(None, ADD("r3", "r4")),
                 LabeledInstr(None, SUB("r3", "r4"))]
         self.assertEqual(_peephole_pass(code), [])
+
+
+class TestPeepholeLabelSafety(unittest.TestCase):
+    """Cancelling a labeled pair must never lose the label.
+
+    A branch may reference it; dropping it leaves the branch dangling and the
+    interpreter fails at load time.
+    """
+
+    def test_labeled_pair_at_end_keeps_label(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr(None, BRA("L")),
+                LabeledInstr("L", ADDI("r3", 1)),
+                LabeledInstr(None, SUBI("r3", 1))]
+        out = _peephole_pass(list(code))
+        self.assertTrue(any(li.label == "L" for li in out),
+                        "label L was dropped; BRA L is dangling")
+
+    def test_labeled_pair_forwarding_still_works(self):
+        from codegen import _peephole_pass
+        code = [LabeledInstr("L", ADDI("r3", 1)),
+                LabeledInstr(None, SUBI("r3", 1)),
+                LabeledInstr(None, ADDI("r4", 2))]
+        out = _peephole_pass(list(code))
+        self.assertEqual([(li.label, type(li.instr).__name__) for li in out],
+                         [("L", "ADDI")])
+        self.assertEqual(out[0].instr.rd, "r4")
 
 
 if __name__ == "__main__":

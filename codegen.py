@@ -1289,7 +1289,10 @@ def _peephole_pass(code: List[LabeledInstr]) -> List[LabeledInstr]:
         cur = code[i]
         if (i + 1 < len(code)
                 and _cancels(cur.instr, code[i + 1].instr)
-                and code[i + 1].label is None):
+                and code[i + 1].label is None
+                # a labeled pair at the very end has nowhere to carry its
+                # label; cancelling it would leave any branch to it dangling
+                and not (cur.label is not None and i + 2 >= len(code))):
             # Both cancel: skip them; forward the first's label if any
             if cur.label is not None and i + 2 < len(code):
                 next_li = code[i + 2]

@@ -22,7 +22,7 @@ Program inversion follows the rules from:
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
 - Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
 - Multiplication by a compile-time constant, compiled to a branch-free shift-and-add chain
-- 334 tests (all passing)
+- 336 tests (all passing)
 
 On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
 
@@ -114,8 +114,11 @@ and the optimizer passes: `peephole` / `remove_nops` (`Opt.v`: they preserve
 `run` on all straight-line code — writing that proof exposed an unsound
 cancellation of aliased pairs like `XOR r r ; XOR r r` in `_cancels`, now
 fixed) and `remove_unused_labels` (`LOpt.v`: `strip_exec`, axiom-free, on a
-PC-based labeled-code machine with direct branches). Not yet: control flow
-compilation, procedures, arrays, peephole label forwarding, inlining. No `Admitted`; the only axiom is
+PC-based labeled-code machine with direct branches) and the peephole label
+forwarding (`delete_cancelling_pair_fwd`: a forward simulation; stating it
+exposed that a labeled pair at the end of the code lost its label when
+cancelled, leaving branches dangling — now fixed). Not yet: control flow
+compilation, procedures, arrays, inlining. No `Admitted`; the only axiom is
 functional extensionality. See `rocq/MANIFEST.md` for the exact scope, side
 conditions, and next milestones.
 
