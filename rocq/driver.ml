@@ -91,13 +91,13 @@ let cases : case list = [
 ]
 
 let () =
-  List.iter (fun c ->
+  Stdlib.List.iter (fun c ->
     let code  = Compile.compile c.ast in
     let final = PISA.run code PISA.zero_state in
     Printf.printf "CASE %s\n" c.name;
-    Printf.printf "SOURCE %s\n" (String.concat "\\n" (String.split_on_char '\n' c.janus));
+    Printf.printf "SOURCE %s\n" (Stdlib.String.concat "\\n" (Stdlib.String.split_on_char '\n' c.janus));
     Printf.printf "NVARS %d\n" c.nvars;
-    List.iter (fun i -> Printf.printf "I %s\n" (instr_to_string i)) code;
+    Stdlib.List.iter (fun i -> Printf.printf "I %s\n" (instr_to_string i)) code;
     for v = 0 to c.nvars - 1 do
       Printf.printf "VAR %d %d\n" v (final.PISA.mem v)
     done;

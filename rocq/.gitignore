@@ -8,3 +8,22 @@
 Makefile
 Makefile.conf
 .Makefile.d
+
+# Extraction output (regenerate with: rocq compile -Q . "" Extract.v)
+BinInt.ml*
+BinNums.ml*
+Compile.ml*
+Datatypes.ml*
+List.ml*
+ListDef.ml*
+NatDef.ml*
+PISA.ml*
+PeanoNat.ml*
+PosDef.ml*
+Src.ml*
+# driver.ml is hand-written and IS tracked
+driver
+*.cmi
+*.cmx
+*.cmo
+*.o

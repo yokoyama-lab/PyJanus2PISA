@@ -1,0 +1,14 @@
+# Build the extracted verified compiler into a driver binary.
+#   make -f Makefile.driver        # extract (via coqc) + compile driver
+#   ./driver                       # emit the reference data
+DRIVER_ML = PISA.ml Src.ml Compile.ml driver.ml
+
+driver: $(DRIVER_ML)
+	ocamlfind ocamlopt -package str -linkpkg $(DRIVER_ML) -o driver 2>/dev/null || \
+	ocamlopt $(DRIVER_ML) -o driver
+
+$(DRIVER_ML): Extract.v PISA.vo Src.vo Compile.vo
+	rocq compile -Q . "" Extract.v
+
+clean-driver:
+	rm -f driver *.cm* *.o

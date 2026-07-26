@@ -118,6 +118,20 @@ conditions, and next milestones.
 cd rocq && make      # Rocq Prover 9.1.1
 ```
 
+`Extract.v` extracts the verified compiler to OCaml, and
+`tools/rocq_diff.py` diffs it against the Python one — catching the case where
+the proof is about a compiler that has drifted from `codegen.py`:
+
+```bash
+make -C rocq -f Makefile.driver   # needs OCaml
+python3 tools/rocq_diff.py        # 8/8 programs agree
+```
+
+It checks both directions at once: the verified compiler's instructions run on
+`pisa_interp.py` must give what the formal machine model gives (validating the
+Python *interpreter*), and `codegen.py`'s output on the same source must give
+the same store (validating the Python *compiler*).
+
 ## Cross-checking against PyJanus
 
 `tools/pyjanus_crosscheck.py` runs the same program through this compiler (→ PISA → PISA interpreter) and through the [PyJanus](https://github.com/yokoyama-lab/PyJanus) interpreter, then compares the final store.

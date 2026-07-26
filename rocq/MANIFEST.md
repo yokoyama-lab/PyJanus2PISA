@@ -68,19 +68,36 @@ the right operand's code is run, used, and then cancelled by `run_invert_code`.
 1. **Control flow** — `If` / `Loop`. Needs PISA branches (`BRA`/`RBRA`/`BEQ`/
    `BGEZ`) and the paired-branch (Pendulum) mechanism `pisa_interp.py` implements,
    so the machine model must grow a program counter and a branch direction.
-2. **Procedures** — `Call` / `Uncall`. This is where the compiler is known to be
-   *wrong*: `uncall f` compiles to `RBRA f`, which the interpreter runs forward
-   (see "Known issue: `uncall`" in the top-level README). Milestone 2 should
-   state the intended contract, `exec (Uncall p) a b ↔ exec (invert (Γ p)) a b`,
-   and prove the emitted code meets it — which the current scheme cannot.
+2. **Procedures** — `Call` / `Uncall`. The contract to state and prove is
+   `exec Γ (Uncall p) a b ↔ exec Γ (invert (Γ p)) a b`. The Python compiler now
+   meets it by branching to an inverted companion `f_inv` (the bug where
+   `uncall` ran the body forward is fixed), but nothing here proves that yet.
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole`, `remove_nops`, `remove_unused_labels`,
    inlining. Each should be proved to preserve `run`.
 
-Note that the Rocq `compile` is a re-implementation of `codegen.py`'s scheme, not
-extracted from it; the two are kept in step by hand and by `Test.v`, which runs
-the verified compiler on the same program `tools/pyjanus_crosscheck.py` uses and
-checks it yields `x = 5`, `y = 3`.
+## Extraction and the tie-back to the Python code
+
+The Rocq `compile` is a re-implementation of `codegen.py`'s scheme, not extracted
+from it, so the proof says nothing about the Python code on its own. `Extract.v`
+extracts the verified compiler and machine to OCaml (`driver.ml` drives them),
+and `../tools/rocq_diff.py` compares three things per program:
+
+| check | what a mismatch would mean |
+|---|---|
+| verified instructions run on `pisa_interp.py` vs on `PISA.run` | the Python **interpreter** disagrees with the formal PISA semantics |
+| `codegen.py` output vs the verified compiler's, on the same source | the Python **compiler** disagrees with the verified translation |
+| scratch registers at the end | garbage — `clean_above` violated |
+
+```bash
+make -f Makefile.driver     # extract + build (needs OCaml)
+cd .. && python3 tools/rocq_diff.py
+```
+
+Currently 8/8 programs agree. `ExtrOcamlNatInt`/`ExtrOcamlZInt` realise `nat`
+and `Z` by OCaml's native `int`, which the theorems do *not* cover — they are
+about unbounded `nat`/`Z`, so the extracted code inherits them only while no
+value overflows a 63-bit int.
 
 ## Axiom footprint
 
