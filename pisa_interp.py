@@ -52,7 +52,7 @@ Reference
 
 import sys
 import os
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -118,7 +118,7 @@ class PISAMachine:
         self.mem: Dict[int, int] = {}
 
         # ---- software call stack ----
-        self._call_stack: List[int] = []
+        self._call_stack: List[Tuple[int, int]] = []  # (return pc, saved br)
 
         # direction bit (tracked but not used for pc control here)
         self.dir = 1
@@ -270,30 +270,39 @@ class PISAMachine:
                 target_label = instr.label
                 target_pc = self.label_map[target_label]
 
-                if target_label in self._proc_names:
-                    # ---- CALL: use software call stack ----
-                    self._call_stack.append(pc + 1)
-                    pc = target_pc
+                cur_label = self.code[pc].label
+                is_proc_bot = (cur_label is not None
+                               and cur_label.endswith('_bot')
+                               and cur_label[:-4] in self._proc_names)
 
-                elif (target_label.endswith('_bot')
-                      and target_label[:-4] in self._proc_names):
-                    # ---- RETURN: f_bot: BRA f_top ----
-                    proc_name = target_label[:-4]
-                    f_top_pc = self.label_map[proc_name + '_top']
+                if is_proc_bot and self._call_stack:
+                    # ---- RETURN: we are sitting on `f_bot: BRA f_top` ----
+                    #
+                    # Detected here rather than after the f_bot/f_top hop: that
+                    # hop goes through the paired-branch machinery, whose `br`
+                    # bookkeeping is perturbed by the SWAPBR in the prologue, so
+                    # on a second call to the same procedure the hop fell through
+                    # to whatever instruction physically followed the procedure.
+                    proc_name = cur_label[:-4]
                     proc_pc = self.label_map[proc_name]
                     # Run the epilogue (second prologue pass) to keep memory
-                    # coherent.  The prologue lives at:
-                    #   f_top_pc+1 .. proc_pc+5  (SUBI EXCH SWAPBR NEG EXCH ADDI)
-                    epilogue_start = f_top_pc + 1
-                    epilogue_end = proc_pc + 6  # exclusive
-                    for ep in range(epilogue_start, epilogue_end):
+                    # coherent: SUBI EXCH SWAPBR NEG EXCH ADDI.
+                    for ep in range(proc_pc, proc_pc + 6):
                         self._exec_data(self.code[ep].instr)
-                    # Return via software call stack
-                    if not self._call_stack:
-                        raise PISAError(
-                            f"RETURN without CALL at pc={pc}, proc={proc_name}"
-                        )
-                    pc = self._call_stack.pop()
+                    pc, self.br = self._call_stack.pop()
+
+                elif target_label in self._proc_names:
+                    # ---- CALL: use software call stack ----
+                    # `br` is saved and cleared: a callee must not leak its
+                    # branch bookkeeping into the caller.
+                    self._call_stack.append((pc + 1, self.br))
+                    self.br = 0
+                    pc = target_pc
+
+                elif is_proc_bot:
+                    raise PISAError(
+                        f"RETURN without CALL at pc={pc}, proc={cur_label[:-4]}"
+                    )
 
                 elif pc in self._paired_pcs:
                     # ---- Paired Pendulum branch ----

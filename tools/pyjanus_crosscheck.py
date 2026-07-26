@@ -186,13 +186,7 @@ PROGRAMS = {
 # Divergences that are known compiler bugs rather than test-harness problems.
 # Reported but not counted as failures, so the tool stays usable as a
 # regression check for everything else.
-KNOWN_ISSUES = {
-    "procedure": (
-        "`uncall f` compiles to RBRA f, which this PISA interpreter executes "
-        "FORWARD, so uncall behaves like call.  PyJanus (the reference) runs "
-        "f backwards.  See README, 'Known issue: uncall'."
-    ),
-}
+KNOWN_ISSUES: dict = {}
 
 
 def main() -> int:

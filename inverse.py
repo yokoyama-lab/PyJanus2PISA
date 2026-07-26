@@ -105,9 +105,20 @@ def invert_stmt(stmt: Stmt) -> Stmt:
 def invert_program(prog: Program) -> Program:
     """Return the syntactic inverse of a Janus program.
 
-    Each procedure body is inverted; variable declarations are unchanged.
+    Only the *main* procedure's body is inverted; the procedure environment is
+    left alone.  This is the standard rule — semantically, exec is relative to
+    a fixed environment Γ and inversion keeps Γ (`exec Γ s a b -> exec Γ (invert s) b a`,
+    proved as `exec_rev` in rocq/Src.v).  Inverting the callees as well would
+    invert them twice, since `invert_stmt` already turns each `call f` into
+    `uncall f`, which runs f backwards.
+
+    Variable declarations are unchanged.
     """
-    inv_procs = [ProcDecl(p.name, invert_stmt(p.body)) for p in prog.procs]
+    inv_procs = [
+        ProcDecl(p.name,
+                 invert_stmt(p.body) if p.name == prog.main_proc else deepcopy(p.body))
+        for p in prog.procs
+    ]
     return Program(
         vars=deepcopy(prog.vars),
         procs=inv_procs,

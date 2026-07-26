@@ -1120,13 +1120,18 @@ class TestCodeGenStatements(unittest.TestCase):
         self.assertIsInstance(instrs[0], BRA)
         self.assertEqual(instrs[0].label, 'foo')
 
-    def test_uncall_generates_rbra(self):
+    def test_uncall_calls_inverted_companion(self):
+        """uncall f branches to the inverted companion f_inv.
+
+        A plain RBRA f would run f's body forward (this interpreter has no
+        Pendulum direction bit), making uncall behave like call.
+        """
         cg = self._cg([])
         code = cg.gen_stmt(Uncall('foo'))
         instrs = self._instrs(code)
         self.assertEqual(len(instrs), 1)
-        self.assertIsInstance(instrs[0], RBRA)
-        self.assertEqual(instrs[0].label, 'foo')
+        self.assertIsInstance(instrs[0], BRA)
+        self.assertEqual(instrs[0].label, 'foo_inv')
 
     def test_swap_scalars_uses_exch(self):
         cg = self._cg(['x', 'y'])
@@ -1427,8 +1432,11 @@ procedure main
         text = self._text(src)
         # bar: call+uncall from main (c=1, u=1, body=Call→not simple) → NOT inlined
         self.assertIn("BRA bar", text)
-        # foo: called once from bar (c=1, u=0, body=skip→simple) → inlined
-        self.assertNotIn("BRA foo", text)
+        # uncall bar goes to the inverted companion, whose body uncalls foo
+        self.assertIn("BRA bar_inv", text)
+        self.assertIn("BRA foo_inv", text)
+        # foo itself: called once from bar (c=1, u=0, body=skip→simple) → inlined
+        self.assertNotIn("BRA foo\n", text)
 
     def test_array_swap_compiles(self):
         src = """\
@@ -1540,8 +1548,8 @@ procedure main
         rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
         self.assertEqual(len(rbras), 0)
 
-    def test_uncall_not_inlined_generates_rbra(self):
-        # Proc called twice: not inlined; uncall must emit RBRA.
+    def test_uncall_not_inlined_branches_to_companion(self):
+        # Proc called twice: not inlined; uncall branches to foo_inv.
         src = """\
 procedure foo
   skip
@@ -1553,8 +1561,12 @@ procedure main
 """
         code = self._e2e(src)
         instrs = [li.instr for li in code]
-        rbras = [i for i in instrs if isinstance(i, RBRA) and i.label == "foo"]
-        self.assertGreaterEqual(len(rbras), 1)
+        self.assertGreaterEqual(
+            len([i for i in instrs if isinstance(i, BRA) and i.label == "foo_inv"]), 1)
+        # the companion procedure itself must be emitted
+        self.assertIn("foo_inv", [li.label for li in code])
+        # RBRA is no longer used for uncall anywhere
+        self.assertEqual([i for i in instrs if isinstance(i, RBRA)], [])
 
     def test_swap_scalar_produces_exch(self):
         src = "int x\nint y\nprocedure main\n  x += 1\n  y += 2\n  x <=> y"
@@ -2040,6 +2052,84 @@ class TestConstantMultiplication(unittest.TestCase):
     def test_constant_too_large_raises(self):
         with self.assertRaises(CodeGenError):
             self._compile("int x\nint y\nprocedure main\n  x += y * 1000000000")
+
+
+class TestUncallSemantics(unittest.TestCase):
+    """`uncall f` must run f backwards, not forwards.
+
+    Regression tests for the bug found by differential testing against
+    PyJanus: uncall used to compile to `RBRA f`, which this interpreter
+    executes forward, so `uncall f` behaved exactly like `call f`.
+    """
+
+    def _run(self, src):
+        from pisa_interp import PISAMachine
+        m = PISAMachine(compile_program(parse(tokenize(src))))
+        m.run()
+        return m.mem.get(0, 0)
+
+    BUMP = "int x\nprocedure bump\n  x += 1\nprocedure main\n"
+
+    def test_single_uncall_subtracts(self):
+        self.assertEqual(self._run(self.BUMP + "  uncall bump"), -1)
+
+    def test_two_uncalls(self):
+        self.assertEqual(self._run(self.BUMP + "  uncall bump\n  uncall bump"), -2)
+
+    def test_three_uncalls(self):
+        self.assertEqual(self._run(self.BUMP + "  uncall bump\n  uncall bump\n  uncall bump"), -3)
+
+    def test_call_then_uncall_is_identity(self):
+        self.assertEqual(self._run(self.BUMP + "  call bump\n  uncall bump"), 0)
+
+    def test_two_calls_one_uncall(self):
+        self.assertEqual(self._run(self.BUMP + "  call bump\n  call bump\n  uncall bump"), 1)
+
+    def test_repeated_calls_still_work(self):
+        """The return protocol must survive a procedure being called twice."""
+        self.assertEqual(self._run(self.BUMP + "  call bump\n  call bump\n  call bump"), 3)
+
+    def test_uncall_reverses_statement_order(self):
+        """f: x += 1; x *= ... — order matters, so a sequence body must reverse."""
+        src = ("int x\nprocedure f\n  x += 1\n  x += 2\n"
+               "procedure main\n  call f\n  uncall f")
+        self.assertEqual(self._run(src), 0)
+
+    def test_uncall_propagates_through_nested_call(self):
+        """uncall f, where f calls g, must uncall g."""
+        src = ("int x\nprocedure g\n  x += 5\nprocedure f\n  call g\n  x += 1\n"
+               "procedure main\n  uncall f")
+        self.assertEqual(self._run(src), -6)
+
+    def test_nested_call_then_uncall_is_identity(self):
+        src = ("int x\nprocedure g\n  x += 5\nprocedure f\n  call g\n  x += 1\n"
+               "procedure main\n  call f\n  uncall f")
+        self.assertEqual(self._run(src), 0)
+
+    def test_inverse_program_roundtrip_with_call(self):
+        """P⁻¹(P(σ)) = σ where P calls a procedure."""
+        from pisa_interp import PISAMachine
+        from inverse import invert_program
+        src = ("int x\nprocedure bump\n  x += 1\n  x += 2\n"
+               "procedure main\n  call bump\n  call bump")
+        prog = parse(tokenize(src))
+        m_fwd = PISAMachine(compile_program(prog))
+        m_fwd.run()
+        self.assertEqual(m_fwd.mem.get(0, 0), 6)
+        m_inv = PISAMachine(compile_program(invert_program(prog)))
+        m_inv.mem[0] = 6
+        m_inv.run()
+        self.assertEqual(m_inv.mem.get(0, 0), 0)
+
+    def test_invert_program_leaves_callees_alone(self):
+        """Only main is inverted; the procedure environment is unchanged."""
+        from inverse import invert_program
+        from syntax import AssignVar, Seq
+        src = ("int x\nprocedure bump\n  x += 1\nprocedure main\n  call bump")
+        inv = invert_program(parse(tokenize(src)))
+        bump = next(p for p in inv.procs if p.name == "bump")
+        body = bump.body.stmts[0] if isinstance(bump.body, Seq) else bump.body
+        self.assertEqual(body.op, "+=")   # NOT inverted
 
 
 if __name__ == "__main__":

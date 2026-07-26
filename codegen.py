@@ -20,6 +20,13 @@ from pisa import (
     DATA, START, FINISH,
 )
 from regalloc import RegAlloc
+from inverse import invert_stmt
+
+
+def _inv_proc_name(name: str) -> str:
+    """Label of the inverted companion of procedure `name`."""
+    return name + "_inv"
+
 
 
 class CodeGenError(Exception):
@@ -908,18 +915,19 @@ class CodeGen:
         return [self._emit(BRA(stmt.proc))]
 
     def _gen_uncall(self, stmt: Uncall) -> List[LabeledInstr]:
-        """Generate procedure uncall (Fig. 5): RBRA f, or inline the body.
+        """Generate procedure uncall: run f backwards.
 
-        Note: in this interpreter RBRA executes the procedure body forward
-        (via software call stack), so inlining simply emits gen_stmt(body).
-        The semantic inverse is already captured at the Janus level by
-        invert_program(), which inverts every procedure body.
+        A plain `RBRA f` does not work here: this interpreter has no Pendulum
+        direction bit, so it would execute f's body FORWARD, making `uncall f`
+        behave exactly like `call f`.  Instead we call an inverted companion
+        procedure `f_inv`, whose body is invert_stmt(f.body); gen_program emits
+        one for every uncalled procedure.  Inlined bodies are inverted in place.
         """
         if stmt.proc in self._inline_procs:
             proc, can_uncall = self._inline_procs[stmt.proc]
             if can_uncall:
-                return self.gen_stmt(proc.body)
-        return [self._emit(RBRA(stmt.proc))]
+                return self.gen_stmt(invert_stmt(proc.body))
+        return [self._emit(BRA(_inv_proc_name(stmt.proc)))]
 
     def _gen_if(self, stmt: If) -> List[LabeledInstr]:
         """Generate if-then-else (Fig. 11).
@@ -1174,7 +1182,8 @@ class CodeGen:
         #                           AND body is branch-free (safe to reverse)
         #
         #    main is never inlined (it is the entry point).
-        reachable = _reachable_procs(prog)
+        reachable_fwd, reachable_inv = _needed_procs(prog)
+        reachable = reachable_fwd | reachable_inv
         total_call_counts: Dict[str, Tuple[int, int]] = {}
         for proc in prog.procs:
             for name, (c, u) in _count_all_calls(proc.body).items():
@@ -1200,9 +1209,21 @@ class CodeGen:
 
         # 3. Procedure code (skip dead and inlined procedures)
         for proc in prog.procs:
-            if proc.name in reachable and proc.name not in self._inline_procs:
+            if proc.name in reachable_fwd and proc.name not in self._inline_procs:
                 proc_code = self.gen_proc(proc)
                 code.extend(proc_code)
+
+        # 3b. Inverted companion procedures, one per uncalled procedure.
+        #     `uncall f` compiles to `BRA f_inv`, so f_inv must exist whenever
+        #     the uncall is not inlined away.
+        for name in sorted(reachable_inv):
+            if name not in proc_map:
+                continue
+            inlined = self._inline_procs.get(name)
+            if inlined is not None and inlined[1]:
+                continue          # uncall of this one is inlined; no branch target needed
+            inv_proc = ProcDecl(_inv_proc_name(name), invert_stmt(proc_map[name].body))
+            code.extend(self.gen_proc(inv_proc))
 
         # 3. Entry/exit
         code.append(self._emit(START(), "start"))
@@ -1391,6 +1412,36 @@ def _is_simple_for_inline(stmt) -> bool:
     if isinstance(stmt, Seq):
         return all(_is_simple_for_inline(s) for s in stmt.stmts)
     return False  # If, From, Call, Uncall → not safe to reverse naively
+
+
+def _needed_procs(prog: Program) -> Tuple[set, set]:
+    """Return (F, I): procedures needing forward code, and needing an inverse.
+
+    Inside an *inverted* body a `call g` has become `uncall g` and vice versa,
+    so the two sets are mutually recursive.  Computing them together also keeps
+    dead code out: a procedure that is only ever uncalled gets `f_inv` emitted
+    and no forward copy.
+    """
+    proc_map = {p.name: p for p in prog.procs}
+    fwd, inv, work = set(), set(), []
+
+    def add(name: str, inverted: bool) -> None:
+        if name not in proc_map:
+            return
+        target = inv if inverted else fwd
+        if name not in target:
+            target.add(name)
+            work.append((name, inverted))
+
+    add(prog.main_proc, False)
+    while work:
+        name, inverted = work.pop()
+        for g, (calls, uncalls) in _count_all_calls(proc_map[name].body).items():
+            if calls:
+                add(g, inverted)
+            if uncalls:
+                add(g, not inverted)
+    return fwd, inv
 
 
 def _compute_call_depth(prog: Program) -> int:
