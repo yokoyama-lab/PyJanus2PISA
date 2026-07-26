@@ -68,13 +68,18 @@ the right operand's code is run, used, and then cancelled by `run_invert_code`.
 1. **Control flow** — `If` / `Loop`. Needs PISA branches (`BRA`/`RBRA`/`BEQ`/
    `BGEZ`) and the paired-branch (Pendulum) mechanism `pisa_interp.py` implements,
    so the machine model must grow a program counter and a branch direction.
-2. **Procedures** — `Call` / `Uncall`. The contract to state and prove is
-   `exec Γ (Uncall p) a b ↔ exec Γ (invert (Γ p)) a b`. The Python compiler now
-   meets it by branching to an inverted companion `f_inv` (the bug where
-   `uncall` ran the body forward is fixed), but nothing here proves that yet.
+2. **Procedures** — `Call` / `Uncall`. The source-side contract is *already*
+   machine-checked in `RevProc.v` of the PyJanus development (see below), in the
+   more general by-reference-parameter form; what is missing is only that the
+   *emitted code* meets it. The Python compiler now does, by branching to an
+   inverted companion `f_inv` (the bug where `uncall` ran the body forward is
+   fixed), but nothing here proves it.
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole`, `remove_nops`, `remove_unused_labels`,
    inlining. Each should be proved to preserve `run`.
+
+Before starting any of these, read "Related existing formalization" below: the
+framework there may supply most of milestones 1–2 for free.
 
 ## Extraction and the tie-back to the Python code
 
@@ -98,6 +103,104 @@ Currently 8/8 programs agree. `ExtrOcamlNatInt`/`ExtrOcamlZInt` realise `nat`
 and `Z` by OCaml's native `int`, which the theorems do *not* cover — they are
 about unbounded `nat`/`Z`, so the extracted code inherits them only while no
 value overflows a 63-bit int.
+
+## Related existing formalization: `yokoyama-lab/PyJanus`, `coq/`
+
+That repository (a *separate* checkout, `github.com/yokoyama-lab/PyJanus`, 39 `.v`
+files, Rocq 9.1, whole build ≈3 s) already contains a large machine-checked
+development about Janus. It was surveyed in full before the milestones above were
+written; this section records what is there, so that work here neither duplicates
+it nor misses the reuse.
+
+### The framework
+
+`RevCore.v` isolates reversibility behind a module type `REV_PRIM` whose only
+obligations are three local laws on the atomic primitives:
+
+```coq
+pinv_invol : pinv (pinv p) = p
+pstep_det  : pstep p a b -> pstep p a b' -> b = b'
+pstep_rev  : pstep p a b -> pstep (pinv p) b a
+```
+
+The functor `RevLang (P : REV_PRIM)` then builds structured control flow
+(sequencing, assertion-guarded `if`, `from/loop/until`, `call`/`uncall`), the
+inverter, the semantics, and proves `exec_rev` / `exec_iff` / `exec_det` /
+`exec_injective` once and for all. `RevNecessity.v` shows the three laws are also
+*necessary* (they force primitive injectivity; a "reset to 0" atom is provably
+inadmissible), and `RevAlgebra.v` recasts the whole thing as an open algebra of
+relational combinators, where each construct's reversibility is a closure lemma.
+
+Instances with no state or primitives in common with Janus — `RevStack.v` (state
+= `list Z`), `RevCA.v` (cellular automaton), `RevToy.v` (a counter) — inherit
+reversibility verbatim from the functor.
+
+### What is proved there (do not re-prove)
+
+| Area | Where |
+|---|---|
+| Janus reversibility, big-step | `Janus.v`, `RevJanus.v` |
+| Parameterized **by-reference procedures**, incl. `Uncall` | `RevProc.v` (concrete), `RevCoreP.v` (generic functor) |
+| Arrays with a runtime aliasing test, `local`/`delocal` | `RevArr.v`, `RevExt.v` |
+| Frame-stacked locals + **recursion** | `RevFrame.v` |
+| Small-step semantics, **equivalent** to big-step | `RevSmallStep.v` |
+| Denotational adequacy, **full abstraction**, `denote_invert` | `RevDenote.v` |
+| Dagger / inverse-category structure | `RevInverse.v`, `RevCat.v` |
+| **Bennett reversibilization (compute–copy–uncompute)** | `RevBennett.v` (`bennett_correct`) |
+| `*=` / `/=` as a partial-injective primitive | `RevMul.v` |
+| Sized ints and the `-m bits` mode (modular / signed-window cores) | `RevMod.v`, `RevExtMod.v`, `RevSMod.v`, `RevExtSMod.v` |
+| Reversible I/O | `RevIO.v` |
+| Verified fuel interpreters extracted to OCaml (six of them) | `RevExtract*.v` |
+| Clean-reversible construction from injective specs | `RevPipeline*.v`, `RevGolomb.v`, `RevVarint.v`, `RevZigzag.v`, `RevDeltaN.v` |
+
+`RevExtractFrame.v` backs **`vjanus`**, a standalone verified jana2014
+implementation (own lexer/parser/lowering, no Python at runtime) that matches
+PyJanus on 48/48 of the corpus, with `vjanus -inverse` running the verified
+inverter.
+
+### What is *not* there — where this directory adds something
+
+- **No assembly target.** Every target in that development is a structured
+  language (the frame core). PISA is unstructured: labels and branches, with the
+  reversibility of a *code layout* rather than of a syntax tree.
+- **No whole-translator semantic preservation.** `RevLowering.v` verifies only
+  the lowering rules that carry real proof obligations (the XOR-triple swap and
+  its aliased collapse, stack `push`/`pop`, the local-array bracket, injectivity
+  of struct-array addressing and the Cantor fold) and says explicitly that a Coq
+  model of all of `lower.ml` proved to commute with the source semantics remains
+  future work. Their roadmap for it is `docs/vjanus-lowering-soundness.md`.
+- **No cleanliness statement about a translation.** `RevBennett.v` verifies the
+  reversibilization *construction*, and the pipeline files produce clean
+  programs, but "the compiler restores every scratch register" — the second
+  conjunct of `compile_spec` — is a property of a code generator and is stated
+  here.
+
+### Reuse to consider before the next milestone
+
+1. **Make `PISA.v` a `REV_PRIM` instance.** `step_invert` is exactly `pstep_rev`;
+   `pinv_invol` and `pstep_det` are immediate. `RevStack.v` / `RevCA.v` show that
+   an unrelated state space is fine. Caveat, so as not to overclaim: `RevLang`
+   builds *structured* control flow, so this buys the straight-line case (a `Seq`
+   chain — i.e. `run_invert_code`) and the **source** side of milestones 1–2. It
+   does not by itself say anything about an arbitrary PISA instruction sequence,
+   which is what `compile_spec` is about.
+2. **`RevProc.v` already fixes the `Uncall` contract** (`E_Uncall` is defined as
+   `exec (rename (pbind p args) (invert (pbody p)))`, with `exec_rev` proved).
+   Milestone 2 should therefore prove only that the *emitted code* meets that
+   contract, not restate it.
+3. **`RevBennett.bennett_correct`** for the compute/uncompute argument that
+   `gen_expr_spec`'s `Bin` case currently makes by hand.
+4. **Adopt their `audit.sh`.** It runs `Print Assumptions` on every headline
+   theorem and fails the build on any axiom beyond functional extensionality or
+   any `Admitted`, wired to CI as `.github/workflows/coq.yml`. `Test.v` here only
+   *prints* its assumptions — nothing fails if that changes.
+5. **Fixed-width registers.** `PISA.v` models registers as unbounded `Z`, which
+   real PISA is not; this is an unflagged fidelity gap. `RevSMod.v`'s signed
+   window `[-2^(b-1), 2^(b-1))` is the ready-made model, and it is validated
+   against PyJanus's `-m 8` output.
+6. **`harness/`** is the established pattern for differential-testing an extracted
+   interpreter against PyJanus, wired into their pytest suite;
+   `../tools/rocq_diff.py` and `../tools/pyjanus_crosscheck.py` re-invent it.
 
 ## Axiom footprint
 
