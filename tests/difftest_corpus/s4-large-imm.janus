@@ -1,0 +1,14 @@
+// Own stress test for the adapter: constants outside phpisa's 11-bit immediate
+// range (|c| > 1023) in += / -= / ^=.  pisa2pal splits medium constants into
+// several ADDI and builds large ones in a scratch register.
+int x
+int y
+int z
+procedure main
+  x += 5000
+  y -= 123456789
+  z ^= 70000
+  z ^= -70000
+  x += 2147483647
+  y ^= 1023
+  y ^= 1024

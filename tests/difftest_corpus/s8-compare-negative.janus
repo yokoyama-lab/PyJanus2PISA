@@ -1,0 +1,15 @@
+// Own stress test: comparison results (0/1 via SLTX) with negative operands,
+// in straight-line code (no if), so the SLTX emulation is tested in isolation.
+int x
+int y = 2
+int lt
+int gt
+int eq
+int le
+procedure main
+  x -= 3
+  lt += x < y
+  gt += x > y
+  eq += x = y
+  le += x <= y
+  le += y <= x

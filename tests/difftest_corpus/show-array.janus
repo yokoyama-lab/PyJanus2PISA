@@ -1,0 +1,6 @@
+// Translated from janus-examples kato131219_comp/131219/examples/show-array.j2
+// Changes: local `int a[3]` -> global; `show(a)` dropped (no output statement
+// in this dialect); a value is written so the store is not all zero.
+int a[3]
+procedure main
+  a[1] += 7

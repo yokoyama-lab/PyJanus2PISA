@@ -1,0 +1,2 @@
+// SKIP: stacks (`stack s`, `show(s)`) are not part of pyjanus2pisa's Janus dialect
+// Original: janus-examples kato131219_comp/131219/examples/show-stack.j2

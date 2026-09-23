@@ -1,0 +1,20 @@
+// Translated from janus-examples watanabe/J1/Fibonacci program.j1, procedure main_bwd
+// Changes: as j1-fib.janus; `main_bwd` -> `main`.  Exercises `uncall` of a
+// recursive procedure (the compiler emits an inverted companion fib_inv).
+int n
+int x1
+int x2
+procedure fib
+  if n = 0 then
+    x1 += 1
+    x2 += 1
+  else
+    n -= 1
+    call fib
+    x1 += x2
+    x1 <=> x2
+  fi x1 = x2
+procedure main
+  x1 += 5
+  x2 += 8
+  uncall fib

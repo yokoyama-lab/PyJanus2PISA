@@ -1,0 +1,7 @@
+// Translated from janus-examples kato131219_comp/131219/examples/comment-multipleline.j2
+// Changes: `/* comment */` -> `//` comment (the lexer has only line comments);
+// `procedure main()` -> `procedure main`.  Needs at least one variable so the
+// harness has a store to compare.
+int dummy
+procedure main
+  skip // comment

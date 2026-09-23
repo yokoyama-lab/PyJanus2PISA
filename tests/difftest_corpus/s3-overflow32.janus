@@ -1,0 +1,9 @@
+// Own stress test: arithmetic past 2^31 and 2^32.  Neither interpreter wraps at
+// 32 bits (pisa_interp: unbounded Python ints; phpisa: PHP 64-bit ints), so the
+// two should agree here while a real 32-bit Pendulum would not.
+int x = 2147483647
+int y
+procedure main
+  y += x
+  x += y
+  x += 1

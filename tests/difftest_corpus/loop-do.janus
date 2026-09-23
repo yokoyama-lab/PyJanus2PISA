@@ -1,0 +1,10 @@
+// Translated from janus-examples kato131219_comp/131219/examples/loop-do.j2
+// Changes: local `int n` -> global; the parser requires both `do` and `loop`
+// parts, so `loop skip` was added.
+int n
+procedure main
+  from n = 0 do
+    skip
+  loop
+    skip
+  until n = 0

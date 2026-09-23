@@ -1,0 +1,2 @@
+// SKIP: uses division `/`, modulo `¥`, variable*variable multiplication and `read`, none of which codegen supports
+// Original: janus-examples watanabe/J1/Factorization program.j1 (Lutz & Derby 1982)

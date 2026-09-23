@@ -1,0 +1,2 @@
+// SKIP: stacks (`stack s`, push/pop) are not part of pyjanus2pisa's Janus dialect
+// Original: janus-examples kato131219_comp/131219/examples/call-stack.j2

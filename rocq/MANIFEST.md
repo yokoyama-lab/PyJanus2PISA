@@ -375,7 +375,9 @@ inverter.
 5. **Fixed-width registers.** `PISA.v` models registers as unbounded `Z`, which
    real PISA is not; this is an unflagged fidelity gap. `RevSMod.v`'s signed
    window `[-2^(b-1), 2^(b-1))` is the ready-made model, and it is validated
-   against PyJanus's `-m 8` output.
+   against PyJanus's `-m 8` output. **Experiment** (branch `claude/pisa-fixed-width`): `RevSMod.v`
+   (stand-in), `PISAFixed.v`, `CompileFixed.v`, `OptFixed.v`, `TestFixed.v` do exactly this; the
+   per-lemma breakage table is in `FIXED_WIDTH_REPORT.md`.
 6. **`harness/`** is the established pattern for differential-testing an extracted
    interpreter against PyJanus, wired into their pytest suite;
    `../tools/rocq_diff.py` and `../tools/pyjanus_crosscheck.py` re-invent it.
