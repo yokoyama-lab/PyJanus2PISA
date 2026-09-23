@@ -92,8 +92,8 @@ PyJanus reports "Assertion failed" for the same program; the two now agree.
 ## Machine-checked correctness (Rocq)
 
 `rocq/` contains a Rocq 9.1 development proving **semantic preservation** for the
-straight-line fragment of the translation — the PISA counterpart of the
-whole-translator correctness that the PyJanus development leaves open:
+straight-line fragment of the translation and for `if` — the PISA counterpart of
+the whole-translator correctness that the PyJanus development leaves open:
 
 ```coq
 Theorem compile_spec : forall st sigma sigma' m,
@@ -117,10 +117,17 @@ fixed) and `remove_unused_labels` (`LOpt.v`: `strip_exec`, axiom-free, on a
 PC-based labeled-code machine with direct branches) and the peephole label
 forwarding (`delete_cancelling_pair_fwd`: a forward simulation; stating it
 exposed that a labeled pair at the end of the code lost its label when
-cancelled, leaving branches dangling — now fixed). Not yet: control flow
-compilation, procedures, arrays, inlining. No `Admitted`; the only axiom is
-functional extensionality. See `rocq/MANIFEST.md` for the exact scope, side
-conditions, and next milestones.
+cancelled, leaving branches dangling — now fixed). Also covered: **`if e1 then
+S1 else S2 fi e2`** (`PISACtl.v`, `CompileIf.v`): a PC-based machine with the
+Pendulum branch register and paired branches, modelled on `pisa_interp.py`, and
+`compile_c_spec`, which proves the `_gen_if` layout — entry test, paired
+branches, exit assertion — correct and clean, for nested `if`s embedded
+anywhere in a larger program, when the tests are 0/1-valued (writing it showed
+that `_gen_if` leaves garbage for a non-Boolean test such as
+`if 5 then … fi 7`, which Janus allows). Not yet: `from/loop/until`,
+procedures, arrays, inlining. No `Admitted`; the only axiom is functional
+extensionality. See `rocq/MANIFEST.md` for the exact scope, side conditions,
+and next milestones.
 
 ```bash
 cd rocq && make      # Rocq Prover 9.1.1

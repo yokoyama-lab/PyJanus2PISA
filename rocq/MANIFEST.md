@@ -4,9 +4,26 @@ Rocq Prover 9.1.1. Build with `make` (regenerate with `rocq makefile -f _CoqProj
 No `Admitted`, no `admit`, no local `Axiom`.
 
 This directory answers the question "is the translation this repository implements
-actually correct?" for the **straight-line fragment** of Janus. It is the PISA
-counterpart of the "whole-translator semantic preservation" that
-`RevLowering.v` in the PyJanus development explicitly leaves open.
+actually correct?" for the **straight-line fragment** of Janus plus **`if`**
+(PISACtl.v / CompileIf.v: a PC-based machine with the Pendulum paired-branch
+mechanism, and the `_gen_if` layout proved correct on it — see "Control flow"
+below). It is the PISA counterpart of the "whole-translator semantic
+preservation" that `RevLowering.v` in the PyJanus development explicitly leaves
+open.
+
+## Modules
+
+| File | Contents |
+|---|---|
+| PISA.v | straight-line machine: registers, memory, `step`/`run`, local inverses |
+| Src.v | source fragment `Skip`/`Assign`/`Swap`/`Seq`, `exec`, `invert` |
+| Compile.v | the straight-line compiler and `compile_spec` |
+| Opt.v | `peephole` / `remove_nops` preserve `run` |
+| LOpt.v | first labeled-code model (direct branches); `remove_unused_labels`, label forwarding |
+| PISACtl.v | **control-flow machine**: labeled program, pc, `br`, paired branches, `cstep`/`steps`/`exec_fuel` |
+| CompileIf.v | **`If`**: base-parametrised body compiler, `exec_c`, `compile_c`, `compile_c_spec` |
+| Test.v | executable checks and `Print Assumptions` |
+| Extract.v | OCaml extraction of the straight-line compiler (driven by `driver.ml`) |
 
 ## What is proved
 
@@ -23,6 +40,12 @@ counterpart of the "whole-translator semantic preservation" that
 | `cancels_undo` | Opt.v | a cancelling pair is exactly a well-formed instruction followed by its inverse |
 | `strip_exec` | LOpt.v | `remove_unused_labels` preserves execution, on a PC-based labeled-code machine (axiom-free) |
 | `delete_cancelling_pair_fwd` | LOpt.v | deleting a cancelling pair with label forwarding preserves every terminating run (forward simulation with a pc map) |
+| `steps_ops` | PISACtl.v | a straight-line segment of the labeled machine behaves like `PISA.run` |
+| `compile_at_spec`, `compile_at_scratch` | CompileIf.v | the straight-line compiler with a scratch *base* is correct, and at base `scratch` it is literally `compile` |
+| `exec_c_rev` | CompileIf.v | the source with `If` is reversible (`invert_c` swaps test and assertion) |
+| `compile_c_labels` | CompileIf.v | every label the compiler emits lies in `[n, n')` (freshness) |
+| **`compile_c_spec`** | CompileIf.v | **semantic preservation + cleanliness for `If`** on the paired-branch machine, for a fragment embedded anywhere — see "Control flow" |
+| `compile_c_program` | CompileIf.v | closed corollary: the fuel executor halts at the end with the right memory and the same registers |
 
 ### The main theorem
 
@@ -67,11 +90,122 @@ the right operand's code is run, used, and then cancelled by `run_invert_code`.
   The model has an unbounded register file, so register *exhaustion* (the
   `RegAllocError` of `regalloc.py`) is out of scope.
 
+## Control flow: the machine model and `If` (PISACtl.v, CompileIf.v)
+
+### The machine (PISACtl.v)
+
+`cstate = {cpc : nat; cbr : Z; cst : PISA.state}` over a labeled program
+`lprog = list (option label * cinstr)`, with `cinstr = COp i | CBra l | CRbra l
+| CBeq rd rs l | CBne rd rs l | CBgez rd l | CSwapbr rd`. `cstep : lprog -> cstate
+-> option cstate` is a function (the machine is deterministic), `steps` its
+reflexive–transitive closure, `exec_fuel` the fuel executor
+(`steps_exec_fuel` ties them). Data instructions delegate to `PISA.step`.
+
+The semantics is that of `pisa_interp.py`, checked line by line:
+
+| `pisa_interp.py` | model |
+|---|---|
+| `_detect_paired_branches`: A is paired iff `code[A]` is BRA/RBRA → B and `code[B]` branches back to A (unconditionally, or conditionally via its label) | `paired p a`, computed from the same static data |
+| paired BRA: `br += t - pc; pc += br` if `br ≠ 0` else `pc += 1` | `bra_step`, `paired = true` branch |
+| unpaired BRA/RBRA: `pc = t` | `bra_step`, `paired = false` branch |
+| BEQ/BNE/BGEZ with `br = 0`: direct conditional jump | `cond_step`, `br =? 0` branch |
+| … with `br ≠ 0`: taken → `br += t - pc`; `br = 0` → `pc = t + 1`, else `pc += br`; not taken → `pc += br` | `cond_step`, other branch |
+| RBRA executed exactly like BRA (the direction bit is tracked but never used) | `CRbra` shares `bra_step` |
+| SWAPBR: exchange register and `br`, `pc += 1` | `CSwapbr` |
+| `pc = pc + br` negative → `PC out of range` | `jump` returns `None` (stuck) |
+| `r0` reads 0 | **not modelled** (PISA.v's register file is uniform); the theorems assume `regs ms 0 = 0`, which compiled code preserves |
+| software call stack, procedure detection (`f_top`/`f_bot`), `START`/`FINISH`/`DATA`, garbage check at `FINISH` | **not modelled** — milestone 2 |
+| direction bit / reverse execution | **not modelled** — `pisa_interp.py` does not implement it either |
+
+So the model covers every control instruction the interpreter executes inside a
+procedure body, including how a branch landing on its partner is consumed
+(`cstep_bra_paired_cancel`, `cstep_beq_cancel`). It was validated by running
+the verified compiler's output for three programs (then path, else path,
+nested) on `pisa_interp.py`: memory, `br = 0` and clean registers agree with
+`exec_fuel` (`ex_then`, `ex_else`, `ex_nested` in CompileIf.v).
+
+### The source and the compiler (CompileIf.v)
+
+```coq
+Inductive cstmt := CBase (s : stmt) | CSeq (a b : cstmt)
+                 | CIf (e1 : expr) (a b : cstmt) (e2 : expr).
+| EC_IfTrue  : eval σ e1 = 1 -> exec_c a σ σ' -> eval σ' e2 = 1 -> exec_c (CIf e1 a b e2) σ σ'
+| EC_IfFalse : eval σ e1 = 0 -> exec_c b σ σ' -> eval σ' e2 = 0 -> exec_c (CIf e1 a b e2) σ σ'
+```
+
+`compile_c st b n : lprog * label` compiles with scratch base `b` and labels
+from `n`, returning the next free label. `If` is `if_code`, the exact
+`_gen_if` layout: `<e1 -> re>; XOR rt re; <uneval e1>; test: BEQ rt r0 false;
+XORI rt 1; S1; XORI rt 1; assert: <e2 -> re>; XOR rt re; <uneval e2>; true: BRA
+end; false: BRA test; S2; BRA assert; end: BRA true`, with `rt = b`, `re = S b`
+and the five labels `n..n+4` in `_gen_if`'s allocation order. Bodies are
+compiled at base `S b` — `_gen_if` allocates the flag first, so bodies use
+`r4` upwards — which is why Compile.v's fixed-base compiler is generalised to
+`compile_at b` (`compile_at scratch = compile`).
+
+### The theorem
+
+```coq
+Theorem compile_c_spec : forall st σ σ' b n p n' ms pre post,
+  exec_c st σ σ' -> wf_cstmt st ->
+  compile_c st b n = (p, n') -> b <> 0%nat ->
+  models ms σ -> clean_above b ms -> regs ms 0%nat = 0 ->
+  (forall l, In l (labels pre)  -> ~ (n <= l < n')%nat) ->
+  (forall l, In l (labels post) -> ~ (n <= l < n')%nat) ->
+  exists ms',
+    steps (pre ++ p ++ post) (mkC (length pre) 0 ms) (mkC (length pre + length p) 0 ms')
+    /\ models ms' σ' /\ regs ms' = regs ms.
+```
+
+Started at its first line with `br = 0`, the code reaches the line after its
+last with `br = 0`, memory representing `σ'` and the *same* register file.
+The `pre`/`post` quantification is what makes it compose: bodies are such
+fragments (nested `If` works), and so is the whole statement inside a larger
+program whose labels avoid `[n, n')` (`compile_c_labels`). `compile_c_program`
+specialises to `pre = post = []`, `b = scratch`, `n = 0` and the fuel executor.
+
+Restrictions, all deliberate:
+
+- **Boolean-valued tests.** `EC_IfTrue`/`EC_IfFalse` require `eval e1`,
+  `eval e2 ∈ {0, 1}` where Janus requires `≠ 0` / `= 0`. This is not a proof
+  convenience: `_gen_if` checks the exit assertion by XOR-ing `eval e2` into the
+  flag, which is clean only when `e2` evaluates to the flag's value. For
+  `if 5 then x += 1 else x += 2 fi 7` — valid Janus — `codegen.py` leaves
+  `5 xor 7 = 2` in `r3` and `pisa_interp.py` reports garbage (reproduced on the
+  Python side; `ex_violation_dirty` shows the same on the model). Comparison
+  operators, which are what real tests use, are 0/1-valued, so the theorem
+  covers them once expressions grow comparisons (milestone 3). Fixing
+  `codegen.py` for non-Boolean tests (normalise the test to 0/1 first) is a
+  follow-up on the Python side.
+- **`b <> 0` and `regs ms 0 = 0`** stand for the hard-wired zero register the
+  entry test `BEQ rt r0` compares against.
+- **Bodies** are straight-line statements or nested `If`s (`wf_cstmt` is
+  `wf_stmt` on the leaves). No `Loop` yet — see below.
+
+`Print Assumptions` (recorded at build time at the end of CompileIf.v):
+
+```
+compile_c_spec     : functional_extensionality_dep
+compile_c_program  : functional_extensionality_dep
+exec_c_rev         : functional_extensionality_dep   (via Src.exec_rev)
+compile_at_scratch : Closed under the global context
+```
+
 ## Not covered (next milestones)
 
-1. **Control flow** — `If` / `Loop`. Needs PISA branches (`BRA`/`RBRA`/`BEQ`/
-   `BGEZ`) and the paired-branch (Pendulum) mechanism `pisa_interp.py` implements,
-   so the machine model must grow a program counter and a branch direction.
+1. **Control flow** — `If` is DONE (above). **`Loop`** (`from e1 do S1 loop S2
+   until e2`) is next. `_gen_from` in `codegen.py` uses only *direct* branches
+   (`BEQ rt r0 loop_body`, `BRA exit`, `BRA entry_do`; none of them lands on a
+   branch, so none is paired), which PISACtl.v already covers. Two things
+   stand in the way, both on the compiler side: `_gen_from` clears the flag
+   with `XOR rt rt` after each assertion, which (a) *discards* the assertion
+   result instead of checking it — the same weakness `4b068be` fixed for `if`
+   — and (b) is not a well-formed reversible instruction (`wf_instr` rejects
+   `IXor rd rd`), so the emitted loop is not covered by `run_invert_code`.
+   The proof of the fixed layout is an induction on the number of iterations
+   with the invariant `models ms σ_i /\ regs ms = R /\ br = 0` at the loop
+   head, reusing `test_steps`/`assert_steps` as they are, plus a `CLoop`
+   constructor with `EC_Loop` rules mirroring `Janus.v`.
 2. **Procedures** — `Call` / `Uncall`. The source-side contract is *already*
    machine-checked in `RevProc.v` of the PyJanus development (see below), in the
    more general by-reference-parameter form; what is missing is only that the
@@ -98,6 +232,32 @@ the right operand's code is run, used, and then cancelled by `run_invert_code`.
 
 Before starting any of these, read "Related existing formalization" below: the
 framework there may supply most of milestones 1–2 for free.
+
+## RESUME — where to pick up
+
+- **`Loop`** (milestone 1, remaining half): first fix `_gen_from`'s `XOR rt rt`
+  clears in `codegen.py` (see "Not covered" 1), then add `CLoop e1 a b e2` to
+  `cstmt`, the layout to `compile_c`, and prove the `CLoop` case of
+  `compile_c_spec` by induction on the iteration count. The layout lemmas in
+  `Section IfLayout` show the pattern (positions as `Let`s, one lemma per line
+  and per label, `paired_*` decided by `paired_bra_bra`/`paired_bra_beq`).
+- **`r0`**: either keep the `regs ms 0 = 0` premise or give PISACtl.v a
+  read-through `rread` that returns 0 for register 0 — cheap, but it should
+  wait for the register-width change below so PISA.v is touched once.
+- **Register width**: PISACtl.v/CompileIf.v use `PISA.state` as is. When the
+  fixed-width (`RevSMod`) register file lands in PISA.v, `xor_block_spec` and
+  the `compile_at_*` proofs are the places that compute on register values
+  (`Z.lxor 1 1`, `rupd_zero`); the control-flow lemmas never look inside
+  registers except through `regs s rd =? regs s rs`.
+- **Non-Boolean tests in `codegen.py`**: see the restriction above; a Python
+  fix plus a `Janus.v`-shaped (`<> 0`) `exec_c` would remove the `= 1` premise.
+- **Unify the two labeled models**: LOpt.v's `binstr`/`exec_fuel` (direct
+  branches only) is subsumed by PISACtl.v; re-stating `strip_exec` and
+  `delete_cancelling_pair_fwd` on PISACtl.v would retire LOpt.v's machine.
+- **Extraction / differential test**: `Extract.v` and `tools/rocq_diff.py`
+  cover the straight-line compiler only; extracting `compile_c` and
+  `exec_fuel` would let `rocq_diff.py` compare `if` programs too (the manual
+  check above did this once for three programs).
 
 ## Extraction and the tie-back to the Python code
 
@@ -225,7 +385,8 @@ inverter.
 ## Axiom footprint
 
 `functional_extensionality_dep`, and nothing else (`Print Assumptions` in
-`Test.v` reports it at build time). It is used only to promote pointwise equality
+`Test.v` and at the end of `CompileIf.v` reports it at build time; PISACtl.v's
+own lemmas are axiom-free). It is used only to promote pointwise equality
 of the register file and memory — both higher-order maps, `reg -> Z` and
 `addr -> Z` — to Leibniz equality. Removing it would require a first-order
 machine state (e.g. a bounded vector of registers). This is the same trade-off
