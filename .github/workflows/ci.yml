@@ -20,8 +20,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install pytest
         run: python -m pip install --upgrade pip pytest
+      - name: Fetch phpisa for the differential tests (skipped if unavailable)
+        run: |
+          php --version || (sudo apt-get update && sudo apt-get install -y php-cli)
+          git clone --depth 1 https://github.com/yokoyama-lab/phpisa "$GITHUB_WORKSPACE/../phpisa" || echo "phpisa not available; test_difftest.py will skip the php tests"
       - name: Run test suite
-        run: python -m pytest test_janus2pisa.py test_inverse.py test_pisa_interp.py -q
+        run: python -m pytest test_janus2pisa.py test_inverse.py test_pisa_interp.py test_difftest.py -q
 
   rocq:
     name: Rocq proofs
