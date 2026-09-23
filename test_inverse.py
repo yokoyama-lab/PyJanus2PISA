@@ -213,6 +213,14 @@ class TestRoundTrip(unittest.TestCase):
         """x += 5; round trip."""
         self._check_zero("int x\nprocedure main\n  x += 5")
 
+    def test_if_nonboolean_predicates(self):
+        """Non-0/1 test and assertion; the inverse swaps them (`if 7 ... fi 5`)."""
+        self._check_zero("int x\nprocedure main\n  if 5 then x += 1 else x += 2 fi 7")
+
+    def test_if_constant_zero_assertion(self):
+        """`fi 0` on the forward run, `if 0` on the inverse run."""
+        self._check_zero("int x\nprocedure main\n  if 0 then x += 10 else x += 20 fi 0")
+
     def test_two_variables(self):
         """x += 3; y += 7; round trip."""
         self._check_zero("""int x

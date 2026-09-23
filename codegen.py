@@ -23,6 +23,24 @@ from regalloc import RegAlloc
 from inverse import invert_stmt
 
 
+_COMPARISONS = ('=', '!=', '<', '>', '<=', '>=')
+
+
+def _as_flag(e: Expr) -> Expr:
+    """Return an expression equal to 1 if e is true (nonzero) and 0 otherwise.
+
+    _gen_if XORs its test and exit assertion into a 0/1 path flag, which is
+    only sound for 0/1-valued expressions.  Comparisons and the constants
+    0/1 already are; anything else (e.g. `if 5 then ... fi 7`, valid Janus)
+    is normalised by `e != 0`.
+    """
+    if isinstance(e, BinOp) and e.op in _COMPARISONS:
+        return e
+    if isinstance(e, Const) and e.value in (0, 1):
+        return e
+    return BinOp('!=', e, Const(0))
+
+
 def _inv_proc_name(name: str) -> str:
     """Label of the inverted companion of procedure `name`."""
     return name + "_inv"
@@ -963,12 +981,13 @@ class CodeGen:
         self.reg.commit_reg(rt)
 
         # Evaluate test expression
-        eval_code, re = self.gen_expr(stmt.test)
+        test = _as_flag(stmt.test)
+        eval_code, re = self.gen_expr(test)
         code.extend(eval_code)
         code.append(self._emit(XOR(rt, re)))
 
         # Unevaluate test
-        uneval_code = self._gen_uneval_expr(stmt.test, re)
+        uneval_code = self._gen_uneval_expr(test, re)
         code.extend(uneval_code)
         code.extend(self._clear_garbage())
 
@@ -994,12 +1013,15 @@ class CodeGen:
         code.append(self._emit(XORI(rt, 1)))
 
         # Evaluate assertion
-        eval_fi, re2 = self.gen_expr(stmt.fi)
-        code.extend(eval_fi)
-        code[-len(eval_fi)] = LabeledInstr(assert_label, code[-len(eval_fi)].instr) \
-            if eval_fi else code[-1]
-        code.append(self._emit(XOR(rt, re2)))
-        uneval_fi = self._gen_uneval_expr(stmt.fi, re2)
+        fi = _as_flag(stmt.fi)
+        # The else path joins at assert_label, the first instruction after
+        # the XORI.  When e2 needs no code (`fi 0`) that is the XOR itself;
+        # the label used to be dropped there, leaving `BRA if_assert` dangling.
+        eval_fi, re2 = self.gen_expr(fi)
+        assert_code = list(eval_fi) + [self._emit(XOR(rt, re2))]
+        assert_code[0] = LabeledInstr(assert_label, assert_code[0].instr)
+        code.extend(assert_code)
+        uneval_fi = self._gen_uneval_expr(fi, re2)
         code.extend(uneval_fi)
         code.extend(self._clear_garbage())
 
