@@ -1,0 +1,2 @@
+// SKIP: stacks (`stack a`, `push(x, a)`, `a <=> b` on stacks) are not part of pyjanus2pisa's Janus dialect
+// Original: janus-examples kato131219_comp/131219/examples/swap-stack.j2

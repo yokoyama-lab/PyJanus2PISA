@@ -1,0 +1,11 @@
+// Own stress test: negative values through SUB/NEG/ADDI with negative immediates.
+int x
+int y
+int z
+procedure main
+  z -= 17
+  x -= 7
+  y += x
+  y -= 100
+  z += y
+  x ^= -3

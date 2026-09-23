@@ -1,0 +1,10 @@
+// Translated from janus-examples kato131219_comp/131219/examples/if-then.j2
+// Changes: local `int n` -> global; `procedure main()` -> `procedure main`;
+// the parser requires an else branch, so `else skip` was added.
+int n
+procedure main
+  if n = 0 then
+    n += 1
+  else
+    skip
+  fi n = 1

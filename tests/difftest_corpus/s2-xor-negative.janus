@@ -1,0 +1,13 @@
+// Own stress test: XOR of negative numbers (two's complement in unbounded ints
+// vs PHP 64-bit ints), XOR-swap and NOT via ^= -1.
+int x
+int y = 3
+int z
+procedure main
+  x -= 5
+  x ^= y
+  y ^= x
+  x ^= y
+  z ^= -1
+  z ^= x
+  z ^= -1024

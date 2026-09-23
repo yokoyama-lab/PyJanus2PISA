@@ -1,0 +1,12 @@
+// Own stress test: nested calls two deep (a calls b twice), so the return
+// offset stack holds two entries at once.
+int x
+procedure b
+  x += 1
+procedure a
+  call b
+  call b
+  x += 10
+procedure main
+  call a
+  call a

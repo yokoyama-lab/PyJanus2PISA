@@ -1,0 +1,5 @@
+// Translated from janus-examples kato131219_comp/131219/examples/comment.j2
+// Changes: `procedure main()` -> `procedure main`; a dummy global added.
+int dummy
+procedure main
+  skip // comment

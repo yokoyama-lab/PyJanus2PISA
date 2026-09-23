@@ -1,0 +1,8 @@
+// Translated from janus-examples kato131219_comp/131219/examples/call-array.j2
+// Changes: procedure parameter `int x[]` and the local `int x[2]` became the
+// global `int x[2]`; `procedure main()` -> `procedure main`; `call foo(x)` -> `call foo`.
+int x[2]
+procedure foo
+  skip
+procedure main
+  call foo

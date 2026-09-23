@@ -1,0 +1,2 @@
+// SKIP: the original file is a fragment (only `procedure alloc_tmp`) with undeclared variables and no main
+// Original: janus-examples watanabe/J1/Stack program.j1

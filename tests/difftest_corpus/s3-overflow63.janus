@@ -1,0 +1,8 @@
+// Own stress test: arithmetic past 2^63.  pisa_interp keeps exact integers;
+// PHP converts an overflowing int to float, so phpisa's register/memory value
+// becomes 9.2233720368547758E+18 (a register-width discrepancy).
+int x = 9223372036854775807
+int y
+procedure main
+  x += 1
+  y += x

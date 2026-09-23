@@ -1,0 +1,10 @@
+// Translated from janus-examples kato131219_comp/131219/examples/swap-array.j2
+// Changes: locals -> globals; the whole-array swap `a <=> b` is not supported
+// (Swap needs indexed operands) and was expanded element-wise.
+int a[3]
+int b[3]
+procedure main
+  a[0] += 3
+  a[0] <=> b[0]
+  a[1] <=> b[1]
+  a[2] <=> b[2]

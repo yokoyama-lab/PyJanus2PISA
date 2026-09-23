@@ -1,0 +1,19 @@
+// Own stress test: nested from-loops with comparisons (SLTX) computing
+// sum = 3*4 by repeated addition; exercises the if/from control-flow lowering.
+int i
+int j
+int sum
+procedure main
+  from i = 0 do
+    from j = 0 do
+      sum += 1
+      j += 1
+    loop
+      skip
+    until j = 4
+    j -= 4
+    i += 1
+  loop
+    skip
+  until i = 3
+  i -= 3
