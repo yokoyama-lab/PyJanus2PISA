@@ -34,9 +34,18 @@ jobs:
           install: |
             startGroup "No opam dependencies"
             endGroup
+          # The checkout is owned by the runner user (1001) while the container
+          # runs as coq (1000); `rocq makefile -o Makefile` needs to write here.
+          before_script: |
+            startGroup "Workaround permission issue"
+              sudo chown -R 1000:1000 .
+            endGroup
           script: |
             startGroup "Build proofs"
               cd rocq
               rocq makefile -f _CoqProject -o Makefile
               make -j2
             endGroup
+      - name: Revert permissions
+        if: ${{ always() }}
+        run: sudo chown -R 1001:116 .
