@@ -5,4 +5,6 @@ Src.v
 Compile.v
 Opt.v
 LOpt.v
+PISACtl.v
+CompileIf.v
 Test.v
