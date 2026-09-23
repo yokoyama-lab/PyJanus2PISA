@@ -20,23 +20,68 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install pytest
         run: python -m pip install --upgrade pip pytest
+      - name: Fetch phpisa for the differential tests (skipped if unavailable)
+        run: |
+          php --version || (sudo apt-get update && sudo apt-get install -y php-cli)
+          git clone --depth 1 https://github.com/yokoyama-lab/phpisa "$GITHUB_WORKSPACE/../phpisa" || echo "phpisa not available; test_difftest.py will skip the php tests"
       - name: Run test suite
-        run: python -m pytest test_janus2pisa.py test_inverse.py test_pisa_interp.py -q
+        run: python -m pytest test_janus2pisa.py test_inverse.py test_pisa_interp.py test_difftest.py -q
 
   rocq:
     name: Rocq proofs
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # only for the failure-report comment below
     steps:
       - uses: actions/checkout@v4
       - uses: coq-community/docker-coq-action@v1
         with:
           custom_image: rocq/rocq-prover:9.1.1-native-flambda
+          # The image ships rocq-prover 9.1.1; there is no opam file to pin, so
+          # the action's default opam install/uninstall phases are no-ops.
           install: |
-            startGroup "No opam dependencies"
+            startGroup "Toolchain shipped by the image (no opam install needed)"
+              rocq --version
             endGroup
+          uninstall: |
+            startGroup "Nothing to uninstall"
+            endGroup
+          # The checkout is owned by the runner user (1001) while the container
+          # runs as coq (1000); `rocq makefile -o Makefile` needs to write here.
+          before_script: |
+            startGroup "Workaround permission issue"
+              sudo chown -R 1000:1000 .
+            endGroup
+          # tee'd into ci-log.txt so a failure can be reported on the PR: the
+          # raw Actions log is not reachable from every network.
           script: |
+            set -o pipefail
+            {
             startGroup "Build proofs"
               cd rocq
               rocq makefile -f _CoqProject -o Makefile
               make -j2
             endGroup
+            } 2>&1 | tee ci-log.txt
+      - name: Revert permissions
+        if: ${{ always() }}
+        run: sudo chown -R 1001:116 .
+      - name: Report a failure on the pull request
+        if: ${{ failure() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Rocq proofs failed for ${{ github.sha }}: [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo
+            if [ -s ci-log.txt ]; then
+              echo 'Last 60 lines of the build script output:'
+              echo '```'
+              tail -n 60 ci-log.txt
+              echo '```'
+            else
+              echo 'The build script did not start: the failure is in the action'\''s install/setup phase (see the run).'
+            fi
+          } > failure-comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file failure-comment.md

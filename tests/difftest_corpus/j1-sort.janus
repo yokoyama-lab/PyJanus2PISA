@@ -1,0 +1,47 @@
+// Translated from janus-examples watanabe/J1/Sorting the list program.j1 (Lutz & Derby 1982, p.4)
+// Changes: implicit globals declared (`list[12]` -> `int list[12]` etc.); `:` swap
+// -> `<=>`; Lutz's `from c1 loop s until c2` -> `from c1 do s loop skip until c2`;
+// `else skip` added to the if; `readlist` (I/O) dropped and replaced by constant
+// initialisation in main; `call makeidperm` before `call sort`.
+int list[12]
+int perm[12]
+int n
+int i
+int j
+procedure sort
+  from i = 0 do
+    j += n - 2
+    from j = n - 2 do
+      if list[j] > list[j+1] then
+        list[j] <=> list[j+1]
+        perm[j] <=> perm[j+1]
+      else
+        skip
+      fi perm[j] > perm[j+1]
+      j -= 1
+    loop
+      skip
+    until j = i - 1
+    j -= i - 1
+    i += 1
+  loop
+    skip
+  until i = n - 1
+  i -= n - 1
+procedure makeidperm
+  from i = 0 do
+    perm[i] += i
+    i += 1
+  loop
+    skip
+  until i = n
+  i -= n
+procedure main
+  n += 5
+  list[0] += 30
+  list[1] += 10
+  list[2] += 50
+  list[3] += 20
+  list[4] += 40
+  call makeidperm
+  call sort

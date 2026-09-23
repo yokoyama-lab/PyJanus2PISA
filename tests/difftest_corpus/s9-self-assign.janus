@@ -1,0 +1,8 @@
+// Own stress test (INVALID Janus on purpose): `x += x` has the assigned
+// variable on the right-hand side, which Janus forbids because it is not
+// invertible (`x -= x` zeroes x instead of halving it).  pyjanus2pisa accepts
+// it ("self-referencing assignment optimization"), so the round trip fails
+// on both interpreters while fwd/bwd still agree.
+int x = 21
+procedure main
+  x += x

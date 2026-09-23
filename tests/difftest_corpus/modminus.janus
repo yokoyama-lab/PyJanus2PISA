@@ -1,0 +1,5 @@
+// Translated from janus-examples kato131219_comp/131219/examples/modminus.j2
+// Changes: local `int x` -> global; `procedure main()` -> `procedure main`.
+int x
+procedure main
+  x -= 3

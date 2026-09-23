@@ -1,0 +1,6 @@
+// Translated from janus-examples kato131219_comp/131219/examples/show.j2
+// Changes: local `int x` -> global; `show(x)` dropped; `x += 1` added so the
+// program is not a no-op.
+int x
+procedure main
+  x += 1

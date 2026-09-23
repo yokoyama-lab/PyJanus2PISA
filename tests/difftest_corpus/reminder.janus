@@ -1,0 +1,7 @@
+// Translated from janus-examples kato131219_comp/131219/examples/reminder.j2
+// Changes: local `int n` -> global.  `%` is parsed but not supported by
+// codegen (CodeGenError), so the constant expression `5 % 2` was folded by
+// hand to `1`.
+int n
+procedure main
+  n += 1
