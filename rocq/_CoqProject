@@ -6,3 +6,8 @@ Compile.v
 Opt.v
 LOpt.v
 Test.v
+RevSMod.v
+PISAFixed.v
+CompileFixed.v
+OptFixed.v
+TestFixed.v
