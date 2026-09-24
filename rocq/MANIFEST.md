@@ -174,9 +174,14 @@ Restrictions, all deliberate:
   `5 xor 7 = 2` in `r3` and `pisa_interp.py` reports garbage (reproduced on the
   Python side; `ex_violation_dirty` shows the same on the model). Comparison
   operators, which are what real tests use, are 0/1-valued, so the theorem
-  covers them once expressions grow comparisons (milestone 3). Fixing
-  `codegen.py` for non-Boolean tests (normalise the test to 0/1 first) is a
-  follow-up on the Python side.
+  covers them once expressions grow comparisons (milestone 3). `codegen.py`
+  now normalises non-Boolean tests to `e != 0` (PR #4); the model has not
+  followed.
+- **The violation branch.** `_gen_if` now ends with `BNE rt r0 finish` after
+  the `end:` pair, so a violated assertion halts instead of leaving 1 in a
+  freed register (2026-09-24). `compile_c` does not emit it; on the proved
+  fragment `rt = 0` there, so it is a fall-through, but the theorem is about
+  the layout without it.
 - **`b <> 0` and `regs ms 0 = 0`** stand for the hard-wired zero register the
   entry test `BEQ rt r0` compares against.
 - **Bodies** are straight-line statements or nested `If`s (`wf_cstmt` is
@@ -195,14 +200,13 @@ compile_at_scratch : Closed under the global context
 
 1. **Control flow** — `If` is DONE (above). **`Loop`** (`from e1 do S1 loop S2
    until e2`) is next. `_gen_from` in `codegen.py` uses only *direct* branches
-   (`BEQ rt r0 loop_body`, `BRA exit`, `BRA entry_do`; none of them lands on a
-   branch, so none is paired), which PISACtl.v already covers. Two things
-   stand in the way, both on the compiler side: `_gen_from` clears the flag
-   with `XOR rt rt` after each assertion, which (a) *discards* the assertion
-   result instead of checking it — the same weakness `4b068be` fixed for `if`
-   — and (b) is not a well-formed reversible instruction (`wf_instr` rejects
-   `IXor rd rd`), so the emitted loop is not covered by `run_invert_code`.
-   The proof of the fixed layout is an induction on the number of iterations
+   (`BEQ rt r0 loop_body`, `BRA exit`, `BRA entry_do`, and `BNE rt r0 finish`
+   after each assertion; none of them lands on a branch, so none is paired),
+   which PISACtl.v already covers. The compiler-side obstacle is gone
+   (2026-09-24): `_gen_from` used to clear the flag with `XOR rt rt`, which
+   discarded the assertion and is not well-formed (`wf_instr` rejects
+   `IXor rd rd`); it now restores it with `XORI rt 1` and branches to `finish`
+   on a violation. The proof of the layout is an induction on the number of iterations
    with the invariant `models ms σ_i /\ regs ms = R /\ br = 0` at the loop
    head, reusing `test_steps`/`assert_steps` as they are, plus a `CLoop`
    constructor with `EC_Loop` rules mirroring `Janus.v`.
@@ -235,8 +239,8 @@ framework there may supply most of milestones 1–2 for free.
 
 ## RESUME — where to pick up
 
-- **`Loop`** (milestone 1, remaining half): first fix `_gen_from`'s `XOR rt rt`
-  clears in `codegen.py` (see "Not covered" 1), then add `CLoop e1 a b e2` to
+- **`Loop`** (milestone 1, remaining half): `_gen_from` no longer clears the
+  flag with `XOR rt rt` (see "Not covered" 1); add `CLoop e1 a b e2` to
   `cstmt`, the layout to `compile_c`, and prove the `CLoop` case of
   `compile_c_spec` by induction on the iteration count. The layout lemmas in
   `Section IfLayout` show the pattern (positions as `Let`s, one lemma per line

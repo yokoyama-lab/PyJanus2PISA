@@ -193,6 +193,22 @@ procedure main
         self.assertEqual(m.get_var(0), 20)
 
 
+    def test_if_violation_not_masked_by_later_code(self):
+        """A violated `fi` leaves 1 in the flag register, which is then freed.
+        Without the check at the join, the next statement's `||` reuses that
+        register as if it were zero and cancels the 1: the program finished
+        clean (found by random testing against a reference evaluator)."""
+        src = """int x
+int y
+int z
+procedure main
+  z += 2
+  if 0 then skip else x += z fi x
+  y += (z > 1) || x"""
+        with self.assertRaises(PISAError):
+            compile_and_run(src)
+
+
 class TestFrom(unittest.TestCase):
     """From-do-loop-until loop."""
 
@@ -254,6 +270,44 @@ procedure main
         self.assertEqual(m.get_var(0), 3)
         self.assertEqual(m.get_var(1), 6)
 
+
+    def test_entry_assertion_violation_detected(self):
+        """`from i = 0` entered with i = 5 used to run on (here: forever)."""
+        src = """int i
+procedure main
+  i += 5
+  from i = 0 do i += 1 loop skip until i = 8"""
+        with self.assertRaises(PISAError) as cm:
+            compile_and_run(src, max_steps=100_000)
+        self.assertIn("garbage", str(cm.exception))
+
+    def test_reentry_assertion_violation_detected(self):
+        """tests/difftest_corpus/s10-loop-assert: `y = 0` still holds when the
+        body is re-entered.  The flag used to be wiped with `XOR rt rt`."""
+        src = """int y
+int x
+procedure main
+  from y = 0 do x += 1 loop skip until x = 3"""
+        with self.assertRaises(PISAError) as cm:
+            compile_and_run(src)
+        self.assertIn("garbage", str(cm.exception))
+
+    def test_nonboolean_predicates(self):
+        """Janus truth is `nonzero`: `from 1 - i` holds at entry (i = 0) and
+        not on re-entry (i = 1); `until i - 1` is false at i = 1, true at 2."""
+        src = """int i
+procedure main
+  from 1 - i do i += 1 loop skip until i - 1"""
+        m = compile_and_run(src)
+        self.assertEqual(m.get_var(0), 2)
+
+    def test_nonboolean_predicate_violation_detected(self):
+        """`from 3 - i` is still true (2) on re-entry at i = 1."""
+        src = """int i
+procedure main
+  from 3 - i do i += 1 loop skip until i = 3"""
+        with self.assertRaises(PISAError):
+            compile_and_run(src)
 
 class TestProcCall(unittest.TestCase):
     """Procedure calls."""
@@ -425,6 +479,91 @@ procedure main
         m = compile_and_run(src)
         self.assertEqual(m.get_var(0), 5)
         self.assertEqual(m.get_var(1), 4)
+
+
+class TestLogicalOperators(unittest.TestCase):
+    """`&&` / `||` are logical (truth = nonzero, result 0/1), not bitwise."""
+
+    def _value(self, expr, **vals):
+        names = sorted(vals)
+        decls = "".join(f"int {n}\n" for n in names)
+        inits = "".join(f"  {n} += {vals[n]}\n" for n in names)
+        src = f"{decls}int r\nprocedure main\n{inits}  r += {expr}"
+        return compile_and_run(src).get_var(len(names))
+
+    def test_and_of_nonboolean_operands(self):
+        """1 && 2 used to evaluate to 1 & 2 = 0 (constant folding gave 1)."""
+        self.assertEqual(self._value("a && b", a=1, b=2), 1)
+        self.assertEqual(self._value("a && b", a=-3, b=4), 1)
+        self.assertEqual(self._value("a && b", a=0, b=4), 0)
+        self.assertEqual(self._value("a && b", a=5, b=0), 0)
+
+    def test_or_of_nonboolean_operands(self):
+        """1 || 2 used to evaluate to 1 | 2 = 3."""
+        self.assertEqual(self._value("a || b", a=1, b=2), 1)
+        self.assertEqual(self._value("a || b", a=0, b=-7), 1)
+        self.assertEqual(self._value("a || b", a=0, b=0), 0)
+
+    def test_matches_constant_folding(self):
+        self.assertEqual(self._value("1 && 2"), 1)
+        self.assertEqual(self._value("1 || 2"), 1)
+
+    def test_comparison_operands_unchanged(self):
+        self.assertEqual(self._value("(a < b) && (b < 9)", a=1, b=2), 1)
+        self.assertEqual(self._value("(a > b) || (b > 9)", a=1, b=2), 0)
+
+    def test_as_if_test(self):
+        src = """int a
+int b
+int x
+procedure main
+  a += 1
+  b += 2
+  if a && b then x += 10 else x += 20 fi x = 10"""
+        self.assertEqual(compile_and_run(src).get_var(2), 10)
+
+    def test_nested_chain_fits_in_registers(self):
+        """Each nonzero test costs one register (4 instructions: SLTX / NEG)."""
+        self.assertEqual(self._value("((a && b) && c) && d", a=1, b=2, c=3, d=4), 1)
+        self.assertEqual(self._value("((a || b) || c) || d", a=0, b=0, c=0, d=4), 1)
+
+    def test_bitwise_or_operands_released(self):
+        """ORX zeroes its source; keeping the sources as garbage until the end
+        of the statement ran out of registers here."""
+        self.assertEqual(self._value("((a | b) | (c | d)) + ((a | c) | (b | d))",
+                                     a=1, b=2, c=4, d=8), 30)
+
+    def test_compound_operand_garbage_cleared(self):
+        """`e != 0` for a compound e clears the garbage of evaluating and
+        uncomputing e at once; left until the end of the statement, it
+        exhausted the registers here (the unfixed code compiled this)."""
+        src = """int x[4]
+int a
+int b
+int c
+int d
+int e
+int r
+procedure main
+  x[1] += 5
+  x[3] += 7
+  a += 1
+  c += 2
+  d += 1
+  e += 1
+  r += x[a + b] && x[c + d] && e"""
+        self.assertEqual(compile_and_run(src).get_var(9), 1)
+
+
+class TestReservedNames(unittest.TestCase):
+    def test_procedure_named_finish_rejected(self):
+        """`finish` is where violated assertions jump; a procedure of that name
+        used to shadow it, so its body never ran and nothing was reported."""
+        from codegen import CodeGenError
+        for name in ("finish", "start"):
+            src = f"int x\nprocedure {name}\n  x += 1\nprocedure main\n  call {name}"
+            with self.assertRaises(CodeGenError):
+                compile_and_run(src)
 
 
 if __name__ == "__main__":

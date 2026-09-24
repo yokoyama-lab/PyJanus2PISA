@@ -95,8 +95,10 @@ inserted, using the compiler's own path flag `rt`:
 `if_assert: BEQ rt r0 <the BRA if_assert>` (else path has rt=0, then path
 falls through with rt=1); `from_loop: BEQ rt r0 <the loop-test BEQ>`;
 `from_exit: BRA <the exit BRA>`; `from_do: BNE rt r0 <the back-edge BRA>; XOR
-rt rt` (the `XOR rt rt` codegen emits before the back-edge is dropped so rt=1
-discriminates the back edge from the first entry).  Labels are never moved
+rt rt` (the re-entry check `XORI rt 1; BNE rt r0 finish` codegen emits
+before the back-edge is dropped so rt=1 discriminates the back edge from the
+first entry; under Pendulum semantics a violated re-entry assertion then
+leaves BR ≠ 0, as in Axelsen's translation).  Labels are never moved
 (codegen's `remove_nops` forwards labels of removed NOPs, so `from_exit` can
 alias `main_bot`); the jumping instruction is retargeted to a fresh label.
 
@@ -115,7 +117,7 @@ alias `main_bot`); the jumping instruction is retargeted to a fresh label.
 | 9 | operand forms | 2-operand `ADD/SUB/XOR`; 2-operand `ORX` and 3-operand `ANDX` with *clearing* semantics; `SLTX`; `SUBI` | 2-operand `ADD/SUB/XOR`; 3-operand XOR-into-dest `ANDX/ORX/NORX`; `ANDIX/ORIX`; shifts/rotates; `BGTZ/BLEZ/BLTZ`; `SHOW/OUTPUT`; no `SLTX`, no `SUBI` | `pisa.py`; `INSTRUCTIONS.md` |
 | 10 | entry / exit | label `start` (required), `FINISH` returns the memory dict; garbage check on r3..r31 optional | `.start L` directive; `FINISH` throws `FinishException`; falling off either end stops silently with `finished=false`; `max_steps` 1,000,000 by default | `pisa_interp.py:140-143, 266-269`; `runner.php:45-66` |
 | 11 | labels | case-sensitive | case-insensitive (`strtoupper`), `;` comments, commas ignored | `php_functions.php:176-179` |
-| 12 | `XOR r r` (clear) | executed (irreversible) | executed (irreversible) | both accept it; codegen emits it for flag clearing |
+| 12 | `XOR r r` (clear) | executed (irreversible) | executed (irreversible) | both accept it; codegen emits it for garbage clearing (no longer for the `from` flag, see D8) |
 | 13 | final state | memory dict (+ `regs`, `br`, `dump_state()`) | registers, `pc`, `direction`, `branch_reg`, `finished`, captured output; memory only via the `$program` global (used by `tools/phpisa_dump.php`) | `runner.php:70-77` |
 
 ## Corpus
@@ -133,14 +135,24 @@ operands, and two deliberately invalid programs `s9-self-assign`,
 
 ## Results
 
-Janus corpus, `--mode both` (faithful and pendulum-cf), 2026-09-23.
+Janus corpus, `--mode both` (faithful and pendulum-cf), 2026-09-23; rows for
+`if-then`, `j1-sort` and `s10-loop-assert` rerun 2026-09-24 after the D8 fix
+(`fi`/`from` assertion violations now halt at `finish`, and the harness
+reports a pisa_interp run that ends with a dirty flag as
+`ERROR(pisa_interp: assertion violated, …)` instead of comparing registers
+that the skipped epilogues left unrestored).  The new ERROR cells are
+programs run outside their domain, not regressions: `bwd` of `if-then` runs
+P⁻¹ (`if n = 1 … fi n = 0`) from n = 0, and `s10-loop-assert` is invalid on
+purpose (both used to report OK with a garbage note).  `j1-sort` violates its
+`fi perm[j] > perm[j+1]` (checked with a reference evaluator over the same
+AST); it used to loop forever on pisa_interp and is now reported.
 
 Summary over the 26 assembled programs (5 SKIPPED):
 
 | mode | fwd | bwd | rt-pisa | rt-php |
 |---|---|---|---|---|
-| faithful | 0 OK / 0 MISMATCH / 26 ERROR | 0 OK / 0 MISMATCH / 26 ERROR | 23 OK / 2 MISMATCH / 1 ERROR | 0 OK / 0 MISMATCH / 26 ERROR |
-| pendulum-cf | 23 OK / 1 MISMATCH / 2 ERROR | 25 OK / 0 MISMATCH / 1 ERROR | 23 OK / 2 MISMATCH / 1 ERROR | 22 OK / 2 MISMATCH / 2 ERROR |
+| faithful | 0 OK / 0 MISMATCH / 26 ERROR | 0 OK / 0 MISMATCH / 26 ERROR | 23 OK / 3 MISMATCH / 0 ERROR | 0 OK / 0 MISMATCH / 26 ERROR |
+| pendulum-cf | 23 OK / 1 MISMATCH / 2 ERROR | 23 OK / 0 MISMATCH / 3 ERROR | 23 OK / 3 MISMATCH / 0 ERROR | 22 OK / 2 MISMATCH / 2 ERROR |
 
 Per program:
 
@@ -155,7 +167,7 @@ Per program:
 | comment | faithful | ERROR(phpisa: did not reach FINISH (pc=-7, br=-9, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-7, br=-9, dir=1)) | OK | ERROR(fwd failed) |
 | comment | pendulum-cf | OK | OK | OK | OK |
 | if-then | faithful | ERROR(phpisa: did not reach FINISH (pc=-104, br=-106, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-104, br=-106, dir=1)) | OK | ERROR(fwd failed) |
-| if-then | pendulum-cf | OK | OK | OK | OK |
+| if-then | pendulum-cf | OK | ERROR(pisa_interp: assertion violated, r3=1 at FINISH) | OK | OK |
 | if-thenelse | faithful | ERROR(phpisa: did not reach FINISH (pc=-107, br=-109, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-107, br=-109, dir=1)) | OK | ERROR(fwd failed) |
 | if-thenelse | pendulum-cf | OK | OK | OK | OK |
 | j1-factorization | faithful | SKIPPED: uses division `/`, modulo `¥`, variable*variable multiplication and `… | | | |
@@ -164,8 +176,8 @@ Per program:
 | j1-fib-bwd | pendulum-cf | OK | OK | OK | OK |
 | j1-fib | faithful | ERROR(phpisa: did not reach FINISH (pc=-7, br=-15, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-166, br=-170, dir=1)) | OK | ERROR(fwd failed) |
 | j1-fib | pendulum-cf | OK | OK | OK | OK |
-| j1-sort | faithful | ERROR(phpisa-side adapter: line 27: branch offset 1074 to main_bot ex… | ERROR(phpisa-side adapter: line 1153: branch offset -1125 to main exc… | ERROR(fwd failed) | ERROR(fwd failed) |
-| j1-sort | pendulum-cf | ERROR(phpisa-side adapter: line 27: branch offset 1084 to main_bot ex… | ERROR(phpisa-side adapter: line 1164: branch offset -1136 to main exc… | ERROR(fwd failed) | ERROR(fwd failed) |
+| j1-sort | faithful | ERROR(phpisa-side adapter: line 27: branch offset 1081 to main_bot ex… | ERROR(phpisa-side adapter: line 1170: branch offset -1142 to main exc… | MISMATCH(mem[0]=10 expected 0) | ERROR(fwd failed) |
+| j1-sort | pendulum-cf | ERROR(phpisa-side adapter: line 27: branch offset 1088 to main_bot ex… | ERROR(phpisa-side adapter: line 1178: branch offset -1150 to main exc… | MISMATCH(mem[0]=10 expected 0) | ERROR(fwd failed) |
 | j1-stack | faithful | SKIPPED: the original file is a fragment (only `procedure alloc_tmp`) with und… | | | |
 | j1-stack | pendulum-cf | SKIPPED: the original file is a fragment (only `procedure alloc_tmp`) with und… | | | |
 | loop-do | faithful | ERROR(phpisa: did not reach FINISH (pc=-140, br=-142, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-140, br=-142, dir=1)) | OK | ERROR(fwd failed) |
@@ -178,8 +190,8 @@ Per program:
 | reminder | pendulum-cf | OK | OK | OK | OK |
 | s1-negative | faithful | ERROR(phpisa: did not reach FINISH (pc=-47, br=-51, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-47, br=-51, dir=1)) | OK | ERROR(fwd failed) |
 | s1-negative | pendulum-cf | OK | OK | OK | OK |
-| s10-loop-assert | faithful | ERROR(phpisa: did not reach FINISH (pc=-153, br=-156, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-160, br=-163, dir=1)) | MISMATCH(mem[1]=3 expected 0) | ERROR(fwd failed) |
-| s10-loop-assert | pendulum-cf | ERROR(phpisa: did not reach FINISH (pc=-55, br=-105, dir=1)) | OK | MISMATCH(mem[1]=3 expected 0) | ERROR(fwd failed) |
+| s10-loop-assert | faithful | ERROR(phpisa: did not reach FINISH (pc=-155, br=-158, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-164, br=-167, dir=1)) | MISMATCH(mem[1]=1 expected 0) | ERROR(fwd failed) |
+| s10-loop-assert | pendulum-cf | ERROR(phpisa: did not reach FINISH (pc=-54, br=-105, dir=1)) | ERROR(pisa_interp: assertion violated, r3=1 at FINISH) | MISMATCH(mem[1]=1 expected 0) | ERROR(fwd failed) |
 | s2-xor-negative | faithful | ERROR(phpisa: did not reach FINISH (pc=-71, br=-75, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-71, br=-75, dir=1)) | OK | ERROR(fwd failed) |
 | s2-xor-negative | pendulum-cf | OK | OK | OK | OK |
 | s3-overflow32 | faithful | ERROR(phpisa: did not reach FINISH (pc=-33, br=-36, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-33, br=-36, dir=1)) | OK | ERROR(fwd failed) |
@@ -320,7 +332,11 @@ D: DATA 7` → phpisa R4 = 7, bare PISAMachine 0 (`pal2pisa` preloads every
 DATA line to compensate).  Consequence for janus2pisa: the stack at
 `nvars+3` would overwrite instructions on phpisa (the adapter relocates it).
 
-**D8 (b, pyjanus2pisa codegen) – `from` assertions are not checked.**  The
+**D8 (b, pyjanus2pisa codegen) – `from` assertions are not checked.**
+*Fixed 2026-09-24*: `_gen_from` now restores the flag with `XORI rt 1` and
+jumps to `finish` (`BNE rt r0 finish`) when the entry or re-entry assertion
+fails; `_gen_if` does the same after its join.  The `--pendulum-cf` lowering
+drops the re-entry check before the back-edge.  Original report:  The
 entry and re-entry assertions are evaluated and then cleared with
 `XOR rt rt` "safe for non-boolean" (`codegen.py:1066, 1091, 1109`) instead of
 being verified like `if` assertions are.  `s10-loop-assert`
@@ -377,7 +393,7 @@ Next:
   Pendulum mode to `pisa_interp.py` (`PC += BR`, direction bit, reverse
   templates).  Then `--mode faithful` should be all-OK and
   `pal2pisa ../phpisa/samples/mult.pal` should print `R5 = 3 9 9 3`.
-  Check D8 (verify `from` assertions instead of clearing rt) and D9 (reject
+  ~~Check D8 (verify `from` assertions instead of clearing rt)~~ (done) and D9 (reject
   `x op= e` with `x ∈ vars(e)`).
 * Day 3 – fixed-width registers: `--width 32` in both interpreters and the
   adapter (worker C's `RevSMod` window); rerun `s3-*`; add wrap-around
