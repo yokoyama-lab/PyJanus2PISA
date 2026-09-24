@@ -268,7 +268,8 @@ class PISAMachine:
             raise PISAError(
                 f"garbage left in registers at FINISH ({detail}); "
                 f"the program is not reversible — most likely an `if` exit "
-                f"assertion that does not hold on the path taken"
+                f"assertion or a `from` entry/re-entry assertion that does "
+                f"not hold on the path taken"
             )
 
     def run(self, max_steps: int = 10_000_000) -> Dict[int, int]:

@@ -1,3 +1,4 @@
+open Datatypes
 
 module Pos =
  struct
@@ -86,6 +87,39 @@ module Pos =
       (fun p -> (pred_double p))
       (fun _ -> 0)
       x
+
+  (** val compare_cont : comparison -> int -> int -> comparison **)
+
+  let rec compare_cont r x y =
+    (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+      (fun p ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q -> compare_cont r p q)
+        (fun q -> compare_cont Gt p q)
+        (fun _ -> Gt)
+        y)
+      (fun p ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q -> compare_cont Lt p q)
+        (fun q -> compare_cont r p q)
+        (fun _ -> Gt)
+        y)
+      (fun _ ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun _ -> Lt)
+        (fun _ -> Lt)
+        (fun _ -> r)
+        y)
+      x
+
+  (** val compare : int -> int -> comparison **)
+
+  let compare =
+    compare_cont Eq
 
   (** val eqb : int -> int -> bool **)
 

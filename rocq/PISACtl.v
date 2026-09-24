@@ -356,6 +356,27 @@ Proof.
   destruct (Z.eqb_spec (regs s rd) (regs s rs)); [contradiction | reflexivity].
 Qed.
 
+Lemma cstep_bne_direct_taken : forall (p : lprog) pc s lo rd rs l t,
+  nth_error p pc = Some (lo, CBne rd rs l) -> find_label l p = Some t ->
+  regs s rd <> regs s rs ->
+  cstep p (mkC pc 0 s) = Some (mkC t 0 s).
+Proof.
+  intros p pc s lo rd rs l t Hn Hf He; simpl; rewrite Hn; unfold cond_step.
+  destruct (Z.eqb_spec (regs s rd) (regs s rs)); [contradiction |].
+  simpl. now rewrite Hf.
+Qed.
+
+(** A conditional branch that is not taken needs no label: the target of
+    `BNE rt r0 finish` may be anywhere (or nowhere) when it falls through. *)
+Lemma cstep_bne_direct_not_taken : forall (p : lprog) pc s lo rd rs l,
+  nth_error p pc = Some (lo, CBne rd rs l) ->
+  regs s rd = regs s rs ->
+  cstep p (mkC pc 0 s) = Some (mkC (S pc) 0 s).
+Proof.
+  intros p pc s lo rd rs l Hn He; simpl; rewrite Hn; unfold cond_step.
+  rewrite He, !Z.eqb_refl. reflexivity.
+Qed.
+
 (** The conditional partner of a paired branch: [br] cancels and execution
     resumes after the branch that sent us here. *)
 Lemma cstep_beq_cancel : forall (p : lprog) pc br s lo rd rs l t,

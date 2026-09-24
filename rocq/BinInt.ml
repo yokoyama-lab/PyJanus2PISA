@@ -1,3 +1,4 @@
+open Datatypes
 open NatDef
 open PosDef
 
@@ -69,6 +70,17 @@ module Z =
   (** val sub : int -> int -> int **)
 
   let sub = (-)
+
+  (** val compare : int -> int -> comparison **)
+
+  let compare = fun x y -> if x=y then Eq else if x<y then Lt else Gt
+
+  (** val ltb : int -> int -> bool **)
+
+  let ltb x y =
+    match compare x y with
+    | Lt -> true
+    | _ -> false
 
   (** val eqb : int -> int -> bool **)
 

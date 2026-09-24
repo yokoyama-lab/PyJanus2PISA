@@ -7,42 +7,48 @@
 
     and proves it correct on the control-flow machine of PISACtl.v.  The
     emitted code is the layout `_gen_if` in `codegen.py` produces (Axelsen,
-    CC 2011, Fig. 9–11):
+    CC 2011, Fig. 9–11, plus the assertion check of PR #6):
 
 <<
-            <eval e1 -> re> ; XOR rt re ; <uneval e1>      -- rt := e1
+            <rt ^= _as_flag(e1)>                           -- rt := (e1 != 0)
    test:    BEQ rt r0 false
             XORI rt 1                                      -- rt := 0 on the then path
             <S1>
             XORI rt 1                                      -- rt := 1 again
-   assert:  <eval e2 -> re> ; XOR rt re ; <uneval e2>      -- rt := rt xor e2
+   assert:  <rt ^= _as_flag(e2)>                           -- rt := rt xor (e2 != 0)
    true:    BRA end                 \ Pendulum pair
    false:   BRA test                / partner of the BEQ
             <S2>
             BRA assert
    end:     BRA true                / partner of `true`
+            BNE rt r0 finish                               -- violated: halt, rt = 1
 >>
 
-    Two facts about this layout drive the proof:
+    [rt ^= _as_flag(e)] is [flag_block]: `_as_flag` leaves the constants
+    0 and 1 alone and turns every other expression of [Src.expr] into
+    [e != 0], computed with two [SLTX] against [r0] (see [nz_block]).
+
+    Three facts about this layout drive the proof:
 
     - The flag register [rt] is allocated *before* the bodies (it is the
       lowest free register, [scratch]), so the bodies are compiled with
       scratch base [S rt].  Compile.v hard-wires the base to [scratch];
       [compile_at] below is the same compiler with the base as a parameter,
       and [compile_at_scratch] shows it coincides with [compile].
-    - The exit assertion is checked by XOR-ing [eval e2] into the flag,
-      which is [1] on the then path and [0] on the else path.  This is
-      garbage-free exactly when the tests are *Boolean-valued* (0 or 1): for
-      `if 5 then skip else skip fi 7` — a valid Janus program, truth being
-      nonzero — the emitted code leaves [5 xor 7] in [rt].  [exec_c] below
-      therefore uses [eval σ e1 = 1] / [= 0] rather than [<> 0] / [= 0]; it
-      is a sub-relation of the Janus semantics, and it is precisely the
-      fragment on which `codegen.py` is a clean translation.
+    - Because tests are normalised to 0/1, the flag is exactly the path bit
+      and [rt xor (e2 != 0)] is [0] precisely when the exit assertion holds.
+      [exec_c] is therefore Janus's own rule set (true = nonzero).
+    - A valid run reaches `BNE rt r0 finish` with [rt = 0], so the branch
+      falls through and the label [finish] is never looked up; a violated
+      assertion reaches it with [rt = 1] and jumps to [finish]
+      ([if_true_violation], [if_false_violation]).  [finish] is a label the
+      enclosing program provides; the compiler takes it as a parameter.
 
     Main result: [compile_c_spec] — semantic preservation and a clean
     register file, for a fragment embedded at any position of a larger
     labeled program with fresh labels; [compile_c_program] is the closed
-    whole-program corollary with the fuel executor. *)
+    whole-program corollary with the fuel executor.  The violation
+    theorems for whole statements are in CompileLoop.v. *)
 
 From Stdlib Require Import ZArith List Lia Bool.
 From Stdlib Require Import FunctionalExtensionality.
@@ -242,6 +248,122 @@ Qed.
 Lemma xor_block_nonempty : forall e rt, xor_block e rt <> [].
 Proof. intros e rt; unfold xor_block; destruct (gen_expr e (S rt)); discriminate. Qed.
 
+(** ** Tests are normalised to 0/1: `_as_flag`
+
+    Janus reads a test as true when it is nonzero.  `codegen.py` XORs tests
+    and assertions into a 0/1 path flag, so `_as_flag` keeps a test that is
+    already 0/1 — a comparison, a logical operator, or the constant 0 or 1 —
+    and rewrites every other [e] to [e != 0].  The source expressions here
+    ([Src.expr]: constants, variables, [+ - ^]) contain no comparison, so the
+    rule is: [Cst 0] and [Cst 1] unchanged ([xor_block]), anything else
+    through [e != 0].
+
+    [e != 0] is compiled by `_gen_nonzero` / `_nonzero_into` into a fresh
+    register [rf]: evaluate [e], [SLTX rf v r0 ; SLTX rf r0 v] (the two bits
+    [v < 0] and [0 < v] are exclusive, so their XOR is [v <> 0]), unevaluate
+    [e].  `_gen_flag_xor` XORs [rf] into the flag and unevaluates [e != 0]
+    by running `_nonzero_into` once more, which clears [rf]:
+
+<<
+     <rf ^= (e != 0)> ; XOR rt rf ; <rf ^= (e != 0)>
+>>
+*)
+
+Definition truth (v : Z) : Z := if v =? 0 then 0 else 1.
+
+Lemma truth_0 : truth 0 = 0.
+Proof. reflexivity. Qed.
+
+Lemma truth_nz : forall v, v <> 0 -> truth v = 1.
+Proof. intros v H; unfold truth; destruct (Z.eqb_spec v 0); [contradiction | reflexivity]. Qed.
+
+Lemma sltx_pair : forall v,
+  Z.lxor (if v <? 0 then 1 else 0) (if 0 <? v then 1 else 0) = truth v.
+Proof.
+  intro v; unfold truth.
+  destruct (Z.ltb_spec v 0), (Z.ltb_spec 0 v), (Z.eqb_spec v 0); try lia; reflexivity.
+Qed.
+
+(** [rf ^= (e != 0)], with [e]'s value in [S rf] while it is needed. *)
+Definition nz_block (e : expr) (rf : reg) : code :=
+  gen_expr e (S rf)
+  ++ ISltx rf (S rf) 0%nat :: ISltx rf 0%nat (S rf)
+  :: invert_code (gen_expr e (S rf)).
+
+Lemma nz_block_spec : forall e rf s σ,
+  models s σ -> clean_above (S rf) s -> regs s 0%nat = 0 -> rf <> 0%nat ->
+  run (nz_block e rf) s
+  = mkState (rupd rf (Z.lxor (regs s rf) (truth (eval σ e))) (regs s)) (mem s).
+Proof.
+  intros e rf [R M] σ Hmod Hcl H0 Hrf; unfold nz_block; cbn [regs mem] in *.
+  rewrite run_app, (gen_expr_spec e (S rf) (mkState R M) σ Hmod Hcl); cbn [regs mem].
+  rewrite !run_cons; cbn [step regs mem].
+  repeat first [ rewrite rupd_same | rewrite rupd_other by lia ].
+  rewrite H0, rupd_shadow, Z.lxor_assoc, sltx_pair.
+  assert (HX : mkState (rupd rf (Z.lxor (R rf) (truth (eval σ e))) (rupd (S rf) (eval σ e) R)) M
+             = run (gen_expr e (S rf))
+                   (mkState (rupd rf (Z.lxor (R rf) (truth (eval σ e))) R) M)).
+  { rewrite (gen_expr_spec e (S rf) _ σ).
+    - cbn [regs mem]. now rewrite (rupd_comm rf (S rf)) by lia.
+    - exact Hmod.
+    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia. }
+  rewrite HX, run_invert_code by apply wf_gen_expr. reflexivity.
+Qed.
+
+Definition is_bool_const (e : expr) : bool :=
+  match e with Cst k => (k =? 0) || (k =? 1) | _ => false end.
+
+(** [rt ^= _as_flag(e)]: the block `_gen_flag_xor(rt, _as_flag(e))` emits. *)
+Definition flag_block (e : expr) (rt : reg) : code :=
+  if is_bool_const e then xor_block e rt
+  else nz_block e (S rt) ++ IXor rt (S rt) :: nz_block e (S rt).
+
+Lemma flag_block_spec : forall e rt s σ,
+  models s σ -> clean_above (S rt) s -> regs s 0%nat = 0 -> rt <> 0%nat ->
+  run (flag_block e rt) s
+  = mkState (rupd rt (Z.lxor (regs s rt) (truth (eval σ e))) (regs s)) (mem s).
+Proof.
+  intros e rt [R M] σ Hmod Hcl H0 Hrt; unfold flag_block; cbn [regs mem] in *.
+  destruct (is_bool_const e) eqn:Eb.
+  - rewrite (xor_block_spec e rt _ σ Hmod Hcl); cbn [regs mem].
+    destruct e as [k | x | o e1 e2]; try discriminate.
+    cbn [eval] in *. apply orb_true_iff in Eb.
+    destruct Eb as [E | E]; apply Z.eqb_eq in E; subst k; reflexivity.
+  - assert (HS : R (S rt) = 0) by (apply Hcl; lia).
+    rewrite run_app, (nz_block_spec e (S rt) (mkState R M) σ Hmod) by
+      (cbn [regs]; first [intros r Hr; apply Hcl; lia | exact H0 | lia]).
+    cbn [regs mem]. rewrite HS, Z.lxor_0_l.
+    rewrite run_cons; cbn [step regs mem].
+    rewrite rupd_same, rupd_other by lia.
+    rewrite (nz_block_spec e (S rt) _ σ).
+    + cbn [regs mem]. rewrite rupd_other, rupd_same by lia.
+      rewrite Z.lxor_nilpotent.
+      rewrite (rupd_comm (S rt) rt) by lia.
+      rewrite rupd_shadow, rupd_zero by exact HS. reflexivity.
+    + exact Hmod.
+    + intros r Hr; cbn [regs]; rewrite !rupd_other by lia; apply Hcl; lia.
+    + cbn [regs]; rewrite !rupd_other by lia; exact H0.
+    + lia.
+Qed.
+
+Lemma flag_block_nonempty : forall e rt, flag_block e rt <> [].
+Proof.
+  intros e rt; unfold flag_block; destruct (is_bool_const e);
+    [apply xor_block_nonempty |].
+  unfold nz_block; destruct (gen_expr e (S (S rt))); discriminate.
+Qed.
+
+(** Unlike the old `XOR rt rt` flag clear, everything in the block is a
+    well-formed (locally invertible) instruction. *)
+Lemma wf_flag_block : forall e rt, wf_code (flag_block e rt).
+Proof.
+  intros e rt; unfold flag_block, xor_block, nz_block.
+  destruct (is_bool_const e);
+    repeat first [ apply wf_code_app | apply wf_gen_expr
+                 | apply wf_invert_code
+                 | apply Forall_cons; [cbn [wf_instr]; first [split; lia | lia] |] ].
+Qed.
+
 (** ** Source language with [If] *)
 
 Inductive cstmt :=
@@ -256,14 +378,13 @@ Fixpoint wf_cstmt (st : cstmt) : Prop :=
   | CIf _ a b _ => wf_cstmt a /\ wf_cstmt b
   end.
 
-(** Janus's rules, with the tests required to be Boolean-valued (see the
-    header).  Replacing [= 1] by [<> 0] gives exactly [Janus.exec]'s rules. *)
+(** Janus's rules ([Janus.exec]): a test is true when it is nonzero. *)
 Inductive exec_c : cstmt -> store -> store -> Prop :=
 | EC_Base : forall s σ σ', exec s σ σ' -> exec_c (CBase s) σ σ'
 | EC_Seq : forall a b σ m σ',
     exec_c a σ m -> exec_c b m σ' -> exec_c (CSeq a b) σ σ'
 | EC_IfTrue : forall e1 a b e2 σ σ',
-    eval σ e1 = 1 -> exec_c a σ σ' -> eval σ' e2 = 1 ->
+    eval σ e1 <> 0 -> exec_c a σ σ' -> eval σ' e2 <> 0 ->
     exec_c (CIf e1 a b e2) σ σ'
 | EC_IfFalse : forall e1 a b e2 σ σ',
     eval σ e1 = 0 -> exec_c b σ σ' -> eval σ' e2 = 0 ->
@@ -289,38 +410,43 @@ Qed.
 
 (** ** The compiler
 
-    [if_code b n e1 e2 pa pb] is the layout of the header with flag register
-    [b], the five labels [n .. n+4] (in `_gen_if`'s allocation order:
-    `if_false`, `if_test`, `if_assert`, `if_assert_true`, `if_end`) and the
-    already-compiled bodies [pa], [pb]. *)
+    [if_code fin b n e1 e2 pa pb] is the layout of the header with flag
+    register [b], the five labels [n .. n+4] (in `_gen_if`'s allocation
+    order: `if_false`, `if_test`, `if_assert`, `if_assert_true`, `if_end`)
+    and the already-compiled bodies [pa], [pb].  [fin] is the label of the
+    program's `finish` (`ASSERT_FAIL_LABEL` in `codegen.py`), where a
+    violated assertion jumps.  The compiler only *refers* to [fin]; the
+    enclosing program must define it (see [with_finish] below). *)
 
-Definition if_code (b : reg) (n : label) (e1 e2 : expr) (pa pb : lprog) : lprog :=
-  ops (xor_block e1 b)
+Definition if_code (fin : label) (b : reg) (n : label) (e1 e2 : expr) (pa pb : lprog)
+  : lprog :=
+  ops (flag_block e1 b)
   ++ (Some (S n), CBeq b 0%nat n)
   :: (None, COp (IXori b 1))
   :: pa
   ++ (None, COp (IXori b 1))
-  :: ops_l (n + 2)%nat (xor_block e2 b)
+  :: ops_l (n + 2)%nat (flag_block e2 b)
   ++ (Some (n + 3)%nat, CBra (n + 4)%nat)
   :: (Some n, CBra (S n))
   :: pb
   ++ (None, CBra (n + 2)%nat)
   :: (Some (n + 4)%nat, CBra (n + 3)%nat)
+  :: (None, CBne b 0%nat fin)
   :: [].
 
-(** [compile_c st b n]: code for [st] with scratch base [b] and labels from
-    [n]; returns the next free label. *)
-Fixpoint compile_c (st : cstmt) (b : reg) (n : label) : lprog * label :=
+(** [compile_c fin st b n]: code for [st] with scratch base [b] and labels
+    from [n]; returns the next free label. *)
+Fixpoint compile_c (fin : label) (st : cstmt) (b : reg) (n : label) : lprog * label :=
   match st with
   | CBase s => (ops (compile_at b s), n)
   | CSeq a c =>
-      let '(p1, n1) := compile_c a b n in
-      let '(p2, n2) := compile_c c b n1 in
+      let '(p1, n1) := compile_c fin a b n in
+      let '(p2, n2) := compile_c fin c b n1 in
       (p1 ++ p2, n2)
   | CIf e1 a c e2 =>
-      let '(pa, na) := compile_c a (S b) (n + 5)%nat in
-      let '(pc, nc) := compile_c c (S b) na in
-      (if_code b n e1 e2 pa pc, nc)
+      let '(pa, na) := compile_c fin a (S b) (n + 5)%nat in
+      let '(pc, nc) := compile_c fin c (S b) na in
+      (if_code fin b n e1 e2 pa pc, nc)
   end.
 
 (** ** Label discipline: every label of the code lies in [[n, n')] *)
@@ -340,32 +466,33 @@ Ltac in_labels H :=
   | H' : In _ (labels (ops_l _ _)) |- _ => apply labels_ops_l in H'
   end.
 
-Lemma labels_if_code : forall b n e1 e2 pa pb l,
-  In l (labels (if_code b n e1 e2 pa pb)) ->
+Lemma labels_if_code : forall fin b n e1 e2 pa pb l,
+  In l (labels (if_code fin b n e1 e2 pa pb)) ->
   l = S n \/ In l (labels pa) \/ l = (n + 2)%nat \/ l = (n + 3)%nat
   \/ l = n \/ In l (labels pb) \/ l = (n + 4)%nat.
 Proof.
-  intros b n e1 e2 pa pb l H; unfold if_code in H.
+  intros fin b n e1 e2 pa pb l H; unfold if_code in H.
   in_labels H; subst; intuition auto.
 Qed.
 
-Lemma compile_c_labels : forall st b n p n',
-  compile_c st b n = (p, n') ->
+Lemma compile_c_labels : forall fin st b n p n',
+  compile_c fin st b n = (p, n') ->
   (n <= n')%nat /\ (forall l, In l (labels p) -> (n <= l < n')%nat).
 Proof.
+  intro fin.
   induction st as [s | a IHa c IHc | e1 a IHa c IHc e2]; intros b n p n' Hc; simpl in Hc.
   - injection Hc as <- <-. split; [lia |].
     intros l H; rewrite labels_ops in H; destruct H.
-  - destruct (compile_c a b n) as [p1 n1] eqn:E1.
-    destruct (compile_c c b n1) as [p2 n2] eqn:E2.
+  - destruct (compile_c fin a b n) as [p1 n1] eqn:E1.
+    destruct (compile_c fin c b n1) as [p2 n2] eqn:E2.
     injection Hc as <- <-.
     destruct (IHa _ _ _ _ E1) as [Hle1 Hin1].
     destruct (IHc _ _ _ _ E2) as [Hle2 Hin2].
     split; [lia |].
     intros l H; rewrite labels_app, in_app_iff in H.
     destruct H as [H | H]; [apply Hin1 in H | apply Hin2 in H]; lia.
-  - destruct (compile_c a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
-    destruct (compile_c c (S b) na) as [pb nb] eqn:Eb.
+  - destruct (compile_c fin a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
+    destruct (compile_c fin c (S b) na) as [pb nb] eqn:Eb.
     injection Hc as <- <-.
     destruct (IHa _ _ _ _ Ea) as [Hlea Hina].
     destruct (IHc _ _ _ _ Eb) as [Hleb Hinb].
@@ -393,6 +520,7 @@ Variable b : reg.
 Variable n : label.
 Variable e1 e2 : expr.
 Variable pa pb : lprog.
+Variable fin : label.
 
 Hypothesis Hb : b <> 0%nat.
 Hypothesis Hpre  : forall l, In l (labels pre)  -> ~ (n <= l < n + 5)%nat.
@@ -405,10 +533,10 @@ Let ltest   := S n.
 Let lassert := (n + 2)%nat.
 Let ltrue   := (n + 3)%nat.
 Let lend    := (n + 4)%nat.
-Let T1 := xor_block e1 b.
-Let T2 := xor_block e2 b.
+Let T1 := flag_block e1 b.
+Let T2 := flag_block e2 b.
 
-Let P := pre ++ if_code b n e1 e2 pa pb ++ post.
+Let P := pre ++ if_code fin b n e1 e2 pa pb ++ post.
 
 (** Positions of the interesting lines. *)
 Let n0 := length pre.
@@ -425,6 +553,7 @@ Let pF := S pE.                     (* false:  BRA test *)
 Let pC := S pF.                     (* else body *)
 Let pG := (pC + lb)%nat.            (* BRA assert *)
 Let pH := S pG.                     (* end:    BRA true *)
+Let pN := S pH.                     (* BNE rt r0 finish *)
 
 (** The bodies as embedded fragments, in the shape the induction provides. *)
 Let preA := pre ++ ops T1
@@ -436,6 +565,7 @@ Let postA := (None, COp (IXori b 1))
              :: pb
              ++ (None, CBra lassert)
              :: (Some lend, CBra ltrue)
+             :: (None, CBne b 0%nat fin)
              :: post.
 Let preB := pre ++ ops T1
             ++ (Some ltest, CBeq b 0%nat lfalse)
@@ -444,10 +574,11 @@ Let preB := pre ++ ops T1
             ++ (None, COp (IXori b 1))
             :: ops_l lassert T2
             ++ [(Some ltrue, CBra lend); (Some lfalse, CBra ltest)].
-Let postB := (None, CBra lassert) :: (Some lend, CBra ltrue) :: post.
+Let postB := (None, CBra lassert) :: (Some lend, CBra ltrue)
+             :: (None, CBne b 0%nat fin) :: post.
 
 Ltac len_solve :=
-  unfold pH, pG, pC, pF, pE, pD, pX, pA, pB, lb, t2, la, t1, n0, T1, T2 in *;
+  unfold pN, pH, pG, pC, pF, pE, pD, pX, pA, pB, lb, t2, la, t1, n0, T1, T2 in *;
   repeat first [ rewrite length_app | rewrite length_ops | rewrite length_ops_l
                | progress cbn [length] ];
   lia.
@@ -462,7 +593,7 @@ Ltac notin_labels :=
   end;
   unfold lfalse, ltest, lassert, ltrue, lend in *; lia.
 
-Lemma len_if_code : length (if_code b n e1 e2 pa pb) = (t1 + la + t2 + lb + 7)%nat.
+Lemma len_if_code : length (if_code fin b n e1 e2 pa pb) = (t1 + la + t2 + lb + 8)%nat.
 Proof. unfold if_code; len_solve. Qed.
 
 Lemma preA_eq : preA ++ pa ++ postA = P.
@@ -476,6 +607,9 @@ Proof. unfold preA; len_solve. Qed.
 
 Lemma len_preB : length preB = pC.
 Proof. unfold preB; len_solve. Qed.
+
+Lemma end_pos : (length pre + length (if_code fin b n e1 e2 pa pb))%nat = S pN.
+Proof. rewrite len_if_code; len_solve. Qed.
 
 (** *** The lines *)
 
@@ -550,6 +684,17 @@ Proof.
   eapply nth_error_at. unfold P, if_code; norm_app; reflexivity.
 Qed.
 
+Lemma nth_N : nth_error P pN = Some (None, CBne b 0%nat fin).
+Proof.
+  replace pN with (length (pre ++ ops T1
+      ++ (Some ltest, CBeq b 0%nat lfalse) :: (None, COp (IXori b 1)) :: pa
+      ++ (None, COp (IXori b 1)) :: ops_l lassert T2
+      ++ (Some ltrue, CBra lend) :: (Some lfalse, CBra ltest) :: pb
+      ++ [(None, CBra lassert); (Some lend, CBra ltrue)]))
+    by len_solve.
+  eapply nth_error_at. unfold P, if_code; norm_app; reflexivity.
+Qed.
+
 (** *** The labels *)
 
 Lemma find_ltest : find_label ltest P = Some pB.
@@ -565,7 +710,7 @@ Proof.
       ++ [(None, COp (IXori b 1))]))
     by len_solve.
   eapply find_label_ops_l_at with (c := T2);
-    [unfold P, if_code; norm_app; reflexivity | apply xor_block_nonempty | notin_labels].
+    [unfold P, if_code; norm_app; reflexivity | apply flag_block_nonempty | notin_labels].
 Qed.
 
 Lemma find_ltrue : find_label ltrue P = Some pE.
@@ -611,16 +756,16 @@ Proof. eapply paired_bra_beq; [apply nth_F | apply find_ltest | apply nth_B | ap
 Lemma paired_G : paired P pG = false.
 Proof.
   assert (HT2 : exists i t, T2 = i :: t).
-  { unfold T2; destruct (xor_block e2 b) as [| i t] eqn:E;
-      [exfalso; eapply xor_block_nonempty; eassumption | eauto]. }
+  { unfold T2; destruct (flag_block e2 b) as [| i t] eqn:E;
+      [exfalso; eapply flag_block_nonempty; eassumption | eauto]. }
   destruct HT2 as [i [t HT2]].
   eapply paired_bra_op; [apply nth_G | apply find_lassert | apply (nth_D i t HT2)].
 Qed.
 
 (** *** The join: `true: BRA end` lands on `end: BRA true`, which cancels
-    [br] and falls through to the line after the [If]. *)
+    [br] and falls through to the flag check after the [If]. *)
 
-Lemma join_steps : forall s, steps P (mkC pE 0 s) (mkC (S pH) 0 s).
+Lemma join_steps : forall s, steps P (mkC pE 0 s) (mkC pN 0 s).
 Proof.
   intro s.
   eapply steps_step.
@@ -632,20 +777,39 @@ Proof.
   eapply cstep_bra_paired_cancel; [apply nth_H | apply find_ltrue | apply paired_H | lia].
 Qed.
 
+(** *** `BNE rt r0 finish`: falls through on a clean flag, jumps to
+    [finish] on a dirty one. *)
+
+Lemma check_pass : forall R M, R b = R 0%nat ->
+  steps P (mkC pN 0 (mkState R M)) (mkC (S pN) 0 (mkState R M)).
+Proof.
+  intros R M H; apply steps_one.
+  eapply cstep_bne_direct_not_taken; [apply nth_N | exact H].
+Qed.
+
+Lemma check_fail : forall R M f, find_label fin P = Some f -> R b <> R 0%nat ->
+  steps P (mkC pN 0 (mkState R M)) (mkC f 0 (mkState R M)).
+Proof.
+  intros R M f Hf H; apply steps_one.
+  eapply cstep_bne_direct_taken; [apply nth_N | exact Hf | exact H].
+Qed.
+
 (** *** The assertion block, from the state the two paths reach it in *)
 
 Lemma assert_steps : forall R M σ' f,
-  models (mkState R M) σ' -> clean_above b (mkState R M) ->
-  Z.lxor f (eval σ' e2) = 0 ->
-  steps P (mkC pD 0 (mkState (rupd b f R) M)) (mkC pE 0 (mkState R M)).
+  models (mkState R M) σ' -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  steps P (mkC pD 0 (mkState (rupd b f R) M))
+          (mkC pE 0 (mkState (rupd b (Z.lxor f (truth (eval σ' e2))) R) M)).
 Proof.
-  intros R M σ' f Hmod Hcl Hf.
-  assert (HT2 : run T2 (mkState (rupd b f R) M) = mkState R M).
-  { unfold T2. rewrite (xor_block_spec e2 b _ σ').
-    - cbn [regs mem]. rewrite rupd_same, Hf, rupd_shadow.
-      rewrite rupd_zero; [reflexivity | apply Hcl; lia].
+  intros R M σ' f Hmod Hcl H0.
+  assert (HT2 : run T2 (mkState (rupd b f R) M)
+                = mkState (rupd b (Z.lxor f (truth (eval σ' e2))) R) M).
+  { unfold T2. rewrite (flag_block_spec e2 b _ σ').
+    - cbn [regs mem]. now rewrite rupd_same, rupd_shadow.
     - exact Hmod.
-    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia. }
+    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia.
+    - cbn [regs]; rewrite rupd_other by lia; exact H0.
+    - exact Hb. }
   rewrite <- HT2.
   replace pD with (length (pre ++ ops T1
       ++ (Some ltest, CBeq b 0%nat lfalse) :: (None, COp (IXori b 1)) :: pa
@@ -656,41 +820,44 @@ Proof.
   eapply steps_ops_l. unfold P, if_code; norm_app; reflexivity.
 Qed.
 
-(** *** The entry test *)
+(** *** The entry test: [rt := (e1 != 0)] *)
 
 Lemma test_steps : forall R M σ,
-  models (mkState R M) σ -> clean_above b (mkState R M) ->
-  steps P (mkC n0 0 (mkState R M)) (mkC pB 0 (mkState (rupd b (eval σ e1) R) M)).
+  models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  steps P (mkC n0 0 (mkState R M))
+          (mkC pB 0 (mkState (rupd b (truth (eval σ e1)) R) M)).
 Proof.
-  intros R M σ Hmod Hcl.
+  intros R M σ Hmod Hcl H0.
   assert (Hb0 : R b = 0) by (apply Hcl; lia).
-  assert (HT1 : run T1 (mkState R M) = mkState (rupd b (eval σ e1) R) M).
-  { unfold T1. rewrite (xor_block_spec e1 b _ σ).
+  assert (HT1 : run T1 (mkState R M) = mkState (rupd b (truth (eval σ e1)) R) M).
+  { unfold T1. rewrite (flag_block_spec e1 b _ σ).
     - cbn [regs mem]. rewrite Hb0. now rewrite Z.lxor_0_l.
     - exact Hmod.
-    - intros r Hr; apply Hcl; lia. }
+    - intros r Hr; apply Hcl; lia.
+    - exact H0.
+    - exact Hb. }
   rewrite <- HT1.
   replace pB with (length pre + length T1)%nat by len_solve.
   eapply steps_ops. unfold P, if_code; norm_app; reflexivity.
 Qed.
 
-(** *** The then path *)
+(** *** The then path, up to the flag check: the flag is [1 xor (e2 != 0)] *)
 
-Lemma if_true_run : forall R M R' M' σ σ',
+Lemma then_path : forall R M R' M' σ σ',
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
-  eval σ e1 = 1 -> eval σ' e2 = 1 ->
+  eval σ e1 <> 0 ->
   steps (preA ++ pa ++ postA) (mkC (length preA) 0 (mkState R M))
         (mkC (length preA + length pa) 0 (mkState R' M')) ->
   models (mkState R' M') σ' -> R' = R ->
   steps P (mkC (length pre) 0 (mkState R M))
-          (mkC (length pre + length (if_code b n e1 e2 pa pb)) 0 (mkState R M')).
+          (mkC pN 0 (mkState (rupd b (Z.lxor 1 (truth (eval σ' e2))) R) M')).
 Proof.
-  intros R M R' M' σ σ' Hmod Hcl H0 He1 He2 Hbody Hmod' HR; subst R'.
+  intros R M R' M' σ σ' Hmod Hcl H0 He1 Hbody Hmod' HR; subst R'.
   rewrite preA_eq, len_preA in Hbody.
   assert (Hb0 : R b = 0) by (apply Hcl; lia).
   (* test: rt := 1 *)
-  eapply steps_trans; [apply (test_steps R M σ Hmod Hcl) |].
-  rewrite He1.
+  eapply steps_trans; [apply (test_steps R M σ Hmod Hcl H0) |].
+  rewrite (truth_nz _ He1).
   (* BEQ rt r0 false: not taken *)
   eapply steps_step.
   { eapply cstep_beq_direct_not_taken; [apply nth_B |].
@@ -704,31 +871,28 @@ Proof.
   (* XORI rt 1: rt := 1 *)
   eapply steps_step; [eapply cstep_op; apply nth_X2 |].
   cbn [step regs mem]. rewrite Hb0. change (Z.lxor 0 1) with 1.
-  (* assertion: rt := 1 xor e2 = 0 *)
-  eapply steps_trans; [apply (assert_steps R M' σ' 1 Hmod' Hcl); now rewrite He2 |].
-  (* the join *)
-  replace (length pre + length (if_code b n e1 e2 pa pb))%nat with (S pH)
-    by (rewrite len_if_code; len_solve).
+  (* assertion: rt := 1 xor (e2 != 0) *)
+  eapply steps_trans; [apply (assert_steps R M' σ' 1 Hmod' Hcl H0) |].
   apply join_steps.
 Qed.
 
-(** *** The else path *)
+(** *** The else path, up to the flag check: the flag is [(e2 != 0)] *)
 
-Lemma if_false_run : forall R M R' M' σ σ',
+Lemma else_path : forall R M R' M' σ σ',
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
-  eval σ e1 = 0 -> eval σ' e2 = 0 ->
+  eval σ e1 = 0 ->
   steps (preB ++ pb ++ postB) (mkC (length preB) 0 (mkState R M))
         (mkC (length preB + length pb) 0 (mkState R' M')) ->
   models (mkState R' M') σ' -> R' = R ->
   steps P (mkC (length pre) 0 (mkState R M))
-          (mkC (length pre + length (if_code b n e1 e2 pa pb)) 0 (mkState R M')).
+          (mkC pN 0 (mkState (rupd b (truth (eval σ' e2)) R) M')).
 Proof.
-  intros R M R' M' σ σ' Hmod Hcl H0 He1 He2 Hbody Hmod' HR; subst R'.
+  intros R M R' M' σ σ' Hmod Hcl H0 He1 Hbody Hmod' HR; subst R'.
   rewrite preB_eq, len_preB in Hbody.
   assert (Hb0 : R b = 0) by (apply Hcl; lia).
   (* test: rt := 0, i.e. the state is unchanged *)
-  eapply steps_trans; [apply (test_steps R M σ Hmod Hcl) |].
-  rewrite He1, rupd_zero by exact Hb0.
+  eapply steps_trans; [apply (test_steps R M σ Hmod Hcl H0) |].
+  rewrite He1, truth_0, rupd_zero by exact Hb0.
   (* BEQ rt r0 false, taken with br = 0: a direct jump to `false` *)
   eapply steps_step.
   { eapply cstep_beq_direct_taken; [apply nth_B | apply find_lfalse |].
@@ -750,14 +914,78 @@ Proof.
   (* BRA assert: an ordinary jump *)
   eapply steps_step.
   { eapply cstep_bra_direct; [apply nth_G | apply find_lassert | apply paired_G]. }
-  (* assertion: rt := 0 xor e2 = 0 *)
-  assert (HA := assert_steps R M' σ' 0 Hmod' Hcl ltac:(now rewrite He2)).
-  rewrite rupd_zero in HA by exact Hb0.
+  (* assertion: rt := 0 xor (e2 != 0) *)
+  assert (HA := assert_steps R M' σ' 0 Hmod' Hcl H0).
+  rewrite rupd_zero in HA by exact Hb0. rewrite Z.lxor_0_l in HA.
   eapply steps_trans; [exact HA |].
-  (* the join *)
-  replace (length pre + length (if_code b n e1 e2 pa pb))%nat with (S pH)
-    by (rewrite len_if_code; len_solve).
   apply join_steps.
+Qed.
+
+(** *** Valid runs: the flag is clean and `BNE rt r0 finish` falls through *)
+
+Lemma if_true_run : forall R M R' M' σ σ',
+  models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  eval σ e1 <> 0 -> eval σ' e2 <> 0 ->
+  steps (preA ++ pa ++ postA) (mkC (length preA) 0 (mkState R M))
+        (mkC (length preA + length pa) 0 (mkState R' M')) ->
+  models (mkState R' M') σ' -> R' = R ->
+  steps P (mkC (length pre) 0 (mkState R M))
+          (mkC (length pre + length (if_code fin b n e1 e2 pa pb)) 0 (mkState R M')).
+Proof.
+  intros R M R' M' σ σ' Hmod Hcl H0 He1 He2 Hbody Hmod' HR.
+  assert (Hb0 : R b = 0) by (apply Hcl; lia).
+  eapply steps_trans; [eapply then_path; eassumption |].
+  rewrite (truth_nz _ He2). change (Z.lxor 1 1) with 0. rewrite rupd_zero by exact Hb0.
+  rewrite end_pos. apply check_pass. congruence.
+Qed.
+
+Lemma if_false_run : forall R M R' M' σ σ',
+  models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  eval σ e1 = 0 -> eval σ' e2 = 0 ->
+  steps (preB ++ pb ++ postB) (mkC (length preB) 0 (mkState R M))
+        (mkC (length preB + length pb) 0 (mkState R' M')) ->
+  models (mkState R' M') σ' -> R' = R ->
+  steps P (mkC (length pre) 0 (mkState R M))
+          (mkC (length pre + length (if_code fin b n e1 e2 pa pb)) 0 (mkState R M')).
+Proof.
+  intros R M R' M' σ σ' Hmod Hcl H0 He1 He2 Hbody Hmod' HR.
+  assert (Hb0 : R b = 0) by (apply Hcl; lia).
+  eapply steps_trans; [eapply else_path; eassumption |].
+  rewrite He2, truth_0, rupd_zero by exact Hb0.
+  rewrite end_pos. apply check_pass. congruence.
+Qed.
+
+(** *** Violated exit assertion: the flag is [1] and the run jumps to
+    [finish] — it does not reach the line after the [If]. *)
+
+Lemma if_true_violation : forall R M R' M' σ σ' f,
+  models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  eval σ e1 <> 0 -> eval σ' e2 = 0 ->
+  steps (preA ++ pa ++ postA) (mkC (length preA) 0 (mkState R M))
+        (mkC (length preA + length pa) 0 (mkState R' M')) ->
+  models (mkState R' M') σ' -> R' = R ->
+  find_label fin P = Some f ->
+  steps P (mkC (length pre) 0 (mkState R M)) (mkC f 0 (mkState (rupd b 1 R) M')).
+Proof.
+  intros R M R' M' σ σ' f Hmod Hcl H0 He1 He2 Hbody Hmod' HR Hf.
+  eapply steps_trans; [eapply then_path; eassumption |].
+  rewrite He2, truth_0. change (Z.lxor 1 0) with 1.
+  apply check_fail; [exact Hf |]. cbn [regs]. rewrite rupd_same, rupd_other by lia. lia.
+Qed.
+
+Lemma if_false_violation : forall R M R' M' σ σ' f,
+  models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
+  eval σ e1 = 0 -> eval σ' e2 <> 0 ->
+  steps (preB ++ pb ++ postB) (mkC (length preB) 0 (mkState R M))
+        (mkC (length preB + length pb) 0 (mkState R' M')) ->
+  models (mkState R' M') σ' -> R' = R ->
+  find_label fin P = Some f ->
+  steps P (mkC (length pre) 0 (mkState R M)) (mkC f 0 (mkState (rupd b 1 R) M')).
+Proof.
+  intros R M R' M' σ σ' f Hmod Hcl H0 He1 He2 Hbody Hmod' HR Hf.
+  eapply steps_trans; [eapply else_path; eassumption |].
+  rewrite (truth_nz _ He2).
+  apply check_fail; [exact Hf |]. cbn [regs]. rewrite rupd_same, rupd_other by lia. lia.
 Qed.
 
 End IfLayout.
@@ -768,11 +996,13 @@ End IfLayout.
     define its labels, started with [br = 0] at its first line, reaches the
     line after its last with [br = 0], a memory representing the final store
     and the *same* register file.  [b <> 0] and [regs ms 0 = 0] stand for
-    the hard-wired zero register `r0` the entry test compares against. *)
+    the hard-wired zero register `r0` the tests compare against.  Nothing is
+    assumed about [fin]: on a valid execution every `BNE rt r0 finish`
+    falls through. *)
 
-Theorem compile_c_spec : forall st σ σ' b n p n' ms pre post,
+Theorem compile_c_spec : forall fin st σ σ' b n p n' ms pre post,
   exec_c st σ σ' -> wf_cstmt st ->
-  compile_c st b n = (p, n') -> b <> 0%nat ->
+  compile_c fin st b n = (p, n') -> b <> 0%nat ->
   models ms σ -> clean_above b ms -> regs ms 0%nat = 0 ->
   (forall l, In l (labels pre)  -> ~ (n <= l < n')%nat) ->
   (forall l, In l (labels post) -> ~ (n <= l < n')%nat) ->
@@ -781,7 +1011,7 @@ Theorem compile_c_spec : forall st σ σ' b n p n' ms pre post,
           (mkC (length pre) 0 ms) (mkC (length pre + length p) 0 ms')
     /\ models ms' σ' /\ regs ms' = regs ms.
 Proof.
-  intros st σ σ' b n p n' ms pre post Hex.
+  intros fin st σ σ' b n p n' ms pre post Hex.
   revert b n p n' ms pre post.
   induction Hex as [s σ σ' Hs | a c σ m σ' Ha IHa Hc IHc
                    | e1 a c e2 σ σ' He1 Ha IHa He2 | e1 a c e2 σ σ' He1 Hc IHc He2];
@@ -793,11 +1023,11 @@ Proof.
     rewrite length_ops. eapply steps_ops. reflexivity.
   - (* CSeq *)
     destruct Hwf as [Hwfa Hwfc].
-    destruct (compile_c a b n) as [p1 n1] eqn:E1.
-    destruct (compile_c c b n1) as [p2 n2] eqn:E2.
+    destruct (compile_c fin a b n) as [p1 n1] eqn:E1.
+    destruct (compile_c fin c b n1) as [p2 n2] eqn:E2.
     injection Hcomp as <- <-.
-    destruct (compile_c_labels _ _ _ _ _ E1) as [Hle1 Hin1].
-    destruct (compile_c_labels _ _ _ _ _ E2) as [Hle2 Hin2].
+    destruct (compile_c_labels _ _ _ _ _ _ E1) as [Hle1 Hin1].
+    destruct (compile_c_labels _ _ _ _ _ _ E2) as [Hle2 Hin2].
     destruct (IHa b n p1 n1 ms pre (p2 ++ post) Hwfa E1 Hb Hmod Hcl H0)
       as [ms1 [Hst1 [Hm1 Hr1]]].
     { intros l Hl; apply Hpre in Hl; lia. }
@@ -819,23 +1049,24 @@ Proof.
     exact Hst2.
   - (* CIf, then path *)
     destruct Hwf as [Hwfa Hwfc].
-    destruct (compile_c a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
-    destruct (compile_c c (S b) na) as [pb nb] eqn:Eb.
+    destruct (compile_c fin a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
+    destruct (compile_c fin c (S b) na) as [pb nb] eqn:Eb.
     injection Hcomp as <- <-.
-    destruct (compile_c_labels _ _ _ _ _ Ea) as [Hlea Hina].
-    destruct (compile_c_labels _ _ _ _ _ Eb) as [Hleb Hinb].
+    destruct (compile_c_labels _ _ _ _ _ _ Ea) as [Hlea Hina].
+    destruct (compile_c_labels _ _ _ _ _ _ Eb) as [Hleb Hinb].
     destruct ms as [R M].
     assert (HclS : clean_above (S b) (mkState R M)) by (intros r Hr; apply Hcl; lia).
     destruct (IHa (S b) (n + 5)%nat pa na (mkState R M)
-                  (pre ++ ops (xor_block e1 b)
+                  (pre ++ ops (flag_block e1 b)
                        ++ [(Some (S n), CBeq b 0%nat n); (None, COp (IXori b 1))])
                   ((None, COp (IXori b 1))
-                   :: ops_l (n + 2)%nat (xor_block e2 b)
+                   :: ops_l (n + 2)%nat (flag_block e2 b)
                    ++ (Some (n + 3)%nat, CBra (n + 4)%nat)
                    :: (Some n, CBra (S n))
                    :: pb
                    ++ (None, CBra (n + 2)%nat)
                    :: (Some (n + 4)%nat, CBra (n + 3)%nat)
+                   :: (None, CBne b 0%nat fin)
                    :: post)
                   Hwfa Ea ltac:(lia) Hmod HclS H0)
       as [[R' M'] [Hst [Hm' Hr']]].
@@ -850,29 +1081,30 @@ Proof.
       end; subst; lia. }
     cbn [regs] in Hr'.
     exists (mkState R M'). split; [| split; [exact Hm' | reflexivity]].
-    apply (if_true_run pre post b n e1 e2 pa pb Hb) with (σ := σ) (σ' := σ') (R' := R');
+    apply (if_true_run pre post b n e1 e2 pa pb fin Hb) with (σ := σ) (σ' := σ') (R' := R');
       try assumption.
     all: intros l Hl;
          first [apply Hpre in Hl | apply Hpost in Hl | apply Hina in Hl | apply Hinb in Hl];
          lia.
   - (* CIf, else path *)
     destruct Hwf as [Hwfa Hwfc].
-    destruct (compile_c a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
-    destruct (compile_c c (S b) na) as [pb nb] eqn:Eb.
+    destruct (compile_c fin a (S b) (n + 5)%nat) as [pa na] eqn:Ea.
+    destruct (compile_c fin c (S b) na) as [pb nb] eqn:Eb.
     injection Hcomp as <- <-.
-    destruct (compile_c_labels _ _ _ _ _ Ea) as [Hlea Hina].
-    destruct (compile_c_labels _ _ _ _ _ Eb) as [Hleb Hinb].
+    destruct (compile_c_labels _ _ _ _ _ _ Ea) as [Hlea Hina].
+    destruct (compile_c_labels _ _ _ _ _ _ Eb) as [Hleb Hinb].
     destruct ms as [R M].
     assert (HclS : clean_above (S b) (mkState R M)) by (intros r Hr; apply Hcl; lia).
     destruct (IHc (S b) na pb nb (mkState R M)
-                  (pre ++ ops (xor_block e1 b)
+                  (pre ++ ops (flag_block e1 b)
                        ++ (Some (S n), CBeq b 0%nat n)
                        :: (None, COp (IXori b 1))
                        :: pa
                        ++ (None, COp (IXori b 1))
-                       :: ops_l (n + 2)%nat (xor_block e2 b)
+                       :: ops_l (n + 2)%nat (flag_block e2 b)
                        ++ [(Some (n + 3)%nat, CBra (n + 4)%nat); (Some n, CBra (S n))])
-                  ((None, CBra (n + 2)%nat) :: (Some (n + 4)%nat, CBra (n + 3)%nat) :: post)
+                  ((None, CBra (n + 2)%nat) :: (Some (n + 4)%nat, CBra (n + 3)%nat)
+                   :: (None, CBne b 0%nat fin) :: post)
                   Hwfc Eb ltac:(lia) Hmod HclS H0)
       as [[R' M'] [Hst [Hm' Hr']]].
     { intros l Hl; in_labels Hl;
@@ -886,7 +1118,7 @@ Proof.
       end; subst; lia. }
     cbn [regs] in Hr'.
     exists (mkState R M'). split; [| split; [exact Hm' | reflexivity]].
-    apply (if_false_run pre post b n e1 e2 pa pb Hb) with (σ := σ) (σ' := σ') (R' := R');
+    apply (if_false_run pre post b n e1 e2 pa pb fin Hb) with (σ := σ) (σ' := σ') (R' := R');
       try assumption.
     all: intros l Hl;
          first [apply Hpre in Hl | apply Hpost in Hl | apply Hina in Hl | apply Hinb in Hl];
@@ -896,18 +1128,19 @@ Qed.
 (** ** Whole-program corollary, on the executable machine
 
     Compile with the real scratch base and labels from 0, start at pc 0 with
-    [br = 0]; the fuel interpreter halts by falling off the end. *)
+    [br = 0]; the fuel interpreter halts by falling off the end.  The
+    program need not even define [fin]. *)
 
-Corollary compile_c_program : forall st σ σ' p n' ms,
+Corollary compile_c_program : forall fin st σ σ' p n' ms,
   exec_c st σ σ' -> wf_cstmt st ->
-  compile_c st scratch 0%nat = (p, n') ->
+  compile_c fin st scratch 0%nat = (p, n') ->
   models ms σ -> clean_above scratch ms -> regs ms 0%nat = 0 ->
   exists ms' fuel,
     exec_fuel fuel p (mkC 0%nat 0 ms) = Some (mkC (length p) 0 ms')
     /\ models ms' σ' /\ regs ms' = regs ms.
 Proof.
-  intros st σ σ' p n' ms Hex Hwf Hc Hmod Hcl H0.
-  destruct (compile_c_spec st σ σ' scratch 0%nat p n' ms [] [] Hex Hwf Hc)
+  intros fin st σ σ' p n' ms Hex Hwf Hc Hmod Hcl H0.
+  destruct (compile_c_spec fin st σ σ' scratch 0%nat p n' ms [] [] Hex Hwf Hc)
     as [ms' [Hst [Hm Hr]]];
     [unfold scratch; lia | exact Hmod | exact Hcl | exact H0
     | intros l Hl; destruct Hl | intros l Hl; destruct Hl |].
@@ -920,7 +1153,16 @@ Qed.
 
 (** ** Sanity checks: run the compiler and the machine
 
-    Straight-line bodies at base 4 (the flag is r3), both paths. *)
+    `finish` is label 0 and the statement's labels start at 1;
+    [with_finish] appends the `finish:` line (a NOP here: the fuel
+    interpreter halts when the pc falls off the end, which is what `FINISH`
+    does).  Straight-line bodies at base 4 (the flag is r3). *)
+
+Definition fin_label : label := 0%nat.
+
+Definition with_finish (p : lprog) : lprog := p ++ [(Some fin_label, COp (IAddi 0%nat 0))].
+
+Definition prog_c (st : cstmt) : lprog := with_finish (fst (compile_c fin_label st scratch 1%nat)).
 
 (** [x += 3; if x ^ 2 then y += 1 else y += 2 fi y ^ 0]: with x = 3 the test
     is 1, the then branch runs, and the assertion [y ^ 0 = 1] holds. *)
@@ -940,6 +1182,16 @@ Definition prog_else : cstmt :=
             (CBase (Assign 1%nat AAdd (Cst 2)))
             (Bin OXor (Var 1%nat) (Cst 2))).
 
+(** Non-Boolean tests, valid Janus: [x += 5; if x then y += 1 else y += 2
+    fi y + 6] — the test is 5 and the assertion 7, both true.  Before the
+    [e != 0] normalisation this left [5 xor 7] in the flag. *)
+Definition prog_nonbool : cstmt :=
+  CSeq (CBase (Assign 0%nat AAdd (Cst 5)))
+       (CIf (Var 0%nat)
+            (CBase (Assign 1%nat AAdd (Cst 1)))
+            (CBase (Assign 1%nat AAdd (Cst 2)))
+            (Bin OAdd (Var 1%nat) (Cst 6))).
+
 Definition observe (p : lprog) (r : option cstate) :=
   match r with
   | Some c => (Nat.eqb (cpc c) (length p), cbr c, mem (cst c) 0, mem (cst c) 1,
@@ -949,28 +1201,39 @@ Definition observe (p : lprog) (r : option cstate) :=
   end.
 
 Example ex_then :
-  let p := fst (compile_c prog_then scratch 0%nat) in
+  let p := prog_c prog_then in
   observe p (exec_fuel 500 p (mkC 0%nat 0 zero_state)) = (true, 0, 3, 1, 0, 0, 0, 0, 0).
 Proof. vm_compute. reflexivity. Qed.
 
 Example ex_else :
-  let p := fst (compile_c prog_else scratch 0%nat) in
+  let p := prog_c prog_else in
   observe p (exec_fuel 500 p (mkC 0%nat 0 zero_state)) = (true, 0, 3, 2, 0, 0, 0, 0, 0).
 Proof. vm_compute. reflexivity. Qed.
 
-(** A violated exit assertion is *not* clean: [fi y ^ 3] on the then path
-    leaves the flag dirty — this is what `pisa_interp.py` reports at FINISH. *)
-Example ex_violation_dirty :
-  let st := CSeq (CBase (Assign 0%nat AAdd (Cst 3)))
-                 (CIf (Bin OXor (Var 0%nat) (Cst 2))
-                      (CBase (Assign 1%nat AAdd (Cst 1)))
-                      (CBase (Assign 1%nat AAdd (Cst 2)))
-                      (Bin OXor (Var 1%nat) (Cst 3))) in
-  let p := fst (compile_c st scratch 0%nat) in
-  match exec_fuel 500 p (mkC 0%nat 0 zero_state) with
-  | Some c => regs (cst c) 3%nat
-  | None => 0
-  end = 3.
+Example ex_nonbool :
+  let p := prog_c prog_nonbool in
+  observe p (exec_fuel 500 p (mkC 0%nat 0 zero_state)) = (true, 0, 5, 1, 0, 0, 0, 0, 0).
+Proof. vm_compute. reflexivity. Qed.
+
+(** A violated exit assertion is detected: [fi y ^ 1] on the then path (y = 1)
+    leaves the flag [1], so `BNE rt r0 finish` jumps to `finish` with r3 = 1
+    — what `pisa_interp.py` reports as garbage at FINISH.  Without a
+    `finish` line the same code gets stuck at that branch (no label). *)
+Definition prog_violation : cstmt :=
+  CSeq (CBase (Assign 0%nat AAdd (Cst 3)))
+       (CIf (Bin OXor (Var 0%nat) (Cst 2))
+            (CBase (Assign 1%nat AAdd (Cst 1)))
+            (CBase (Assign 1%nat AAdd (Cst 2)))
+            (Bin OXor (Var 1%nat) (Cst 1))).
+
+Example ex_violation_detected :
+  let p := prog_c prog_violation in
+  observe p (exec_fuel 500 p (mkC 0%nat 0 zero_state)) = (true, 0, 3, 1, 1, 0, 0, 0, 0).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_violation_jumps :
+  exec_fuel 500 (fst (compile_c fin_label prog_violation scratch 1%nat))
+            (mkC 0%nat 0 zero_state) = None.
 Proof. vm_compute. reflexivity. Qed.
 
 (** A nested [If] with the inner flag in r4 and its bodies at base 5:
@@ -987,14 +1250,14 @@ Definition prog_nested : cstmt :=
             (Bin OXor (Var 1%nat) (Cst 4))).
 
 Example ex_nested :
-  let p := fst (compile_c prog_nested scratch 0%nat) in
+  let p := prog_c prog_nested in
   observe p (exec_fuel 500 p (mkC 0%nat 0 zero_state)) = (true, 0, 3, 5, 0, 0, 0, 0, 0).
 Proof. vm_compute. reflexivity. Qed.
 
 (** The nested case compiles with distinct labels and the theorem applies to it. *)
 Example ex_nested_labels :
-  snd (compile_c (CIf (Cst 1) (CIf (Cst 1) (CBase Skip) (CBase Skip) (Cst 1))
-                               (CBase Skip) (Cst 1)) scratch 0%nat) = 10%nat.
+  snd (compile_c fin_label (CIf (Cst 1) (CIf (Cst 1) (CBase Skip) (CBase Skip) (Cst 1))
+                               (CBase Skip) (Cst 1)) scratch 1%nat) = 11%nat.
 Proof. reflexivity. Qed.
 
 (** ** Axiom footprint *)
@@ -1003,3 +1266,4 @@ Print Assumptions compile_c_spec.
 Print Assumptions compile_c_program.
 Print Assumptions exec_c_rev.
 Print Assumptions compile_at_scratch.
+Print Assumptions flag_block_spec.

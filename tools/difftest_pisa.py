@@ -214,6 +214,10 @@ def compare(pisa: PisaResult, php: PhpResult, nvars: int, base_pisa: Optional[in
     if not php.ok or not php.finished:
         why = php.error or f"did not reach FINISH (pc={php.pc}, br={php.br}, dir={php.dir})"
         return (f"ERROR(phpisa: {why})", detail)
+    if pisa.dirty:
+        # codegen jumps to FINISH as soon as a `fi` or `from` assertion fails,
+        # skipping epilogues, so the final registers are not comparable.
+        return (f"ERROR(pisa_interp: assertion violated, {', '.join(pisa.dirty)} at FINISH)", detail)
     for a in range(nvars):
         pv, hv = pisa.mem.get(a, 0), php.mem.get(a, 0)
         if pv != hv:

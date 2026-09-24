@@ -13,7 +13,7 @@ Inversion rules (Yokoyama & Glück, PEPM 2007):
     (uncall f)⁻¹                      = call f
     (if e₁ then s₁ else s₂ fi e₂)⁻¹  = if e₂ then s₁⁻¹ else s₂⁻¹ fi e₁
     (from e₁ do s₁ loop s₂ until e₂)⁻¹
-                                       = from e₂ do s₂⁻¹ loop s₁⁻¹ until e₁
+                                       = from e₂ do s₁⁻¹ loop s₂⁻¹ until e₁
     (s₁ ; s₂ ; … ; sn)⁻¹             = sn⁻¹ ; … ; s₂⁻¹ ; s₁⁻¹
 
     where   inv(+=) = -=,   inv(-=) = +=,   inv(^=) = ^=  (self-inverse)
@@ -83,11 +83,14 @@ def invert_stmt(stmt: Stmt) -> Stmt:
 
     if isinstance(stmt, From):
         # from e1 do s1 loop s2 until e2
-        # →  from e2 do s2⁻¹ loop s1⁻¹ until e1
+        # →  from e2 do s1⁻¹ loop s2⁻¹ until e1
+        # The forward run executes s1 (s2 s1)ⁿ, whose reverse is
+        # s1⁻¹ (s2⁻¹ s1⁻¹)ⁿ: do and loop keep their places.  (They used to be
+        # swapped, which is only harmless when one of them is skip.)
         return From(
             from_=deepcopy(stmt.until),
-            do_=invert_stmt(stmt.loop_),
-            loop_=invert_stmt(stmt.do_),
+            do_=invert_stmt(stmt.do_),
+            loop_=invert_stmt(stmt.loop_),
             until=deepcopy(stmt.from_),
         )
 

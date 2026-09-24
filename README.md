@@ -22,7 +22,7 @@ Program inversion follows the rules from:
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
 - Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
 - Multiplication by a compile-time constant, compiled to a branch-free shift-and-add chain
-- 336 tests (all passing)
+- 381 tests (380 passing, 1 skipped without an rfcl checkout)
 
 On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
 
@@ -163,8 +163,8 @@ The **common subset** that cross-checks cleanly is:
 |---|---|
 | `x += e`, `x -= e`, `x ^= e` | identical syntax |
 | `x <=> y`, `a[i] <=> b[j]` | identical syntax |
-| `if e1 then S1 else S2 fi e2` | identical; `e2` must genuinely discriminate the branches, which PyJanus checks at runtime and this compiler does not |
-| `from e1 do S1 loop S2 until e2` | identical |
+| `if e1 then S1 else S2 fi e2` | identical; `e2` must genuinely discriminate the branches.  Both check it at run time: the compiled code halts at `finish` with the flag register nonzero, which `PISAMachine` reports |
+| `from e1 do S1 loop S2 until e2` | identical; the entry and re-entry assertions on `e1` are checked like `fi` |
 | arrays, constant multiplication | identical |
 | `call f` / `uncall f` | needs the parameter-threading shim; agrees since the `uncall` fix |
 
@@ -262,7 +262,7 @@ The inverter implements the syntactic inversion rules:
 | `x <=> y` | `x <=> y` |
 | `call f` | `uncall f` |
 | `if e1 then S1 else S2 fi e2` | `if e2 then S1⁻¹ else S2⁻¹ fi e1` |
-| `from e1 do S1 loop S2 until e2` | `from e2 do S2⁻¹ loop S1⁻¹ until e1` |
+| `from e1 do S1 loop S2 until e2` | `from e2 do S1⁻¹ loop S2⁻¹ until e1` |
 | `S1; S2; …; Sn` | `Sn⁻¹; …; S2⁻¹; S1⁻¹` |
 
 The round-trip property P⁻¹(P(σ)) = σ is verified by the test suite for a variety of programs.

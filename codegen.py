@@ -23,6 +23,50 @@ from regalloc import RegAlloc
 from inverse import invert_stmt
 
 
+_COMPARISONS = ('=', '!=', '<', '>', '<=', '>=')
+_LOGICAL = ('&&', '||')
+
+# Jump target for a violated `fi` or loop assertion (the FINISH of gen_program).
+ASSERT_FAIL_LABEL = "finish"
+
+
+def _as_flag(e: Expr) -> Expr:
+    """Return an expression equal to 1 if e is true (nonzero) and 0 otherwise.
+
+    _gen_if and _gen_from XOR their predicates into a 0/1 path flag, which is
+    only sound for 0/1-valued expressions.  Comparisons, `&&`/`||` and the
+    constants 0/1 already are; anything else (e.g. `if 5 then ... fi 7`, valid Janus)
+    is normalised by `e != 0`.
+    """
+    if isinstance(e, BinOp) and (e.op in _COMPARISONS or e.op in _LOGICAL):
+        return e
+    if isinstance(e, Const) and e.value in (0, 1):
+        return e
+    return BinOp('!=', e, Const(0))
+
+
+def _logical_operands(e: BinOp) -> BinOp:
+    """Normalise the operands of `&&` / `||` to 0/1 (see _as_flag).
+
+    Janus `&&`/`||` are logical: operands are true when nonzero and the
+    result is 0/1.  They are lowered to the bitwise ANDX / ORX, which agree
+    only on 0/1 operands (`1 && 2` used to give 1 & 2 = 0, `1 || 2` gave 3).
+    Operands that are already 0/1 (comparisons, logical ops, 0/1 constants),
+    the usual case, compile exactly as before.  The others become
+    `operand != 0`, which _gen_nonzero evaluates, uncomputes and cleans up
+    on the spot, so the extra flag costs code but not registers.  gen and
+    uneval must apply the same rewrite.
+    """
+    if e.op in _LOGICAL:
+        return BinOp(e.op, _as_flag(e.left), _as_flag(e.right))
+    return e
+
+
+def _is_nonzero_test(e: BinOp) -> bool:
+    """`e != 0`, the shape _as_flag produces."""
+    return e.op == '!=' and isinstance(e.right, Const) and e.right.value == 0
+
+
 def _inv_proc_name(name: str) -> str:
     """Label of the inverted companion of procedure `name`."""
     return name + "_inv"
@@ -237,6 +281,10 @@ class CodeGen:
             if folded is not None:
                 return self._gen_const(Const(folded))
 
+        expr = _logical_operands(expr)
+        if _is_nonzero_test(expr):
+            return self._gen_nonzero(expr.left)
+
         left_code, rl = self.gen_expr(expr.left)
         right_code, rr = self.gen_expr(expr.right)
         code = list(left_code) + list(right_code)
@@ -337,8 +385,9 @@ class CodeGen:
             re = self.reg.alloc()
             code.append(self._emit(ORX(re, rl)))
             code.append(self._emit(ORX(re, rr)))
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
+            # ORX zeroes its source, so rl and rr are clean and can be reused.
+            self.reg.free_reg(rl)
+            self.reg.free_reg(rr)
             self.reg.commit_reg(re)
             return code, re
 
@@ -354,12 +403,50 @@ class CodeGen:
             re = self.reg.alloc()
             code.append(self._emit(ORX(re, rl)))
             code.append(self._emit(ORX(re, rr)))
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
+            # ORX zeroes its source, so rl and rr are clean and can be reused.
+            self.reg.free_reg(rl)
+            self.reg.free_reg(rr)
             self.reg.commit_reg(re)
             return code, re
 
         raise CodeGenError(f"Unknown operator: {op}")
+
+    def _flag_of(self, rf: str, rv: str) -> List[LabeledInstr]:
+        """rf ^= (rv != 0), rv unchanged.  Self-inverse.
+
+        (rv < 0) and (0 < rv) are mutually exclusive, so XOR-ing both SLTX
+        bits adds exactly (rv != 0); no NEG, so INT_MIN is fine under fixed
+        width.  r0 as an SLTX operand is special-cased by the PAL expansion
+        (tools/pisa2pal.py), which never writes it.
+        """
+        return [self._emit(SLTX(rf, rv, "r0")),     # rf ^= (rv < 0)
+                self._emit(SLTX(rf, "r0", rv))]     # rf ^= (0 < rv)
+
+    def _nonzero_into(self, rf: str, e: Expr) -> List[LabeledInstr]:
+        """rf ^= (e != 0), leaving every other register as it was.
+
+        e's value is uncomputed straight away and the garbage its
+        evaluation and uncomputation produced is cleared here, so the flag
+        costs one register.  (The general `!=` path keeps both operands as
+        garbage until the end of the statement, which exhausted the
+        registers for `a && b && c`.)  Self-inverse: running it again with
+        the same e clears rf, which is how the uneval pass uses it.
+        """
+        before = set(self.reg.garbage)
+        code, rv = self.gen_expr(e)
+        code.extend(self._flag_of(rf, rv))
+        code.extend(self._gen_uneval_expr(e, rv))
+        for r in sorted(self.reg.garbage - before, key=lambda r: int(r[1:])):
+            code.append(self._emit(XOR(r, r)))
+            self.reg.free_reg(r)
+        return code
+
+    def _gen_nonzero(self, e: Expr) -> Tuple[List[LabeledInstr], str]:
+        """Evaluate (e != 0) into a fresh register holding only the 0/1 flag."""
+        rf = self.reg.alloc()
+        code = self._nonzero_into(rf, e)
+        self.reg.commit_reg(rf)
+        return code, rf
 
     def uneval_expr(self, expr: Expr, result_reg: str) -> List[LabeledInstr]:
         """Generate code to unevaluate an expression (reverse of gen_expr).
@@ -602,7 +689,13 @@ class CodeGen:
         For arithmetic ops (+, -, ^) with a constant operand, we skip the register
         load/unload and use an immediate instruction directly (saves 2 instructions).
         """
+        expr = _logical_operands(expr)
         op = expr.op
+
+        if _is_nonzero_test(expr):
+            code = self._nonzero_into(result_reg, expr.left)   # result_reg -> 0
+            self.reg.free_reg(result_reg)
+            return code
 
         # Fast path for arithmetic with constant operand(s).
         # Avoids allocating a register and two instructions per const operand.
@@ -934,21 +1027,19 @@ class CodeGen:
 
         if e1 then S1 else S2 fi e2
 
-        Test e1 (Fig. 9):
-            BNE rt r0 error
-            <eval e1 → re>
-            XOR rt re
-            <uneval e1>
-        test: BEQ rt r0 test_false
-              XORI rt 1
-              <S1>
-              ...
-        Assert e2 (at join, Fig. 10):
-              XORI rt 1
-        assert: BNE rt r0 assert_true
-              <eval e2 → re>
-              XOR rt re
-              <uneval e2>
+                    <rt ^= e1>              ; e1, e2 normalised to 0/1 by _as_flag
+        test:       BEQ rt r0 false
+                    XORI rt 1               ; then path: rt = 0
+                    <S1>
+                    XORI rt 1               ; then path: rt = 1
+        assert:     <rt ^= e2>              ; both paths join here: rt = 0 iff e2
+                                            ; matches the path taken
+        assert_true: BRA end
+        false:      BRA test                ; paired with the BEQ
+                    <S2>                    ; else path: rt = 0
+                    BRA assert
+        end:        BRA assert_true         ; paired; falls through below
+                    BNE rt r0 finish        ; violated -> halt with rt = 1
         """
         test_false = self.fresh_label("if_false")
         test_label = self.fresh_label("if_test")
@@ -962,15 +1053,7 @@ class CodeGen:
         rt = self.reg.alloc()
         self.reg.commit_reg(rt)
 
-        # Evaluate test expression
-        eval_code, re = self.gen_expr(stmt.test)
-        code.extend(eval_code)
-        code.append(self._emit(XOR(rt, re)))
-
-        # Unevaluate test
-        uneval_code = self._gen_uneval_expr(stmt.test, re)
-        code.extend(uneval_code)
-        code.extend(self._clear_garbage())
+        code.extend(self._gen_flag_xor(rt, _as_flag(stmt.test)))
 
         # Branch
         code.append(self._emit(BEQ(rt, "r0", test_false), test_label))
@@ -993,15 +1076,13 @@ class CodeGen:
         # never checked at all and reversibility was silently lost.
         code.append(self._emit(XORI(rt, 1)))
 
-        # Evaluate assertion
-        eval_fi, re2 = self.gen_expr(stmt.fi)
-        code.extend(eval_fi)
-        code[-len(eval_fi)] = LabeledInstr(assert_label, code[-len(eval_fi)].instr) \
-            if eval_fi else code[-1]
-        code.append(self._emit(XOR(rt, re2)))
-        uneval_fi = self._gen_uneval_expr(stmt.fi, re2)
-        code.extend(uneval_fi)
-        code.extend(self._clear_garbage())
+        # Evaluate assertion.  The else path joins at assert_label, the first
+        # instruction after the XORI.  When e2 needs no code (`fi 0`) that is
+        # the XOR itself; the label used to be dropped there, leaving
+        # `BRA if_assert` dangling.
+        assert_code = self._gen_flag_xor(rt, _as_flag(stmt.fi))
+        assert_code[0] = LabeledInstr(assert_label, assert_code[0].instr)
+        code.extend(assert_code)
 
         code.append(self._emit(BRA(end_label), assert_true))
 
@@ -1021,8 +1102,11 @@ class CodeGen:
         # exits via pc = end_label + 1.  Both paths leave rt = flag XOR eval(e2),
         # which is 0 for a correct program — so rt needs no clearing, and any
         # nonzero value left here is a genuine assertion violation rather than
-        # something to be wiped.
+        # something to be wiped.  It is reported at once: rt goes back to the
+        # free pool, and the next statement that XORs a value into it (every
+        # allocation assumes a zero register) could cancel the 1 and hide it.
         code.append(self._emit(BRA(assert_true), end_label))  # Pendulum pair second
+        code.append(self._emit(BNE(rt, "r0", ASSERT_FAIL_LABEL)))
         self.reg.free_reg(rt)
 
         return code
@@ -1032,38 +1116,47 @@ class CodeGen:
 
         from e1 do S1 loop S2 until e2
 
-        entry:  <assert e1>          ; entry assertion
-                <S1 (do body)>
-        test:   <test e2>            ; exit test
+                <rt ^= e1>           ; entry assertion: e1 must hold
+                XORI rt 1
+                BNE rt r0 finish     ; violated -> halt with rt = 1
+        do:     <S1 (do body)>
+        test:   <rt ^= e2>           ; exit test
                 BEQ rt r0 loop_body
                 XORI rt 1
                 BRA exit
         loop_body:
                 XORI rt 1
                 <S2 (loop body)>
-                <assert NOT e1>      ; re-entry assertion
-                BRA entry_do
+                <rt ^= e1>           ; re-entry assertion: e1 must NOT hold
+                XORI rt 1
+                BNE rt r0 finish     ; violated -> halt with rt = 1
+                BRA do
         exit:   ...
+
+        rt is 0 at `do` and at `exit`.  e1 and e2 are normalised to 0/1 by
+        _as_flag, so every flag update is an XOR with a known bit and rt is
+        restored by XORI instead of being wiped (`XOR rt rt`, which discarded
+        the assertion and is not reversible).  A violated assertion cannot be
+        left in rt as `_gen_if` does, because rt steers the loop test: a stale
+        1 at `test` would flip the exit decision and could clear itself.  So
+        the violation jumps to `finish`, where the interpreter reports the
+        nonzero rt as garbage.  A correct program never takes these branches.
         """
         test_label = self.fresh_label("from_test")
         loop_body = self.fresh_label("from_loop")
         exit_label = self.fresh_label("from_exit")
         entry_do = self.fresh_label("from_do")
+        from_ = _as_flag(stmt.from_)
+        until = _as_flag(stmt.until)
 
         code = []
         rt = self.reg.alloc()
         self.reg.commit_reg(rt)
 
         # --- Entry assertion (e1 must be true) ---
-        # Assert e1
-        eval_entry, re = self.gen_expr(stmt.from_)
-        code.extend(eval_entry)
-        code.append(self._emit(XOR(rt, re)))
-        uneval_entry = self._gen_uneval_expr(stmt.from_, re)
-        code.extend(uneval_entry)
-        code.extend(self._clear_garbage())
-        # rt should be nonzero (assertion holds)
-        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
+        code.extend(self._gen_flag_xor(rt, from_))
+        code.append(self._emit(XORI(rt, 1)))
+        code.append(self._emit(BNE(rt, "r0", ASSERT_FAIL_LABEL)))
 
         # entry_do label: start of do body
         code_do = self.gen_stmt(stmt.do_)
@@ -1075,20 +1168,13 @@ class CodeGen:
         code.extend(code_do)
 
         # --- Test e2 (exit condition) ---
-        eval_exit, re2 = self.gen_expr(stmt.until)
-        test_code = list(eval_exit)
-        test_code.append(self._emit(XOR(rt, re2)))
-        uneval_exit = self._gen_uneval_expr(stmt.until, re2)
-        test_code.extend(uneval_exit)
-        test_code.extend(self._clear_garbage())
-
-        if test_code:
-            test_code[0] = LabeledInstr(test_label, test_code[0].instr)
+        test_code = self._gen_flag_xor(rt, until)
+        test_code[0] = LabeledInstr(test_label, test_code[0].instr)
         code.extend(test_code)
 
         # Branch on result
         code.append(self._emit(BEQ(rt, "r0", loop_body)))
-        code.append(self._emit(XOR(rt, rt)))   # clear rt (safe for non-boolean)
+        code.append(self._emit(XORI(rt, 1)))   # rt was 1 (e2 true)
         code.append(self._emit(BRA(exit_label)))
 
         # --- Loop body ---
@@ -1097,16 +1183,10 @@ class CodeGen:
         body_code = self.gen_stmt(stmt.loop_)
         loop_code.extend(body_code)
 
-        # Assert NOT e1 (re-entry: e1 must be false)
-        eval_reentry, re3 = self.gen_expr(stmt.from_)
-        loop_code.extend(eval_reentry)
-        loop_code.append(self._emit(XOR(rt, re3)))
-        uneval_reentry = self._gen_uneval_expr(stmt.from_, re3)
-        loop_code.extend(uneval_reentry)
-        loop_code.extend(self._clear_garbage())
-        # rt = 1 ^ eval(e1). Since e1 is false on re-entry, eval(e1)=0 → rt=1.
-        # Flip rt back to 0 so the invariant rt=0 at from_test is maintained.
-        loop_code.append(self._emit(XOR(rt, rt)))  # clear rt (safe for non-boolean)
+        # Re-entry assertion: rt = 1 ^ e1, which is 1 exactly when e1 is false.
+        loop_code.extend(self._gen_flag_xor(rt, from_))
+        loop_code.append(self._emit(XORI(rt, 1)))
+        loop_code.append(self._emit(BNE(rt, "r0", ASSERT_FAIL_LABEL)))
 
         loop_code.append(self._emit(BRA(entry_do)))
         code.extend(loop_code)
@@ -1116,6 +1196,19 @@ class CodeGen:
         # Add exit label
         code.append(self._emit(ADDI("r0", 0), exit_label))  # NOP with label
 
+        return code
+
+    def _gen_flag_xor(self, rt: str, e: Expr) -> List[LabeledInstr]:
+        """rt ^= e for a 0/1 expression e, leaving no other register dirty.
+
+        Always returns at least one instruction (the XOR), so the caller can
+        label its first element.
+        """
+        eval_code, re = self.gen_expr(e)
+        code = list(eval_code)
+        code.append(self._emit(XOR(rt, re)))
+        code.extend(self._gen_uneval_expr(e, re))
+        code.extend(self._clear_garbage())
         return code
 
     # --- Procedure code generation (Fig. 5) ---
@@ -1216,6 +1309,14 @@ class CodeGen:
                 # Size limit prevents code growth when the body is large enough
                 # that emitting it twice costs more than the call overhead.
                 self._inline_procs[name] = (proc, True)
+
+        # A procedure's name is its entry label, so it must not be one of the
+        # program labels: `finish` in particular is where a violated `fi` or
+        # loop assertion jumps (ASSERT_FAIL_LABEL).
+        for proc in prog.procs:
+            if proc.name in ("start", ASSERT_FAIL_LABEL):
+                raise CodeGenError(
+                    f"procedure name `{proc.name}` is reserved (program label)")
 
         # 3. Procedure code (skip dead and inlined procedures)
         for proc in prog.procs:

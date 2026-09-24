@@ -1,3 +1,4 @@
+open Datatypes
 open NatDef
 open PosDef
 
@@ -16,6 +17,10 @@ module Z :
   val opp : int -> int
 
   val sub : int -> int -> int
+
+  val compare : int -> int -> comparison
+
+  val ltb : int -> int -> bool
 
   val eqb : int -> int -> bool
 

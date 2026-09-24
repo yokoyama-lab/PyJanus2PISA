@@ -87,8 +87,9 @@ Qed.
 
 (** ** Instructions
 
-    The straight-line fragment of PISA: the arithmetic/logic updates and the
-    memory exchange.  Control flow (BRA/RBRA/BEQ/…) is deliberately absent —
+    The straight-line fragment of PISA: the arithmetic/logic updates, the
+    memory exchange, and [SLTX] (which `codegen.py` uses to normalise a
+    non-Boolean `if`/`from` test to [e != 0]; see CompileIf.v).  Control flow (BRA/RBRA/BEQ/…) is deliberately absent —
     see MANIFEST.md for the milestone structure. *)
 
 Inductive instr : Type :=
@@ -99,7 +100,8 @@ Inductive instr : Type :=
 | ISubi (rd : reg) (c : Z)
 | IXori (rd : reg) (c : Z)
 | INeg  (rd : reg)
-| IExch (rd ra : reg).   (** swap register [rd] with the memory cell addressed by [ra] *)
+| IExch (rd ra : reg)    (** swap register [rd] with the memory cell addressed by [ra] *)
+| ISltx (rd rs rt : reg). (** [rd ^= (rs < rt)], used by the [e != 0] normalisation *)
 
 Definition code := list instr.
 
@@ -119,6 +121,9 @@ Definition step (i : instr) (s : state) : state :=
   | IExch rd ra =>
       let a := regs s ra in
       mkState (rupd rd (mem s a) (regs s)) (mupd a (regs s rd) (mem s))
+  | ISltx rd rs rt =>
+      mkState (rupd rd (Z.lxor (regs s rd) (if regs s rs <? regs s rt then 1 else 0))
+                    (regs s)) (mem s)
   end.
 
 Definition run (c : code) (s : state) : state := fold_left (fun st i => step i st) c s.
@@ -147,6 +152,7 @@ Definition invert_instr (i : instr) : instr :=
   | IXori rd c  => IXori rd c       (* self-inverse *)
   | INeg  rd    => INeg  rd         (* self-inverse *)
   | IExch rd ra => IExch rd ra      (* self-inverse *)
+  | ISltx rd rs rt => ISltx rd rs rt  (* self-inverse *)
   end.
 
 Definition invert_code (c : code) : code := rev (map invert_instr c).
@@ -159,6 +165,7 @@ Definition wf_instr (i : instr) : Prop :=
   match i with
   | IAdd  rd rs | ISub rd rs | IXor rd rs | IExch rd rs => rd <> rs
   | IAddi _ _ | ISubi _ _ | IXori _ _ | INeg _ => True
+  | ISltx rd rs rt => rd <> rs /\ rd <> rt
   end.
 
 Definition wf_code (c : code) : Prop := Forall wf_instr c.
@@ -190,6 +197,10 @@ Proof.
   - (* IExch *) rewrite rupd_other by (now apply not_eq_sym).
     rewrite mupd_same, rupd_same, rupd_shadow, mupd_shadow.
     now rewrite rupd_id, mupd_id.
+  - (* ISltx *) destruct Hwf as [H1 H2].
+    rewrite rupd_same, (rupd_other rd rs), (rupd_other rd rt)
+      by (now apply not_eq_sym).
+    rewrite rupd_shadow, xor_involutive. now rewrite rupd_id.
 Qed.
 
 Lemma wf_code_app : forall c1 c2, wf_code c1 -> wf_code c2 -> wf_code (c1 ++ c2).

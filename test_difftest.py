@@ -129,6 +129,17 @@ def test_pal2pisa_label_immediates_and_trailing_data():
 
 # --- the harness against phpisa ---------------------------------------------------
 
+def test_compare_reports_assertion_violation_not_register_mismatch():
+    """A violated fi/from assertion halts at FINISH before the epilogues run,
+    so r1 etc. are not comparable; the harness must say what happened."""
+    pisa = dt.PisaResult(True, None, [0, 5] + [0] * 30, {0: 1}, 0, ["r3=1"], 10)
+    php = dt.PhpResult(True, True, None, [0, 176] + [0] * 30, {0: 1}, 0, 0, 1, [], "")
+    status, _ = dt.compare(pisa, php, 1, None, None)
+    assert status.startswith("ERROR(pisa_interp: assertion violated"), status
+    clean = dt.PisaResult(True, None, [0, 176] + [0] * 30, {0: 1}, 0, [], 10)
+    assert dt.compare(clean, php, 1, None, None)[0] == "OK"
+
+
 @needs_php
 @pytest.mark.parametrize("name", ["call-array", "if-thenelse", "s5-nested-loops", "s6-uncall", "s8-compare-negative"])
 def test_harness_agrees_in_pendulum_cf_mode(name):
