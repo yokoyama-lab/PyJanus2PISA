@@ -23,6 +23,12 @@
    end:     BRA true                / partner of `true`
 >>
 
+    `codegen.py` has since grown two things this model does not have:
+    tests and assertions that are not 0/1 are compiled as `e != 0`, and
+    `BNE rt r0 finish` follows `end:` so that a violated assertion halts.
+    On the fragment proved here [rt] is 0 after `end:` and that branch is a
+    fall-through, but the instruction is not part of [compile_c].
+
     Two facts about this layout drive the proof:
 
     - The flag register [rt] is allocated *before* the bodies (it is the

@@ -1168,10 +1168,15 @@ class TestCodeGenStatements(unittest.TestCase):
         )
         code = cg.gen_stmt(stmt)
         types = self._itypes(code)
-        # BEQ is the entry test.  There is no BNE: the exit assertion used to be
-        # skipped by one, which meant it was never checked (see TestIfAssertion).
+        # BEQ is the entry test.  The only BNE is the violation check after the
+        # join, which jumps to `finish`; the exit assertion used to be skipped
+        # by a BNE, which meant it was never checked (see TestIfAssertion).
         self.assertIn("BEQ", types)
-        self.assertNotIn("BNE", types)
+        bnes = [li for li in code if type(li.instr).__name__ == "BNE"]
+        self.assertEqual(len(bnes), 1)
+        self.assertEqual(bnes[0].instr.label, "finish")
+        self.assertTrue(code[-2].label.startswith("if_end"))
+        self.assertIs(code[-1], bnes[0])
 
     def test_from_generates_bra_and_beq(self):
         cg = self._cg(['x'])
@@ -1185,6 +1190,20 @@ class TestCodeGenStatements(unittest.TestCase):
         types = self._itypes(code)
         self.assertIn("BRA", types)
         self.assertIn("BEQ", types)
+
+    def test_from_flag_is_restored_not_wiped(self):
+        """The loop flag is restored with XORI and never wiped with `XOR rt rt`
+        (which discarded the assertions and is not reversible); both
+        assertions branch to `finish` when violated."""
+        cg = self._cg(['x'])
+        stmt = From(BinOp('=', Var('x'), Const(0)), AssignVar('x', '+=', Const(1)),
+                    Skip(), BinOp('=', Var('x'), Const(5)))
+        code = cg.gen_stmt(stmt)
+        rt = next(li.instr.rd for li in code if type(li.instr).__name__ == "BEQ")  # loop test
+        self.assertFalse([li for li in code if type(li.instr).__name__ == "XOR"
+                          and li.instr.rd == rt and li.instr.rs == rt])
+        bnes = [li.instr for li in code if type(li.instr).__name__ == "BNE"]
+        self.assertEqual([(b.rd, b.label) for b in bnes], [(rt, "finish")] * 2)
 
     def test_proc_entry_has_subi_r1(self):
         """gen_proc: second instruction is SUBI r1 1."""

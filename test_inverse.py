@@ -142,23 +142,22 @@ class TestInvertStmt(unittest.TestCase):
         self.assertEqual(inv.then_.op, '-=')
         self.assertIsInstance(inv.else_, Skip)
 
-    def test_from_swaps_from_until_and_do_loop(self):
+    def test_from_swaps_from_until_keeps_do_loop(self):
         # from e1 do s1 loop s2 until e2
-        # →  from e2 do s2⁻¹ loop s1⁻¹ until e1
+        # →  from e2 do s1⁻¹ loop s2⁻¹ until e1
         e1 = Const(0)
         e2 = Const(5)
         s1 = AssignVar('x', '+=', Const(1))
-        s2 = Skip()
+        s2 = AssignVar('y', '+=', Const(2))
         s = From(from_=e1, do_=s1, loop_=s2, until=e2)
         inv = invert_stmt(s)
         self.assertIsInstance(inv, From)
         self.assertEqual(inv.from_, e2)
         self.assertEqual(inv.until, e1)
-        # do = s2⁻¹ = Skip⁻¹ = Skip
-        self.assertIsInstance(inv.do_, Skip)
-        # loop = s1⁻¹ = (x += 1)⁻¹ = (x -= 1)
-        self.assertIsInstance(inv.loop_, AssignVar)
-        self.assertEqual(inv.loop_.op, '-=')
+        # do = s1⁻¹ = (x += 1)⁻¹ = (x -= 1)
+        self.assertEqual((inv.do_.var, inv.do_.op), ('x', '-='))
+        # loop = s2⁻¹ = (y += 2)⁻¹ = (y -= 2)
+        self.assertEqual((inv.loop_.var, inv.loop_.op), ('y', '-='))
 
     def test_seq_reversal(self):
         stmts = [
@@ -220,6 +219,28 @@ class TestRoundTrip(unittest.TestCase):
     def test_if_constant_zero_assertion(self):
         """`fi 0` on the forward run, `if 0` on the inverse run."""
         self._check_zero("int x\nprocedure main\n  if 0 then x += 10 else x += 20 fi 0")
+
+    def test_loop_with_both_bodies(self):
+        """do and loop both non-skip: the inverse used to swap them."""
+        self._check_zero("""int c
+int x
+procedure main
+  from c = 0 do c += 1 loop x += 2 until c = 3
+  c -= 3""")
+
+    def test_loop_uncall_round_trip(self):
+        """call; uncall of a loop procedure restores x (it used to give 6)."""
+        from test_pisa_interp import compile_and_run
+        m = compile_and_run("""int x
+int c
+procedure body
+  from c = 0 do c += 1 loop x -= 2 until c = 1
+  c -= 1
+procedure main
+  x += 2
+  call body
+  uncall body""")
+        self.assertEqual(m.get_var(0), 2)
 
     def test_two_variables(self):
         """x += 3; y += 7; round trip."""
