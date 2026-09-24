@@ -152,6 +152,46 @@ procedure main
         self.assertEqual(m.get_var(0), 5)
         self.assertEqual(m.get_var(1), 3)
 
+    def test_if_nonboolean_predicates(self):
+        """Janus truth is `nonzero`: `if 5 ... fi 7` is valid and takes then.
+
+        The path flag used to be XOR-ed with the raw values, leaving 5^7=2
+        in a register (reported as garbage at FINISH).
+        """
+        src = """int x
+procedure main
+  if 5 then x += 1 else x += 2 fi 7"""
+        m = compile_and_run(src)
+        self.assertEqual(m.get_var(0), 1)
+
+    def test_if_nonboolean_variable_test(self):
+        """`if y then ... fi x` with y = 3 (then) and y = 0 (else)."""
+        for y0, expected in ((3, 10), (0, 20)):
+            src = f"""int x
+int y
+procedure main
+  y += {y0}
+  if y then x += 10 else x += 20 fi x - 20"""
+            m = compile_and_run(src)
+            self.assertEqual(m.get_var(0), expected, f"y0={y0}")
+
+    def test_if_nonboolean_violation_still_detected(self):
+        """then path with a false (zero) exit assertion is still rejected."""
+        src = """int x
+procedure main
+  if 5 then x += 1 else x += 2 fi x - 1"""
+        with self.assertRaises(PISAError):
+            compile_and_run(src)
+
+    def test_if_constant_zero_assertion(self):
+        """`fi 0` compiles to no evaluation code; the else path must still
+        find the join label (it used to jump to an undefined `if_assert`)."""
+        src = """int x
+procedure main
+  if 0 then x += 10 else x += 20 fi 0"""
+        m = compile_and_run(src)
+        self.assertEqual(m.get_var(0), 20)
+
 
 class TestFrom(unittest.TestCase):
     """From-do-loop-until loop."""
