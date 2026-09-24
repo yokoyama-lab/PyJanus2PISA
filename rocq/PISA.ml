@@ -27,6 +27,7 @@ type instr =
 | IXori of reg * int
 | INeg of reg
 | IExch of reg * reg
+| ISltx of reg * reg * reg
 
 type code = instr list
 
@@ -51,6 +52,13 @@ let step i s =
   | IExch (rd, ra) ->
     let a = s.regs ra in
     { regs = (rupd rd (s.mem a) s.regs); mem = (mupd a (s.regs rd) s.mem) }
+  | ISltx (rd, rs, rt) ->
+    { regs =
+      (rupd rd
+        (Z.coq_lxor (s.regs rd)
+          (if Z.ltb (s.regs rs) (s.regs rt) then 1 else 0))
+        s.regs);
+      mem = s.mem }
 
 (** val run : code -> state -> state **)
 

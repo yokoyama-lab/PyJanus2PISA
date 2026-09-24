@@ -1,3 +1,4 @@
+open Datatypes
 
 module Pos :
  sig
@@ -10,6 +11,10 @@ module Pos :
   val pred_double : int -> int
 
   val pred_N : int -> int
+
+  val compare_cont : comparison -> int -> int -> comparison
+
+  val compare : int -> int -> comparison
 
   val eqb : int -> int -> bool
 

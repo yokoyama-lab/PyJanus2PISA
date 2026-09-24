@@ -22,6 +22,7 @@ let instr_to_string (i : PISA.instr) : string =
   | PISA.IXori (rd, c)  -> Printf.sprintf "XORI %d %d" rd c
   | PISA.INeg  rd       -> Printf.sprintf "NEG %d"     rd
   | PISA.IExch (rd, ra) -> Printf.sprintf "EXCH %d %d" rd ra
+  | PISA.ISltx (rd, rs, rt) -> Printf.sprintf "SLTX %d %d %d" rd rs rt
 
 (* Programs are given together with the Janus source text that
    tools/rocq_diff.py feeds to codegen.py, so the two sides cannot drift. *)

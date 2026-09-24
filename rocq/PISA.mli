@@ -21,6 +21,7 @@ type instr =
 | IXori of reg * int
 | INeg of reg
 | IExch of reg * reg
+| ISltx of reg * reg * reg
 
 type code = instr list
 
