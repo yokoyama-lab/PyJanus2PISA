@@ -7,6 +7,7 @@ Opt.v
 LOpt.v
 PISACtl.v
 CompileIf.v
+CompileLoop.v
 Test.v
 RevSMod.v
 PISAFixed.v

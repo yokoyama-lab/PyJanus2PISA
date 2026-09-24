@@ -4,10 +4,12 @@ Rocq Prover 9.1.1. Build with `make` (regenerate with `rocq makefile -f _CoqProj
 No `Admitted`, no `admit`, no local `Axiom`.
 
 This directory answers the question "is the translation this repository implements
-actually correct?" for the **straight-line fragment** of Janus plus **`if`**
-(PISACtl.v / CompileIf.v: a PC-based machine with the Pendulum paired-branch
-mechanism, and the `_gen_if` layout proved correct on it — see "Control flow"
-below). It is the PISA counterpart of the "whole-translator semantic
+actually correct?" for the **straight-line fragment** of Janus plus **`if`** and
+**`from/loop/until`** (PISACtl.v / CompileIf.v / CompileLoop.v: a PC-based machine
+with the Pendulum paired-branch mechanism, and the `_gen_if` and `_gen_from`
+layouts proved correct on it — see "Control flow" below; `_gen_from` is correct
+on every execution Janus admits, but it does not check its assertions — see
+"Loops"). It is the PISA counterpart of the "whole-translator semantic
 preservation" that `RevLowering.v` in the PyJanus development explicitly leaves
 open.
 
@@ -22,6 +24,7 @@ open.
 | LOpt.v | first labeled-code model (direct branches); `remove_unused_labels`, label forwarding |
 | PISACtl.v | **control-flow machine**: labeled program, pc, `br`, paired branches, `cstep`/`steps`/`exec_fuel` |
 | CompileIf.v | **`If`**: base-parametrised body compiler, `exec_c`, `compile_c`, `compile_c_spec` |
+| CompileLoop.v | **`from/loop/until`**: `lstmt` (subsumes `cstmt`), `exec_l`/`lp_l`, `compile_l` = `_gen_from`'s layout, `compile_lg_spec`, the assertion-discarding counterexamples |
 | Test.v | executable checks and `Print Assumptions` |
 | Extract.v | OCaml extraction of the straight-line compiler (driven by `driver.ml`) |
 
@@ -46,6 +49,14 @@ open.
 | `compile_c_labels` | CompileIf.v | every label the compiler emits lies in `[n, n')` (freshness) |
 | **`compile_c_spec`** | CompileIf.v | **semantic preservation + cleanliness for `If`** on the paired-branch machine, for a fragment embedded anywhere — see "Control flow" |
 | `compile_c_program` | CompileIf.v | closed corollary: the fuel executor halts at the end with the right memory and the same registers |
+| `exec_l_rev` | CompileLoop.v | the source with `If` and loops is reversible (the `Janus.exec_rev` proof, via `opn_l`) |
+| `steps_relabel` | CompileLoop.v | putting a fresh label on an unlabeled data line preserves every run (axiom-free) |
+| `compile_lg_labels`, `compile_lg_head` | CompileLoop.v | labels lie in `[n, n')`; compiled code is empty or starts with an unlabeled data line |
+| **`compile_lg_spec`** | CompileLoop.v | **semantic preservation + cleanliness for loops** (and `If`), for every flag-clearing instruction `clr` with `clr_ok` — see "Loops" |
+| `compile_l_spec`, `compile_l_program` | CompileLoop.v | the instance `clr = XOR rt rt`, i.e. exactly `_gen_from`; closed fuel-executor corollary |
+| `compile_xori_spec` | CompileLoop.v | the instance `clr = XORI rt 1` (all emitted data instructions well-formed) |
+| `compile_l_lift` | CompileLoop.v | on `If`-only programs `compile_l` *is* `compile_c` |
+| `entry_violation_no_exec`, `reentry_violation_no_exec` | CompileLoop.v | two loops Janus rejects have no execution in `exec_l`; `ex_*_violation_accepted` show `_gen_from`'s code runs them to the end, clean |
 
 ### The main theorem
 
@@ -180,7 +191,7 @@ Restrictions, all deliberate:
 - **`b <> 0` and `regs ms 0 = 0`** stand for the hard-wired zero register the
   entry test `BEQ rt r0` compares against.
 - **Bodies** are straight-line statements or nested `If`s (`wf_cstmt` is
-  `wf_stmt` on the leaves). No `Loop` yet — see below.
+  `wf_stmt` on the leaves). Loops are in CompileLoop.v — see "Loops" below.
 
 `Print Assumptions` (recorded at build time at the end of CompileIf.v):
 
@@ -191,21 +202,127 @@ exec_c_rev         : functional_extensionality_dep   (via Src.exec_rev)
 compile_at_scratch : Closed under the global context
 ```
 
+### Loops: `from e1 do S1 loop S2 until e2` (CompileLoop.v)
+
+**Source.** `lstmt = LBase | LSeq | LIf | LLoop e1 a c e2`, with `exec_l` / `lp_l`
+mutually inductive and shaped exactly like `Janus.v`'s `E_Loop` / `L_one` /
+`L_more`, under the same Boolean restriction as `If`:
+
+```coq
+| EL_Loop : eval σ e1 = 1 -> lp_l e1 a c e2 σ σ' -> exec_l (LLoop e1 a c e2) σ σ'
+| LP_One  : exec_l a σ σ' -> eval σ' e2 = 1 -> lp_l e1 a c e2 σ σ'
+| LP_More : exec_l a σ σ1 -> eval σ1 e2 = 0 -> exec_l c σ1 σ2 -> eval σ2 e1 = 0 ->
+            lp_l e1 a c e2 σ2 σ' -> lp_l e1 a c e2 σ σ'
+```
+
+`lift : cstmt -> lstmt` embeds the `If` language (`exec_c_lift`), and
+`compile_l_lift` shows the compiler is unchanged on it, so nothing of
+CompileIf.v is lost; its `If` layout lemmas are reused verbatim.
+
+**Layout.** `loop_code` is `_gen_from` line for line (labels `from_test` = n,
+`from_loop` = n+1, `from_exit` = n+2, `from_do` = n+3 in its allocation order,
+bodies at base `S b` with labels from n+4):
+
+```
+          <rt ^= e1>  ; XOR rt rt
+do:       <S1>                 (label on S1's first line; a labeled ADDI r0 0 if S1 is empty)
+test:     <rt ^= e2>  ; BEQ rt r0 loop ; XOR rt rt ; BRA exit
+loop:     XORI rt 1 ; <S2> ; <rt ^= e1> ; XOR rt rt ; BRA do
+exit:     ADDI r0 0
+```
+
+No branch here is paired, so only direct jumps are exercised. `_gen_from`
+*overwrites* the label of S1's first line; `compile_lg_head` shows that line
+never carries one, and `steps_relabel` transfers S1's run across the added
+label.
+
+**Theorem.** The compiler is parametrised by the flag-clearing instruction:
+
+```coq
+Definition clr_ok (clr : reg -> instr) : Prop :=
+  forall r R M, R r = 1 -> step (clr r) (mkState R M) = mkState (rupd r 0 R) M.
+
+Theorem compile_lg_spec : forall clr, clr_ok clr ->
+  forall st σ σ', exec_l st σ σ' ->
+  forall b n p n' ms pre post,
+  wf_lstmt st -> compile_lg clr st b n = (p, n') -> b <> 0%nat ->
+  models ms σ -> clean_above b ms -> regs ms 0%nat = 0 ->
+  (forall l, In l (labels pre)  -> ~ (n <= l < n')%nat) ->
+  (forall l, In l (labels post) -> ~ (n <= l < n')%nat) ->
+  exists ms',
+    steps (pre ++ p ++ post) (mkC (length pre) 0 ms) (mkC (length pre + length p) 0 ms')
+    /\ models ms' σ' /\ regs ms' = regs ms.
+```
+
+`compile_l_spec` is the instance `clr_codegen = XOR rt rt` (what `codegen.py`
+emits); `compile_xori_spec` the instance `XORI rt 1`. The proof is a mutual
+induction on `exec_l`/`lp_l` (`exec_l_mut`); the invariant at `do` is
+"`br = 0`, the same register file (so `rt = 0`), memory representing the current
+store", and each round is `do_steps` (S1) · `iter_steps` (test fails, `rt := 1`)
+· `s2_steps` · `back_steps` (re-entry assertion, clear, `BRA do`), the last round
+`do_steps` · `exit_steps`.
+
+**Defect in `_gen_from` (machine-checked).** The three `XOR rt rt` clears zero
+the flag whatever it holds, so the entry assertion (`e1` true on entry) and the
+re-entry assertion (`e1` false after S2) are computed and then *discarded*.
+This does not affect `compile_l_spec` — which only speaks about executions the
+source admits — but the compiled code also runs, to completion and clean,
+programs Janus rejects:
+
+| program | Janus (PyJanus) | `exec_l` | `_gen_from` code (model and `pisa_interp.py`) |
+|---|---|---|---|
+| `x2 += 1; from x0 do c += 1 loop x1<=>x2 x0<=>x1 until x2` (`prog_v1`) | "Assertion failed: should be true" | no execution (`entry_violation_no_exec`) | ends, `br = 0`, registers 0, `c = 1` (`ex_entry_violation_accepted`) |
+| `x0 += 1; from x0 do c += 1 loop x2 += 1 until x2` (`prog_v2`) | "Assertion failed: should be false" | no execution (`reentry_violation_no_exec`) | ends, `br = 0`, registers 0, `c = 2` (`ex_reentry_violation_accepted`) |
+
+Contrast `_gen_if`, whose violated exit assertion leaves the flag dirty
+(`ex_violation_dirty`). `XOR rt rt` is also not a well-formed reversible
+instruction (`clr_codegen_not_wf`), so the loop body is outside
+`run_invert_code`. Replacing it by `XORI rt 1` fixes well-formedness and makes
+the re-entry violation visible (`ex_xori_reentry_violation_dirty`: `r3 = 2` at
+the end), but **not** the entry violation: the unclear flag is XOR-ed into the
+exit test, control flow changes, and the run still ends clean with a different
+store (`ex_xori_entry_violation_still_clean`). The Python fix needed is
+therefore more than the one-token change: the assertion must be checked without
+feeding its value into the exit test — e.g. check it into a separate register
+that stays allocated (garbage) across the loop, or adopt a layout where the
+assertion is the conditional partner of the back edge (Axelsen 2011, Fig. 12)
+so a violation diverts control instead of being cleared. Both layouts are
+unverified here; `compile_lg_spec`'s proof structure (invariant at `do`) is the
+template for either.
+
+**Cross-check.** `tools/rocq_loop_crosscheck.py` asks Rocq (`vm_compute`) for
+`compile_l`'s code and result on the six programs of CompileLoop.v, runs that
+code on `pisa_interp.py`, compiles the same Janus source with `codegen.py` and
+runs it, and compares the control skeleton (labels, branches, flag updates) of
+`codegen.py`'s unoptimised output with the Rocq layout. 6/6 agree (store,
+registers, `br`, skeleton), including the two violating programs. The skeleton
+comparison was checked to reject a mutated layout. Straight-line pieces differ
+at the instruction level (`codegen.py` emits `ADDI` for constant right-hand
+sides, Compile.v the general expression code), which is why the skeleton, not
+the full listing, is compared.
+
+`Print Assumptions` (at the end of CompileLoop.v):
+
+```
+compile_lg_spec, compile_l_spec, compile_l_program, exec_l_rev : functional_extensionality_dep
+steps_relabel                                                  : Closed under the global context
+```
+
+**Mutation test** (each applied to CompileLoop.v, compiled, restored):
+`XORI rt 1` → `XORI rt 0` at `loop:` and `BRA do` → `BRA test` fail at the layout
+lemmas (`P_D`); compiling S1 at the flag's base `b` instead of `S b`
+(consistently everywhere) fails inside `compile_lg_spec`; requiring `e1 = 1`
+instead of `0` on re-entry fails already in the source reversibility proof
+(`opn_l_to_lp`).
+
 ## Not covered (next milestones)
 
-1. **Control flow** — `If` is DONE (above). **`Loop`** (`from e1 do S1 loop S2
-   until e2`) is next. `_gen_from` in `codegen.py` uses only *direct* branches
-   (`BEQ rt r0 loop_body`, `BRA exit`, `BRA entry_do`; none of them lands on a
-   branch, so none is paired), which PISACtl.v already covers. Two things
-   stand in the way, both on the compiler side: `_gen_from` clears the flag
-   with `XOR rt rt` after each assertion, which (a) *discards* the assertion
-   result instead of checking it — the same weakness `4b068be` fixed for `if`
-   — and (b) is not a well-formed reversible instruction (`wf_instr` rejects
-   `IXor rd rd`), so the emitted loop is not covered by `run_invert_code`.
-   The proof of the fixed layout is an induction on the number of iterations
-   with the invariant `models ms σ_i /\ regs ms = R /\ br = 0` at the loop
-   head, reusing `test_steps`/`assert_steps` as they are, plus a `CLoop`
-   constructor with `EC_Loop` rules mirroring `Janus.v`.
+1. **Control flow** — `If` and **`Loop`** are DONE (above), with the Boolean
+   restriction on tests. For loops the theorem is about `_gen_from`'s exact
+   layout; what remains is its **assertion checking** (the `XOR rt rt` clears
+   discard the entry / re-entry assertions — machine-checked counterexamples in
+   "Loops"), which is a fix on the Python side followed by re-running the proof
+   on the new layout.
 2. **Procedures** — `Call` / `Uncall`. The source-side contract is *already*
    machine-checked in `RevProc.v` of the PyJanus development (see below), in the
    more general by-reference-parameter form; what is missing is only that the
@@ -235,12 +352,19 @@ framework there may supply most of milestones 1–2 for free.
 
 ## RESUME — where to pick up
 
-- **`Loop`** (milestone 1, remaining half): first fix `_gen_from`'s `XOR rt rt`
-  clears in `codegen.py` (see "Not covered" 1), then add `CLoop e1 a b e2` to
-  `cstmt`, the layout to `compile_c`, and prove the `CLoop` case of
-  `compile_c_spec` by induction on the iteration count. The layout lemmas in
-  `Section IfLayout` show the pattern (positions as `Let`s, one lemma per line
-  and per label, `paired_*` decided by `paired_bra_bra`/`paired_bra_beq`).
+- **`Loop`** (milestone 1, second half): DONE in CompileLoop.v for the exact
+  `_gen_from` layout (`compile_l_spec`), and for any flag clear with `clr_ok`
+  (`compile_lg_spec`). Next step here is on the Python side: make `_gen_from`
+  *check* its entry / re-entry assertions (see "Loops" for why `XOR rt rt` →
+  `XORI rt 1` alone is insufficient), then change `loop_code` to the new layout
+  and re-run the proof — `Section LoopLayout` has one lemma per line/label and
+  per phase (`entry_steps`, `do_steps`, `exit_steps`, `iter_steps`,
+  `s2_steps`, `back_steps`), so a layout change is local. Also add the new
+  programs to `tools/rocq_loop_crosscheck.py` (it is not in CI: it needs
+  `rocq` and the built `.vo` files).
+- **Procedures** (milestone 2) are the next milestone of this directory; the
+  labeled-fragment theorem (`pre`/`post` quantification) is the interface a
+  procedure body will be proved against.
 - **`r0`**: either keep the `regs ms 0 = 0` premise or give PISACtl.v a
   read-through `rread` that returns 0 for register 0 — cheap, but it should
   wait for the register-width change below so PISA.v is touched once.
@@ -257,7 +381,9 @@ framework there may supply most of milestones 1–2 for free.
 - **Extraction / differential test**: `Extract.v` and `tools/rocq_diff.py`
   cover the straight-line compiler only; extracting `compile_c` and
   `exec_fuel` would let `rocq_diff.py` compare `if` programs too (the manual
-  check above did this once for three programs).
+  check above did this once for three programs). For loops,
+  `tools/rocq_loop_crosscheck.py` does it without extraction (it reads
+  `vm_compute` output), and could absorb the `if` examples as well.
 
 ## Extraction and the tie-back to the Python code
 
@@ -385,8 +511,8 @@ inverter.
 ## Axiom footprint
 
 `functional_extensionality_dep`, and nothing else (`Print Assumptions` in
-`Test.v` and at the end of `CompileIf.v` reports it at build time; PISACtl.v's
-own lemmas are axiom-free). It is used only to promote pointwise equality
+`Test.v` and at the end of `CompileIf.v` and `CompileLoop.v` reports it at build
+time; PISACtl.v's own lemmas and `steps_relabel` are axiom-free). It is used only to promote pointwise equality
 of the register file and memory — both higher-order maps, `reg -> Z` and
 `addr -> Z` — to Leibniz equality. Removing it would require a first-order
 machine state (e.g. a bounded vector of registers). This is the same trade-off
