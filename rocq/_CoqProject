@@ -8,6 +8,10 @@ LOpt.v
 PISACtl.v
 CompileIf.v
 CompileLoop.v
+PISAProc.v
+SrcProc.v
+CompileProc.v
+TestProc.v
 Test.v
 RevSMod.v
 PISAFixed.v
