@@ -181,6 +181,15 @@ PROGRAMS = {
                "  from y = 0 do\n    y += 1\n    call step\n  loop\n"
                "    if y = 1 then\n      x += 1\n    else\n      x -= 1\n    fi y = 1\n"
                "  until y = 3"),
+    # a call/uncall in S2 of a loop (the callee used to see the loop flag = 1)
+    "call-in-loop": ("int i\nint c\nprocedure f\n  c += 5\nprocedure main\n"
+                     "  from i = 0 do i += 1 loop call f until i = 3\n"
+                     "  from i = 3 do i -= 1 loop uncall f until i = 0\n  call f"),
+    "recursion-in-loop": ("int d\nint c\nint xs[4]\nprocedure q\n  c += 1\n"
+                          "  if d < 2 then\n    d += 1\n"
+                          "    from xs[d] = 0 do xs[d] += 1 loop call q until xs[d] = 2\n"
+                          "    xs[d] -= 2\n    d -= 1\n  else\n    skip\n  fi d < 2\n"
+                          "procedure main\n  call q\n  call q"),
 }
 
 # Divergences that are known compiler bugs rather than test-harness problems.

@@ -309,10 +309,11 @@ def pendulum_calls(ir: List[Ins], new_stack_base: int) -> Tuple[List[Ins], Lower
 #   from:  `from_loop: BEQ rt r0 <the BEQ that jumps here>`      (rt = 0 there)
 #          `from_exit: BRA <the BRA that jumps here>`            (paired BRAs)
 #          `from_do:   BNE rt r0 <the BRA from_do>; XOR rt rt`   (rt = 1 from the
-#          loop body, 0 on first entry; the re-entry check `XORI rt 1; BNE rt
-#          r0 finish` that codegen emits just before `BRA from_do` is dropped
-#          so that rt discriminates the paths.  Under Pendulum semantics a
-#          violated re-entry assertion then leaves BR non-zero, as in Axelsen)
+#          loop body, 0 on first entry; the re-entry check `BNE rt r0 finish`
+#          that codegen emits just before `BRA from_do`, where rt = e1, is
+#          replaced by `XORI rt 1` so that rt = 1 xor e1 discriminates the
+#          paths.  Under Pendulum semantics a violated re-entry assertion then
+#          leaves BR non-zero, as in Axelsen)
 #
 # This is an ADAPTER TRANSFORMATION (results marked "pendulum-cf").  The
 # lowered code is phpisa-only: pisa_interp would treat the inserted
@@ -339,6 +340,7 @@ def pendulum_cf(ir: List[Ins]) -> Tuple[List[Ins], CFInfo]:
     retarget: Dict[int, str] = {}              # jumping instruction -> new target label
     newlabel: Dict[int, str] = {}              # give an unlabelled instruction a label
     remove: set = set()
+    replace: Dict[int, Ins] = {}               # instruction -> its replacement
     counter = [0]
 
     def fresh(p: str) -> str:
@@ -386,8 +388,10 @@ def pendulum_cf(ir: List[Ins]) -> Tuple[List[Ins], CFInfo]:
         info.ifs += 1
 
     # ---- from:  A: BEQ rt r0 from_loop_L ; A+1: XORI rt 1 ; A+2: BRA E ;
-    #             L: XORI rt 1 ; ... ; D-2: XORI rt 1 ; D-1: BNE rt r0 finish ;
+    #             L: <S2> ... ; D-1: BNE rt r0 finish ;
     #             D = E-1: BRA J ; E: <exit>
+    #   (rt = 0 while S2 runs; `L:` is a NOP in codegen's unoptimised output,
+    #   whose label remove_nops moves onto S2's first instruction)
     for a, ins in enumerate(ir):
         if not (ins.op == "BEQ" and ins.args[1] == "r0" and ins.args[2].startswith("from_loop_")):
             continue
@@ -395,22 +399,20 @@ def pendulum_cf(ir: List[Ins]) -> Tuple[List[Ins], CFInfo]:
         l = labels[ins.args[2]]
         expect(ir[a + 1].op == "XORI" and ir[a + 1].args == [rt, "1"] and ir[a + 2].op == "BRA",
                f"{ins.args[2]}: expected `XORI rt 1; BRA exit` after the loop test")
-        expect(ir[l].op == "XORI" and ir[l].args == [rt, "1"],
-               f"{ins.args[2]}: loop body does not start with `XORI {rt} 1`")
         e = labels[ir[a + 2].args[0]]
         d = e - 1
         expect(ir[d].op == "BRA" and ir[d].args[0] in labels,
                f"{ins.args[2]}: expected the back-edge `BRA from_do` right before the exit")
-        expect(ir[d - 2].op == "XORI" and ir[d - 2].args == [rt, "1"]
-               and ir[d - 1].op == "BNE" and ir[d - 1].args == [rt, "r0", "finish"],
-               f"{ins.args[2]}: expected `XORI {rt} 1; BNE {rt} r0 finish` right before the back-edge")
+        expect(ir[d - 1].op == "BNE" and ir[d - 1].args == [rt, "r0", "finish"],
+               f"{ins.args[2]}: expected `BNE {rt} r0 finish` right before the back-edge")
         j = labels[ir[d].args[0]]
         alab = label_of(a, "frt")
         land(l, a, "frl", [Ins(None, "BEQ", [rt, "r0", alab], "; pendulum-cf: cancel loop-test jump")])
         blab = label_of(a + 2, "frx")
         land(e, a + 2, "fre", [Ins(None, "BRA", [blab], "; pendulum-cf: pair with the exit BRA")])
         dlab = label_of(d, "frd")
-        remove.update((d - 2, d - 1))
+        replace[d - 1] = Ins(ir[d - 1].label, "XORI", [rt, "1"],
+                             "; pendulum-cf: rt = 1 xor e1 marks the back edge")
         land(j, d, "frj", [Ins(None, "BNE", [rt, "r0", dlab], "; pendulum-cf: cancel back-edge jump"),
                            Ins(None, "XOR", [rt, rt], "; pendulum-cf: clear flag")])
         info.loops += 1
@@ -420,6 +422,8 @@ def pendulum_cf(ir: List[Ins]) -> Tuple[List[Ins], CFInfo]:
         out.extend(inserts.get(i, []))
         if i in remove:
             continue
+        if i in replace:
+            ins = replace[i]
         if i in newlabel:
             ins = ins.clone(label=newlabel[i])
         if i in retarget:
