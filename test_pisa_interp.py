@@ -382,6 +382,79 @@ procedure main
         self.assertEqual(m.get_var(0), 3)
 
 
+class TestLabelNamespace(unittest.TestCase):
+    """Procedure names must not collide with labels the compiler makes up.
+
+    Each procedure is called at least twice so it is not inlined away.
+    Expected values are PyJanus's.
+    """
+
+    def test_user_proc_named_like_companion(self):
+        """`f_inv` is also the companion label of `f` once `uncall f` appears."""
+        src = """int x
+int y
+procedure f
+  x += 1
+procedure f_inv
+  y += 100
+procedure main
+  call f_inv
+  call f_inv
+  call f
+  call f
+  call f
+  uncall f"""
+        m = compile_and_run(src)
+        self.assertEqual((m.get_var(0), m.get_var(1)), (2, 200))
+
+    def test_user_proc_named_like_fresh_label(self):
+        """`if_false_1` is the first label `_gen_if` makes up."""
+        src = """int c
+procedure if_false_1
+  c += 100
+procedure main
+  if c = 0 then c += 1 else skip fi c = 1
+  call if_false_1
+  call if_false_1"""
+        m = compile_and_run(src)
+        self.assertEqual(m.get_var(0), 201)
+
+    def test_underscores_in_several_names(self):
+        """`f_`, `f` and `f__inv`: the escaping must stay injective."""
+        src = """int c
+procedure f_
+  c += 1
+procedure f
+  c += 10
+procedure f__inv
+  c += 1000
+procedure main
+  call f_
+  call f_
+  uncall f_
+  call f
+  call f
+  uncall f
+  call f__inv
+  call f__inv"""
+        m = compile_and_run(src)
+        self.assertEqual(m.get_var(0), 2011)
+
+    def test_proc_labels_are_disjoint_from_generated_ones(self):
+        """Every user-derived label has only even runs of `_`."""
+        import re
+        from codegen import _proc_label, _inv_proc_name
+        names = ["f", "f_", "_f", "f_inv", "f__inv", "g_top", "if_false_1", "a___b"]
+        user = {_proc_label(n) for n in names}
+        generated = ({_proc_label(n) + s for n in names for s in ("_top", "_bot")}
+                     | {_inv_proc_name(n) for n in names}
+                     | {_inv_proc_name(n) + s for n in names for s in ("_top", "_bot")})
+        self.assertEqual(len(user), len(names))
+        self.assertFalse(user & generated)
+        for lab in user:
+            self.assertTrue(all(len(r) % 2 == 0 for r in re.findall(r"_+", lab)), lab)
+
+
 class TestSkip(unittest.TestCase):
     """Skip statement."""
 

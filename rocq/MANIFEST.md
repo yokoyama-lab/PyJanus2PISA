@@ -594,7 +594,11 @@ procedure machine (a violated assertion inside a procedure).
    c = 1 instead of 201), or procedures `g` and `g_top` (c = 2 instead of 202)
    all compile silently to wrong code (`label_map` keeps the last definition).
    The model uses injective numeric labels, which is why `g_finv` in TestProc.v
-   is right there. Suggested fix: reject such names, or mangle generated labels.
+   is right there. **Fixed (2026-09-26):** `codegen.py` derives procedure labels
+   with `_proc_label` (every `_` of the source name doubled; generated suffixes
+   add a single `_`), so user-derived labels and generated ones are disjoint;
+   `g_finv` in `tools/rocq_proc_crosscheck.py` is now an ordinary program and
+   `TestLabelNamespace` in `test_pisa_interp.py` covers the three cases.
 
 ### Cross-check
 
@@ -656,7 +660,7 @@ admitted):
    with the S2 restriction. What remains: inlining (`_inline_procs`), the
    by-reference parameters of `RevProc.v`, `local`/`delocal`, violated
    assertions inside procedures (only valid executions are covered), and the
-   two Python defects found (a call in S2; label collisions).
+   Python defect found (a call in S2; the label collisions are fixed).
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole` and `remove_nops` are DONE for straight-line
    code (Opt.v: `optimize_run`; writing the proof exposed and fixed an unsound

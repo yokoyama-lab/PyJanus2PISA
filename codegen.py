@@ -67,9 +67,24 @@ def _is_nonzero_test(e: BinOp) -> bool:
     return e.op == '!=' and isinstance(e.right, Const) and e.right.value == 0
 
 
+def _proc_label(name: str) -> str:
+    """Entry label of procedure `name`.
+
+    Procedure labels share one namespace with the labels the compiler makes
+    up (`f_top`/`f_bot`, the companion `f_inv`, `if_false_1`, ...), and Janus
+    identifiers may contain `_`, so e.g. a user procedure `f_inv` used to be
+    the same label as the inverted companion of `f`.  Doubling every `_` of
+    the source name makes the map injective and disjoint from generated
+    names: a user-derived label has only even runs of `_`, while every
+    generated suffix (`_top`, `_bot`, `_inv`, `if_false_<n>`, ...) adds a
+    single `_`.  Names without `_` (the common case) are unchanged.
+    """
+    return name.replace("_", "__")
+
+
 def _inv_proc_name(name: str) -> str:
     """Label of the inverted companion of procedure `name`."""
-    return name + "_inv"
+    return _proc_label(name) + "_inv"
 
 
 
@@ -1005,7 +1020,7 @@ class CodeGen:
         if stmt.proc in self._inline_procs:
             proc, _can_uncall = self._inline_procs[stmt.proc]
             return self.gen_stmt(proc.body)
-        return [self._emit(BRA(stmt.proc))]
+        return [self._emit(BRA(_proc_label(stmt.proc)))]
 
     def _gen_uncall(self, stmt: Uncall) -> List[LabeledInstr]:
         """Generate procedure uncall: run f backwards.
@@ -1213,7 +1228,7 @@ class CodeGen:
 
     # --- Procedure code generation (Fig. 5) ---
 
-    def gen_proc(self, proc: ProcDecl) -> List[LabeledInstr]:
+    def gen_proc(self, proc: ProcDecl, label: Optional[str] = None) -> List[LabeledInstr]:
         """Generate code for a procedure definition.
 
         f_top: BRA f_bot
@@ -1226,12 +1241,14 @@ class CodeGen:
                <code for f body>
         f_bot: BRA f_top
         """
-        f_top = f"{proc.name}_top"
-        f_bot = f"{proc.name}_bot"
+        if label is None:
+            label = _proc_label(proc.name)
+        f_top = f"{label}_top"
+        f_bot = f"{label}_bot"
 
         code = [
             self._emit(BRA(f_bot), f_top),
-            self._emit(SUBI("r1", 1), proc.name),
+            self._emit(SUBI("r1", 1), label),
             self._emit(EXCH("r2", "r1")),
             self._emit(SWAPBR("r2")),
             self._emit(NEG("r2")),
@@ -1333,13 +1350,13 @@ class CodeGen:
             inlined = self._inline_procs.get(name)
             if inlined is not None and inlined[1]:
                 continue          # uncall of this one is inlined; no branch target needed
-            inv_proc = ProcDecl(_inv_proc_name(name), invert_stmt(proc_map[name].body))
-            code.extend(self.gen_proc(inv_proc))
+            inv_proc = ProcDecl(name, invert_stmt(proc_map[name].body))
+            code.extend(self.gen_proc(inv_proc, _inv_proc_name(name)))
 
         # 3. Entry/exit
         code.append(self._emit(START(), "start"))
         code.append(self._emit(ADDI("r1", stack_offset)))
-        code.append(self._emit(BRA(prog.main_proc)))
+        code.append(self._emit(BRA(_proc_label(prog.main_proc))))
 
         code.append(self._emit(FINISH(), "finish"))
         code.append(self._emit(SUBI("r1", stack_offset)))
