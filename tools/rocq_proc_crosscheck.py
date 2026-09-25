@@ -16,8 +16,7 @@ For each program of `rocq/TestProc.v` this script
      **`pisa_interp.py`**: store, r1..r8 and `br` must equal the verified
      machine's — this checks the call-stack model against the interpreter;
   3. compiles the Janus source with **`codegen.py`** and runs it: the store
-     must equal the source semantics' (except for the two known defects
-     below);
+     must equal the source semantics' (except for the known defect below);
   4. compares, procedure by procedure (forward and `_inv` companions), the
      prologue instruction for instruction and the control skeleton of the
      body (as in `rocq_loop_crosscheck.py`) of `codegen.py`'s *unoptimised*
@@ -27,8 +26,8 @@ For each program of `rocq/TestProc.v` this script
      and compares with the source semantics — an independent check that
      `exec_p` is Janus's.
 
-Two programs demonstrate defects of `codegen.py` (valid Janus programs it
-miscompiles); they are expected to show the divergence:
+One program demonstrates a defect of `codegen.py` (a valid Janus program it
+miscompiles); it is expected to show the divergence:
 
   * `g_s2`: a call inside the `loop` part (S2) of a `from` loop.  `_gen_from`
     runs S2 with the loop flag register r3 = 1 and the callee's body assumes
@@ -36,10 +35,11 @@ miscompiles); they are expected to show the divergence:
     excludes it (`wf_p`), and `s2_call_counterexample` in TestProc.v proves
     the verified layout wrong on it (c = 17 instead of 15); `codegen.py`
     gives c = 5, d = 10.
-  * `g_finv`: procedures named `f` and `f_inv` with `uncall f`.
-    `codegen.py`'s companion of `f` is the label `f_inv`, the user's
-    procedure: the labels collide.  The verified layout (numeric labels)
-    is right here.
+
+`g_finv` (procedures named `f` and `f_inv` with `uncall f`) used to be the
+second one: the companion of `f` was the label `f_inv`, the user's procedure.
+codegen.py now derives procedure labels with `_proc_label` (every `_`
+doubled), so it is an ordinary program.
 
 Usage:
     make -C rocq                 # the .vo files must exist
@@ -58,7 +58,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lexer import tokenize                      # noqa: E402
 from parser import parse                        # noqa: E402
-from codegen import CodeGen, compile_program    # noqa: E402
+from codegen import CodeGen, compile_program, _proc_label    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
                   BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
@@ -110,7 +110,7 @@ PROGRAMS = {
                "procedure f\n  x0 += 1\n  x0 += 1\n"
                "procedure f_inv\n  x1 += 100\n"
                "procedure main\n  call f\n  call f\n  call f_inv\n  call f_inv\n  uncall f\n",
-               "names"),
+               "ok"),
 }
 
 
@@ -286,43 +286,35 @@ def main() -> int:
                 problems.append("expected codegen.py to fail on a call in S2")
             notes.append(f"KNOWN DEFECT (call in S2): Janus {source}, verified layout "
                          f"{want['mem']}, codegen.py {py_mem}")
-        elif kind == "names":
-            if want["mem"] != source:
-                problems.append(f"verified machine {want['mem']} != source {source}")
-            if py_mem == source:
-                problems.append("expected codegen.py's label collision to show")
-            notes.append(f"KNOWN DEFECT (label f_inv collides): Janus {source}, "
-                         f"verified layout {want['mem']}, codegen.py {py_mem}")
         else:
             if want["mem"] != source:
                 problems.append(f"verified machine {want['mem']} != source {source}")
             if (py_mem, (py_regs or [None] * 8)[2:]) != (source, [0] * 6):
                 problems.append(f"codegen.py: {py_mem} {py_regs} != source {source}")
         # 4. layout: prologue, body skeleton, wrapper
-        if kind != "names":
-            gen = CodeGen().gen_program(parse(tokenize(src)))
-            compared = 0
-            for f, name in enumerate(names):
-                for suffix in ("", "_inv"):
-                    py = proc_parts(gen, name + suffix)
-                    if py is None:
-                        continue            # dead or never uncalled: codegen omits it
-                    rq = proc_parts(code, f"p{f}" + suffix)
-                    if rq is None or rq[0] != py[0]:
-                        problems.append(f"prologue of {name + suffix} differs")
-                        continue
-                    if skeleton(rq[1]) != skeleton(py[1]):
-                        problems.append(f"body of {name + suffix} differs:\n"
-                                        f"  rocq {skeleton(rq[1])}\n  py   {skeleton(py[1])}")
-                    compared += 1
-            s = next(j for j, li in enumerate(gen) if li.label == "start")
-            wrap_py = [type(li.instr).__name__ for li in gen[s:s + 4]]
-            wrap_rq = [type(li.instr).__name__ for li in code[-4:]]
-            if (wrap_py != wrap_rq or code[-3].instr != gen[s + 1].instr
-                    or code[-2].instr.label != f"p{names.index('main')}"
-                    or gen[s + 2].instr.label != "main"):
-                problems.append(f"wrapper differs: {wrap_rq} vs {wrap_py}")
-            notes.append(f"{compared} procedure bodies agree")
+        gen = CodeGen().gen_program(parse(tokenize(src)))
+        compared = 0
+        for f, name in enumerate(names):
+            for suffix in ("", "_inv"):
+                py = proc_parts(gen, _proc_label(name) + suffix)
+                if py is None:
+                    continue            # dead or never uncalled: codegen omits it
+                rq = proc_parts(code, f"p{f}" + suffix)
+                if rq is None or rq[0] != py[0]:
+                    problems.append(f"prologue of {name + suffix} differs")
+                    continue
+                if skeleton(rq[1]) != skeleton(py[1]):
+                    problems.append(f"body of {name + suffix} differs:\n"
+                                    f"  rocq {skeleton(rq[1])}\n  py   {skeleton(py[1])}")
+                compared += 1
+        s = next(j for j, li in enumerate(gen) if li.label == "start")
+        wrap_py = [type(li.instr).__name__ for li in gen[s:s + 4]]
+        wrap_rq = [type(li.instr).__name__ for li in code[-4:]]
+        if (wrap_py != wrap_rq or code[-3].instr != gen[s + 1].instr
+                or code[-2].instr.label != f"p{names.index('main')}"
+                or gen[s + 2].instr.label != "main"):
+            problems.append(f"wrapper differs: {wrap_rq} vs {wrap_py}")
+        notes.append(f"{compared} procedure bodies agree")
         # 5. PyJanus
         pj = pyjanus_store(src)
         if pj is not None:
