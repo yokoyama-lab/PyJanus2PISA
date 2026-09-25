@@ -1178,7 +1178,7 @@ class CodeGen:
         code.append(self._emit(BRA(exit_label)))
 
         # --- Loop body ---
-        loop_code = [self._emit(XORI(rt, 1), loop_body), self._emit(XORI(rt, 1)), self._emit(XORI(rt, 1))]  # CI MUTATION (to be reverted)
+        loop_code = [self._emit(XORI(rt, 1), loop_body)]
 
         body_code = self.gen_stmt(stmt.loop_)
         loop_code.extend(body_code)
