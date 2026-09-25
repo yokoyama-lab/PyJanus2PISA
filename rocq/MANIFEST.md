@@ -662,10 +662,10 @@ procedure that calls; a call heading a loop's S1, so `from_do` labels a
 backwards; a call in an `if` in S1; **a call in S2** (`g_s2`, c = 15);
 **recursion through S2** forwards and backwards (`g_rec_s2`)) agree on every
 count, 25 procedure bodies' skeletons agree, PyJanus agrees on all ten;
-`g_finv` reproduces the label-collision defect (Janus x0, x1 = 2, 200 /
-verified 2, 200 / codegen −2, 0). (Before the fix: 9/9 against main a21787a,
-with `g_s2` expected to fail — verified layout 17, codegen 5 with d = 10.) Not in CI: it needs `rocq` and the built
-`.vo` files.
+`g_finv` is an ordinary program too since the label fix (Janus x0, x1 =
+2, 200; codegen used to give −2, 0). (Before the S2 fix: 9/9 against main
+a21787a, with `g_s2` expected to fail — verified layout 17, codegen 5 with
+d = 10.) Runs in CI (Rocq job) since PR #9.
 
 `Print Assumptions` (end of CompileProc.v / TestProc.v):
 
