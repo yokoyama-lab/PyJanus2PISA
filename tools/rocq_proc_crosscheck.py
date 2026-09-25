@@ -26,20 +26,17 @@ For each program of `rocq/TestProc.v` this script
      and compares with the source semantics — an independent check that
      `exec_p` is Janus's.
 
-One program demonstrates a defect of `codegen.py` (a valid Janus program it
-miscompiles); it is expected to show the divergence:
+`g_s2` (a call in the `loop` part S2 of a `from` loop) and `g_rec_s2`
+(recursion through S2, forwards and backwards) are ordinary programs now:
+`_gen_from` used to run S2 with the loop flag r3 = 1 while the callee's body
+assumes r3 = 0 (verified layout c = 17, codegen.py c = 5 and d = 10, Janus
+c = 15); it runs S2 with the flag at 0 since the fix, and `wf_p` no longer
+excludes calls there (`s2_call_works` in TestProc.v).
 
-  * `g_s2`: a call inside the `loop` part (S2) of a `from` loop.  `_gen_from`
-    runs S2 with the loop flag register r3 = 1 and the callee's body assumes
-    r3 = 0.  The verified compiler inherits the layout, so `compile_p_spec`
-    excludes it (`wf_p`), and `s2_call_counterexample` in TestProc.v proves
-    the verified layout wrong on it (c = 17 instead of 15); `codegen.py`
-    gives c = 5, d = 10.
-
-`g_finv` (procedures named `f` and `f_inv` with `uncall f`) used to be the
-second one: the companion of `f` was the label `f_inv`, the user's procedure.
-codegen.py now derives procedure labels with `_proc_label` (every `_`
-doubled), so it is an ordinary program.
+`g_finv` (procedures named `f` and `f_inv` with `uncall f`) is an ordinary
+program too: the companion of `f` used to be the label `f_inv`, the user's
+procedure.  codegen.py now derives procedure labels with `_proc_label`
+(every `_` doubled).  No program is expected to diverge any more.
 
 Usage:
     make -C rocq                 # the .vo files must exist
@@ -105,7 +102,12 @@ PROGRAMS = {
     "g_s2": (["f", "main"], 1,
              "procedure f\n  c += 5\n"
              "procedure main\n  x0 += 1\n"
-             f"  from x0 do skip loop call f\n  {ROT} until x2\n  call f\n", "s2"),
+             f"  from x0 do skip loop call f\n  {ROT} until x2\n  call f\n", "ok"),
+    "g_rec_s2": (["h", "main"], 1,
+                 "procedure h\n  d += 1\n  if y0 then\n    y0 -= 1\n    y1 += 1\n"
+                 "    from y1 do skip loop\n      y1 -= 1\n      call h\n      x1 += 1\n"
+                 "    until x1\n    x1 -= 1\n    y0 += 1\n  else skip fi y0\n"
+                 "procedure main\n  y0 += 2\n  call h\n  uncall h\n  call h\n", "ok"),
     "g_finv": (["f", "f_inv", "main"], 2,
                "procedure f\n  x0 += 1\n  x0 += 1\n"
                "procedure f_inv\n  x1 += 100\n"
@@ -279,18 +281,10 @@ def main() -> int:
                             f" != verified machine {want['mem']} {want['regs']}")
         # 3. codegen.py + pisa_interp.py
         py_mem, py_regs, _ = run_machine(compile_program(parse(tokenize(src))))
-        if kind == "s2":
-            if want["mem"] == source:
-                problems.append("expected the verified layout to fail on a call in S2")
-            if py_mem == source:
-                problems.append("expected codegen.py to fail on a call in S2")
-            notes.append(f"KNOWN DEFECT (call in S2): Janus {source}, verified layout "
-                         f"{want['mem']}, codegen.py {py_mem}")
-        else:
-            if want["mem"] != source:
-                problems.append(f"verified machine {want['mem']} != source {source}")
-            if (py_mem, (py_regs or [None] * 8)[2:]) != (source, [0] * 6):
-                problems.append(f"codegen.py: {py_mem} {py_regs} != source {source}")
+        if want["mem"] != source:
+            problems.append(f"verified machine {want['mem']} != source {source}")
+        if (py_mem, (py_regs or [None] * 8)[2:]) != (source, [0] * 6):
+            problems.append(f"codegen.py: {py_mem} {py_regs} != source {source}")
         # 4. layout: prologue, body skeleton, wrapper
         gen = CodeGen().gen_program(parse(tokenize(src)))
         compared = 0

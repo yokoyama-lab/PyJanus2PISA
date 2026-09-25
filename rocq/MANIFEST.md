@@ -8,14 +8,15 @@ actually correct?" for the **straight-line fragment** of Janus plus **`if`** and
 **`from/loop/until`** (PISACtl.v / CompileIf.v / CompileLoop.v: a PC-based machine
 with the Pendulum paired-branch mechanism, and the `_gen_if` and `_gen_from`
 layouts of `codegen.py` **as of main a1088e2** (PR #4 test normalisation, PR #6
-assertion checks) proved correct on it — see "Control flow" below; violated
+assertion checks), with `_gen_from`'s S2 run at flag 0 (branch
+`fix/call-in-loop-s2`, 2026-09-26), proved correct on it — see "Control flow" below; violated
 `fi` / entry / re-entry assertions are proved to reach `finish` with a dirty
 flag — see "Loops") and **`call f` / `uncall f`** of parameterless
 global-variable procedures, recursion included (PISAProc.v / SrcProc.v /
 CompileProc.v: the machine gets `pisa_interp.py`'s software call stack, and
 `gen_proc`'s `f_top`/prologue/`f_bot` layout, `BRA f` and `BRA f_inv` are proved
-correct and clean for whole programs, with one necessary restriction — see
-"Procedures"). It is the PISA counterpart of the "whole-translator semantic
+correct and clean for whole programs, with calls allowed anywhere, the `loop`
+part of a `from` loop included — see "Procedures"). It is the PISA counterpart of the "whole-translator semantic
 preservation" that `RevLowering.v` in the PyJanus development explicitly leaves
 open.
 
@@ -34,7 +35,7 @@ open.
 | PISAProc.v | **procedure machine**: PISACtl.v plus `pisa_interp.py`'s call stack (CALL/RETURN by label, epilogue as data), `pstep`/`psteps`/`pexec_fuel` |
 | SrcProc.v | source with `call`/`uncall` (`pstmt`, `exec_p`/`lp_p`, `invert_p`), reversibility, determinism, frame lemma, fuel interpreter `run_p` (sound) |
 | CompileProc.v | **`compile_p`** (`BRA f` / `BRA f_inv`), `proc_code` = `gen_proc`, `whole` = `gen_program`, the `If`/loop layouts re-proved on the procedure machine, `compile_p_spec`, `compile_p_program` |
-| TestProc.v | executable checks (8 programs, source vs machine) and the machine-checked counterexample `s2_call_counterexample` |
+| TestProc.v | executable checks (10 programs, source vs machine), and `s2_call_works`: a call in S2 as an instance of `compile_p_program` |
 | Test.v | executable checks and `Print Assumptions` |
 | Extract.v | OCaml extraction of the straight-line compiler (driven by `driver.ml`) |
 
@@ -77,7 +78,7 @@ open.
 | **`compile_p_spec`** | CompileProc.v | **semantic preservation + cleanliness with calls**, any call-stack depth, recursion included — see "Procedures" |
 | **`compile_p_program`** | CompileProc.v | the whole program from `start` halts past `finish` with the right memory, `br = 0`, an empty call stack and the start registers (r1 = k) |
 | `procs_in_whole` | CompileProc.v | `whole` lays every procedure and companion out as `gen_proc` does, with fresh labels |
-| **`s2_call_counterexample`** | TestProc.v | a call in a loop's `loop` part (S2): Janus gives c = 15, the `_gen_from` layout (as reproduced by the verified compiler) gives c = 17 — the restriction of `compile_p_spec` is necessary |
+| **`s2_call_works`** | TestProc.v | a call in a loop's `loop` part (S2), formerly the counterexample `s2_call_counterexample` (old layout: c = 17 instead of Janus's 15): the program is now in scope, and `compile_p_program` gives c = 15 |
 
 ### The main theorem
 
@@ -286,9 +287,20 @@ from n+4):
           <rt ^= _as_flag(e1)> ; XORI rt 1 ; BNE rt r0 finish     -- entry assertion
 do:       <S1>                 (label on S1's first line; a labeled ADDI r0 0 if S1 is empty)
 test:     <rt ^= _as_flag(e2)> ; BEQ rt r0 loop ; XORI rt 1 ; BRA exit
-loop:     XORI rt 1 ; <S2> ; <rt ^= _as_flag(e1)> ; XORI rt 1 ; BNE rt r0 finish ; BRA do
+loop:     ADDI r0 0 ; <S2> ; <rt ^= _as_flag(e1)> ; BNE rt r0 finish ; BRA do
 exit:     ADDI r0 0
 ```
+
+The flag `rt` is 0 whenever S1 or S2 runs (and at `do`, `loop`, `exit`): the
+`BEQ` to `loop` is taken only when it is 0, and the re-entry assertion leaves
+`rt = _as_flag(e1)`, which the `BNE` tests directly (a correct program has
+`e1` false there). Until 2026-09-26 (`fix/call-in-loop-s2`) the line at
+`loop:` was `XORI rt 1` and another `XORI rt 1` followed the re-entry flag
+computation, so S2 ran with `rt = 1` — harmless for straight-line S2, but a
+callee's body assumes r3, r4, … are 0 (see "Procedures").  `loop:` heads a
+NOP rather than S2's first line (as `do:` does for S1) so that the layout
+does not depend on S2's first instruction; `remove_nops` moves the label
+onto that instruction in `codegen.py`'s optimised output.
 
 No branch here is paired, so only direct jumps are exercised. `_gen_from`
 *overwrites* the label of S1's first line; `compile_l_head` shows that line
@@ -312,10 +324,14 @@ Theorem compile_l_spec : forall fin st σ σ', exec_l st σ σ' ->
 The proof is a mutual induction on `exec_l`/`lp_l` (`exec_l_mut`); the
 invariant at `do` is "`br = 0`, the same register file (so `rt = 0`), memory
 representing the current store", and each round is `do_steps` (S1) ·
-`iter_steps` (test fails, `rt := 1`) · `s2_steps` · `back_steps` (re-entry
-assertion false: `rt := 1 xor 0`, `XORI` back to 0, `BNE` falls through,
-`BRA do`), the last round `do_steps` · `exit_steps`; the entry is
-`entry_steps` (`rt := 1`, `XORI` to 0, `BNE` falls through).
+`iter_steps` (test fails, `rt` stays 0, the `BEQ` jumps to the NOP at `loop`)
+· `s2_steps` (S2 with the registers of `do`) · `back_steps` (re-entry
+assertion false: `rt := 0`, `BNE` falls through, `BRA do`), the last round
+`do_steps` · `exit_steps`; the entry is `entry_steps` (`rt := 1`, `XORI` to
+0, `BNE` falls through). Since S2 now starts from the registers of `do`,
+the S2 premise of `loop_round` / `loop_more` /
+`loop_first_reentry_violation` is `frag_spec pb … (mkState R M1)` (it was
+`mkState (rupd b 1 R) M1`).
 
 The previous version (PR #5) was parametrised by the flag clear `clr` and
 instantiated at `XOR rt rt`; that parameter, `compile_lg`/`compile_lg_spec`,
@@ -416,8 +432,10 @@ compile_l_loop_reentry_violation                        : functional_extensional
 steps_relabel, compile_l_lift                           : Closed under the global context
 ```
 
-**Mutation tests** (2026-09-25; each applied, rebuilt, restored — sha256 of
-CompileIf.v/CompileLoop.v checked after restoring). "Proof" is the Rocq build
+**Mutation tests** (2026-09-25, on the layout before the S2 fix; each
+applied, rebuilt, restored — sha256 of CompileIf.v/CompileLoop.v checked
+after restoring; for the 2026-09-26 layout see "Mutation tests of the S2
+fix" under "Procedures"). "Proof" is the Rocq build
 of the repository; "cross-check" is the script run on a scratch copy with the
 same mutation and every proof admitted, so that it measures the script alone.
 
@@ -516,7 +534,8 @@ unavailable, because the unlabeled program's copy of that procedure would lack
 `from_do`. So the main theorem is stated for `relab lo p` (the code with an
 optional label on its first line), and S1's run is obtained for the code *as
 labeled*. A call heading S1 makes `from_do` label a `BRA f`; `BRA do` stays a
-direct jump because it sits on an unlabeled line (`paired_unlabeled`).
+direct jump because it sits on an unlabeled line (`paired_unlabeled`). S2
+needs no such care: `loop:` is a NOP, and S2's code follows it unlabeled.
 
 ### The theorems
 
@@ -554,21 +573,40 @@ Theorem compile_p_program : forall Γ main σ σ' ms slot,
 `proc_code`, its body compiled at base r3 with fresh labels; `procs_in_whole`
 proves it for `whole`. `compile_p_spec` holds at every call-stack depth `k`
 (a callee runs at `(S pc, 0) :: k`), which is what lets the induction go
-through calls and recursion. Its last premise is where the restriction below
-enters: a callee's body is compiled at base r3, so a call is only correct where
-r3, r4, … are all 0.
+through calls and recursion. Its last premise is where cleanliness of the
+flags enters: a callee's body is compiled at base r3, so a call is only
+correct where r3, r4, … are all 0 — which holds in both bodies of an `if`
+and in both bodies (S1 and S2) of a loop, since every enclosing flag is 0
+while they run. In the loop's round invariant (`P0` of the mutual
+induction) this premise is `has_call a || has_call c = true -> clean_above
+scratch (mkState R M)`, discharged for S2 with the same registers `R` as for
+S1.
 
-**Restriction: no call in the `loop` part (S2) of a `from` loop** (`wf_p`:
-`has_call c = false`). `_gen_from` runs S2 with its flag register at 1
-(`loop: XORI rt 1 ; <S2>`), so a callee sees a dirty r3. This is not a
-limitation of the proof: `s2_call_counterexample` (TestProc.v, closed under the
-global context) shows, for
-`f: c += 5; main: x0 += 1; from x0 do skip loop call f; rot until x2; call f`,
-that the source has exactly one result, with c = 15, while the machine runs the
-layout to `finish` with c = 17. Calls in `if` branches, in S1, and inside `if`s
-and loops nested in S1 are fine (the enclosing flags are 0 while those bodies
-run). Everything else is Janus: tests are `_as_flag`-normalised, recursion is
-allowed, `uncall` of procedures that call and uncall is allowed.
+**No restriction on where calls occur** (2026-09-26). `wf_p` is `wf_stmt` on
+the straight-line leaves and nothing else; the earlier clause `has_call c =
+false` for the `loop` part of a loop is gone, together with the `rupd b 1 R`
+in the S2 case, because `_gen_from` now runs S2 with its flag at 0. The
+program that used to be the counterexample,
+`f: c += 5; main: x0 += 1; from x0 do skip loop call f; rot until x2; call f`
+(Janus c = 15; the old layout gave c = 17), is now `g_s2` of TestProc.v and
+an instance of the theorem:
+
+```coq
+Theorem s2_call_works :
+  (exists σ', exec_p g_s2 (PCall 1) zero_store σ') /\
+  (forall σ', exec_p g_s2 (PCall 1) zero_store σ' ->
+     σ' 3%nat = 15 /\
+     exists ms' fuel,
+       pexec_fuel fuel (ptab (length g_s2)) (whole g_s2 1 8) (start_state g_s2)
+       = Some (mkC (length (whole g_s2 1 8)) 0 ms', [])
+       /\ models ms' σ' /\ regs ms' = rupd 1%nat 8 (regs zero_state)).
+```
+
+(proved from `compile_p_program`, `env_wf` and `env_nomod` decided by
+computation). `g_rec_s2` adds recursion through S2, forwards and backwards
+(`h_inv`'s loop has `uncall h` in its S2). Everything else is Janus: tests
+are `_as_flag`-normalised, recursion is allowed, `uncall` of procedures that
+call and uncall is allowed.
 
 Other side conditions: `wf_stmt` (no aliased swap), the stack cell `slot`
 (above), `regs ms 0 = 0` (r0), and — not modelled — procedure **inlining**:
@@ -580,13 +618,18 @@ procedure machine (a violated assertion inside a procedure).
 
 ### Python defects found
 
-1. **A call in S2 of a loop is miscompiled** (the restriction above).
-   `codegen.py`'s own straight-line code fails differently: for the program
-   above it ends with c = 5 and d = 10 (the dirty r3 is used as an address
-   offset); PyJanus gives c = 15, d = 0. Suggested fix (not applied): let S2 run
-   with the flag at 0 — after `BEQ rt r0 loop` is taken the flag *is* 0, so the
-   two `XORI rt 1` around S2 (at `loop:` and after the re-entry flag
-   computation) can be dropped.
+1. **A call in S2 of a loop was miscompiled** — FIXED on branch
+   `fix/call-in-loop-s2` (2026-09-26). `codegen.py` ended the program above
+   with c = 5 and d = 10 (the dirty r3 was used as an address offset); PyJanus
+   gives c = 15, d = 0. Fix: S2 runs with the flag at 0 — after `BEQ rt r0
+   loop` is taken the flag *is* 0, so the two `XORI rt 1` around S2 (at
+   `loop:` and after the re-entry flag computation) were dropped and `loop:`
+   now heads a NOP; `tools/pisa2pal.py`'s `--pendulum-cf` lowering was
+   adapted (it replaces the re-entry `BNE` by `XORI rt 1` so that the flag
+   still tells the back edge from the first entry). Regression tests:
+   `TestCallInLoopS2` in test_janus2pisa.py (call, uncall, inlined call,
+   recursion through S2, nested loops, a callee with its own loop, round
+   trips `P⁻¹(P(0)) = 0`, the unoptimised layout).
 2. **Label collisions.** Procedure names and generated labels share one string
    namespace and nothing checks for clashes: procedures `f` and `f_inv` with an
    `uncall f` (the companion is also called `f_inv`: `x0`/`x1` end at −2/0
@@ -612,23 +655,29 @@ with `codegen.py` and runs it; compares, per procedure and companion, the
 prologue exactly and the body's control skeleton (as in
 `rocq_loop_crosscheck.py`) with `codegen.py`'s unoptimised output, and the
 `start` wrapper; and runs the source under PyJanus when a checkout is
-available. Result (2026-09-26, against main a21787a): **9/9 as expected** —
-seven programs (call; uncall; nested calls and the uncall of a procedure that
-calls; a call heading a loop's S1, so `from_do` labels a `BRA f`; calls and an
-uncall in `if` branches; recursion forwards and backwards; a call in an `if`
-in S1) agree on every count, 22 procedure bodies' skeletons agree, PyJanus
-agrees on all nine; `g_s2` and `g_finv` reproduce the two defects (Janus
-c = 15 / verified layout 17 / codegen 5 with d = 10; Janus x0, x1 = 2, 200 /
-verified 2, 200 / codegen −2, 0). Not in CI: it needs `rocq` and the built
-`.vo` files.
+available. Result (2026-09-26, branch `fix/call-in-loop-s2`): **10/10 as
+expected** — nine programs (call; uncall; nested calls and the uncall of a
+procedure that calls; a call heading a loop's S1, so `from_do` labels a
+`BRA f`; calls and an uncall in `if` branches; recursion forwards and
+backwards; a call in an `if` in S1; **a call in S2** (`g_s2`, c = 15);
+**recursion through S2** forwards and backwards (`g_rec_s2`)) agree on every
+count, 25 procedure bodies' skeletons agree, PyJanus agrees on all ten;
+`g_finv` is an ordinary program too since the label fix (Janus x0, x1 =
+2, 200; codegen used to give −2, 0). (Before the S2 fix: 9/9 against main
+a21787a, with `g_s2` expected to fail — verified layout 17, codegen 5 with
+d = 10.) Runs in CI (Rocq job) since PR #9.
 
 `Print Assumptions` (end of CompileProc.v / TestProc.v):
 
 ```
 compile_p_spec, compile_p_program, prologue_id, exec_p_rev : functional_extensionality_dep
 procs_in_whole, exec_p_det, exec_p_frame, run_p_sound      : Closed under the global context
-s2_call_counterexample                                     : Closed under the global context
+s2_call_works                                              : functional_extensionality_dep
+wf_p_invert                                                : Closed under the global context
 ```
+
+(`s2_call_counterexample`, closed under the global context, is gone with the
+old layout.)
 
 **Mutation tests** (2026-09-26; each applied to the worktree, rebuilt,
 restored with sha256 checked; "cross-check" is the script run on a scratch
@@ -640,7 +689,22 @@ admitted):
 | `uncall f` → `BRA f` (the old bug: the body runs forwards) | fails in `compile_p_spec` (PUncall case) | 4/9 — DIFF on the five programs with an `uncall` |
 | prologue `ADDI r1 1` → `ADDI r1 2` (in `proc_code` and `prologue_lines`) | fails in `prologue_list` | 0/9 |
 | machine: CALL pushes `pc` instead of `pc + 1` | fails in `pstep_call` | 0/9 |
-| drop the S2 restriction from `wf_p` | fails in `compile_p_spec` (loop case: the round invariant needs it to discharge S2's callee-cleanliness premise) | 9/9 (the script does not use `wf_p`; `s2_call_counterexample` is the semantic witness) |
+| drop the S2 restriction from `wf_p` (on the old layout) | fails in `compile_p_spec` (loop case: the round invariant needs it to discharge S2's callee-cleanliness premise) | 9/9 (the script does not use `wf_p`; `s2_call_counterexample` was the semantic witness) — the restriction is now dropped for real, with the layout fixed |
+
+**Mutation tests of the S2 fix** (2026-09-26; Python: applied to
+`codegen.py`, full `pytest` run, restored with sha256 checked; Rocq: applied
+to `loop_code` (CompileLoop.v) and `loop_code_o` (CompileProc.v) together,
+rebuilt in the worktree, restored with sha256 checked; "cross-check" is
+both scripts run with `ROCQ_DIR` on a scratch copy with the same mutation
+and every `Qed` proof admitted):
+
+| mutation | tests / proof | cross-check |
+|---|---|---|
+| Python: the old layout back (`loop: XORI rt 1`, and `XORI rt 1` before the re-entry `BNE`) | 8 failures, all in `TestCallInLoopS2` (incl. round-trip subtests) | `pyjanus_crosscheck.py` 9/10 (`call-in-loop` differs) |
+| Python: drop the re-entry `BNE rt r0 finish` | 5 failures (`test_reentry_assertion_violation_detected`, `test_nonboolean_predicate_violation_detected`, …) | 10/10 (valid programs only) |
+| Python: S2 at flag 1 with the restore moved before the re-entry flag code | 8 failures in `TestCallInLoopS2` | 9/10 |
+| Rocq: `loop:` line `XORI rt 1` instead of the NOP | fails in `P_D` (CompileLoop.v: layout pinned) | loop 3/11 (every program with a loop DIFF); procedures 6/10 (`g_loop`, `g_loop_if`, `g_s2`, `g_rec_s2` DIFF) |
+| Rocq: drop the re-entry `BNE rt r0 finish` | fails in `P_D` | loop: 7 DIFF, then the script aborts on `prog_v2` (the verified run no longer terminates within the fuel); procedures 6/10 |
 
 ## Not covered (next milestones)
 
@@ -657,10 +721,12 @@ admitted):
    conclusion).
 2. **Procedures** — `Call` / `Uncall` are DONE (see "Procedures") for
    parameterless global-variable procedures, non-inlined, recursion included,
-   with the S2 restriction. What remains: inlining (`_inline_procs`), the
+   calls anywhere (the S2 restriction is gone since `fix/call-in-loop-s2`).
+   What remains: inlining (`_inline_procs`), the
    by-reference parameters of `RevProc.v`, `local`/`delocal`, violated
-   assertions inside procedures (only valid executions are covered), and the
-   Python defect found (a call in S2; the label collisions are fixed).
+   assertions inside procedures (only valid executions are covered).  Both
+   Python defects found while writing the proof are fixed (a call in S2; the
+   label collisions).
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole` and `remove_nops` are DONE for straight-line
    code (Opt.v: `optimize_run`; writing the proof exposed and fixed an unsound
@@ -703,9 +769,10 @@ framework there may supply most of milestones 1–2 for free.
   exist twice: Sections `IfLayout`/`LoopLayout` (PISACtl machine) and
   `IfLayoutP`/`LoopLayoutP` of CompileProc.v (procedure machine, head label
   `lo`) — update both (a later clean-up could derive the former from the
-  latter). If the S2 defect is fixed in `_gen_from` (e.g. no `XORI rt 1`
-  around S2), drop `has_call c = false` from `wf_p` and the `rupd b 1 R` from
-  the S2 case.
+  latter). The S2 defect is fixed (2026-09-26, `fix/call-in-loop-s2`):
+  `loop:` is a NOP, no `XORI rt 1` around S2, `has_call c = false` is gone
+  from `wf_p` and `rupd b 1 R` from the S2 case, and the loop's round
+  invariant carries `has_call a || has_call c = true -> clean_above scratch`.
 - **Comparisons in Src.expr** (milestone 3): `_as_flag` leaves comparisons and
   `&&`/`||` alone; once Src.expr has them, `is_bool_const` must grow to
   "comparison or logical operator or 0/1 constant" (and `flag_block_spec`

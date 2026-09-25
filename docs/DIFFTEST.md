@@ -95,10 +95,12 @@ inserted, using the compiler's own path flag `rt`:
 `if_assert: BEQ rt r0 <the BRA if_assert>` (else path has rt=0, then path
 falls through with rt=1); `from_loop: BEQ rt r0 <the loop-test BEQ>`;
 `from_exit: BRA <the exit BRA>`; `from_do: BNE rt r0 <the back-edge BRA>; XOR
-rt rt` (the re-entry check `XORI rt 1; BNE rt r0 finish` codegen emits
-before the back-edge is dropped so rt=1 discriminates the back edge from the
-first entry; under Pendulum semantics a violated re-entry assertion then
-leaves BR ≠ 0, as in Axelsen's translation).  Labels are never moved
+rt rt` (the re-entry check `BNE rt r0 finish` codegen emits before the
+back-edge, where rt = e1, is replaced by `XORI rt 1`, so rt = 1 xor e1 = 1
+discriminates the back edge from the first entry; under Pendulum semantics a
+violated re-entry assertion then leaves BR ≠ 0, as in Axelsen's translation.
+Since 2026-09-26 codegen runs S2 with rt = 0 and no longer brackets it with
+`XORI rt 1`).  Labels are never moved
 (codegen's `remove_nops` forwards labels of removed NOPs, so `from_exit` can
 alias `main_bot`); the jumping instruction is retargeted to a fresh label.
 

@@ -1,4 +1,4 @@
-(** * TestProc.v — executable checks for procedures, and the counterexample
+(** * TestProc.v — executable checks for procedures, including calls in S2
 
     Variables [x0 x1 x2 c y0 y1 d] at addresses [0 .. 6]; the stack cell is
     variable 7, so [r1 = k = 8] (`codegen.py` would use
@@ -159,8 +159,52 @@ Proof. vm_compute. reflexivity. Qed.
 Example ex_finv : agrees g_finv 2 = true.
 Proof. vm_compute. reflexivity. Qed.
 
-(** The programs above are within the theorem's scope ([wf_p] on every
-    body, decided by [wf_pb]); [g_s2] below is not. *)
+(** *** 9. Calls in the [loop] part (S2) of a loop:
+    [f: c += 5]; [main: x0 += 1; from x0 do skip loop call f; rot until x2;
+    call f].  Janus: S2 runs twice, then the final call — [c = 15].  This
+    used to be the counterexample of the S2 restriction: `_gen_from` entered
+    S2 with the loop flag r3 = 1 ([loop: XORI rt 1]), and [f]'s body,
+    compiled at base r3 like every procedure body, computed [5 + r3] into
+    r3, so the verified layout ended with [c = 17] (and `codegen.py`, whose
+    straight-line code differs, with [c = 5, d = 10]).  Now `loop:` is a NOP
+    and S2 runs with the flag at 0: the layout gives [c = 15], and the
+    program is in the scope of [compile_p_spec] ([s2_call_works] below). *)
+Definition g_s2 : penv :=
+  [ inc 3 5
+  ; PSeq (inc 0 1)
+         (PSeq (PLoop (Var 0) (PBase Skip) (PSeq (PCall 0) rotp) (Var 2)) (PCall 0)) ].
+Example ex_s2_src : run_src g_s2 1 = Some [0; 0; 1; 15; 0; 0; 0].
+Proof. vm_compute. reflexivity. Qed.
+Example ex_s2 : agrees g_s2 1 = true.
+Proof. vm_compute. reflexivity. Qed.
+
+(** *** 10. Recursion through S2, forwards and backwards:
+    [h: d += 1; if y0 then y0 -= 1; y1 += 1;
+          from y1 do skip loop y1 -= 1; call h; x1 += 1 until x1;
+          x1 -= 1; y0 += 1
+        else skip fi y0]
+    — at each level the loop runs S2 once (the entry sees [y1 = 1], the
+    re-entry [y1 = 0], the second exit test [x1 = 1]), and S2 calls [h] one
+    level down.  [main: y0 += 2; call h; uncall h; call h]: [h] runs at
+    levels 2, 1, 0, so [d = 3] after each call; the [uncall] runs `h_inv`,
+    whose loop (the inverse of [h]'s) has `uncall h` in its S2. *)
+Definition g_rec_s2 : penv :=
+  [ PSeq (inc 6 1)
+         (PIf (Var 4)
+              (PSeq (dec 4 1) (PSeq (inc 5 1)
+               (PSeq (PLoop (Var 5) (PBase Skip)
+                            (PSeq (dec 5 1) (PSeq (PCall 0) (inc 1 1)))
+                            (Var 1))
+                     (PSeq (dec 1 1) (inc 4 1)))))
+              (PBase Skip) (Var 4))
+  ; PSeq (inc 4 2) (PSeq (PCall 0) (PSeq (PUncall 0) (PCall 0))) ].
+Example ex_rec_s2_src : run_src g_rec_s2 1 = Some [0; 0; 0; 0; 2; 0; 3].
+Proof. vm_compute. reflexivity. Qed.
+Example ex_rec_s2 : agrees g_rec_s2 1 = true.
+Proof. vm_compute. reflexivity. Qed.
+
+(** Every program above is within the theorem's scope ([wf_p] on every
+    body, decided by [wf_pb]). *)
 Fixpoint wf_sb (s : stmt) : bool :=
   match s with
   | Skip | Assign _ _ _ => true
@@ -171,8 +215,7 @@ Fixpoint wf_sb (s : stmt) : bool :=
 Fixpoint wf_pb (st : pstmt) : bool :=
   match st with
   | PBase s => wf_sb s
-  | PSeq a c | PIf _ a c _ => wf_pb a && wf_pb c
-  | PLoop _ a c _ => wf_pb a && wf_pb c && negb (has_call c)
+  | PSeq a c | PIf _ a c _ | PLoop _ a c _ => wf_pb a && wf_pb c
   | PCall _ | PUncall _ => true
   end.
 
@@ -188,60 +231,42 @@ Proof.
   induction st; cbn; intro H; auto;
     repeat match goal with H : (_ && _)%bool = true |- _ => apply andb_true_iff in H as [? ?] end;
     auto using wf_sb_sound.
-  repeat split; auto. now apply negb_true_iff.
+Qed.
+
+Lemma env_wf_of : forall Γ, forallb wf_pb Γ = true -> env_wf Γ.
+Proof.
+  intros Γ H f body Hf. apply wf_pb_sound.
+  rewrite forallb_forall in H. apply H. eapply nth_error_In; exact Hf.
+Qed.
+
+Lemma env_nomod_of : forall Γ x, forallb (fun st => negb (pmods st x)) Γ = true -> env_nomod Γ x.
+Proof.
+  intros Γ x H f body Hf. rewrite forallb_forall in H.
+  apply negb_true_iff, H. eapply nth_error_In; exact Hf.
 Qed.
 
 Example ex_envs_wf :
-  forallb (forallb wf_pb) [g_call; g_uncall; g_nested; g_loop; g_if; g_rec; g_loop_if; g_finv]
+  forallb (forallb wf_pb)
+    [g_call; g_uncall; g_nested; g_loop; g_if; g_rec; g_loop_if; g_finv; g_s2; g_rec_s2]
   = true.
 Proof. reflexivity. Qed.
 
-(** ** The counterexample: a call in the [loop] part of a loop
+(** ** A call in S2, through the main theorem
 
-    [f: c += 5]; [main: x0 += 1; from x0 do skip loop call f; rot until x2;
-    call f].  Janus: S2 runs twice, then the final call — [c = 15].
-    `_gen_from` enters S2 with the loop flag r3 = 1 ([loop: XORI rt 1]),
-    and [f]'s body, compiled at base r3 like every procedure body, computes
-    [5 + r3] into r3: [c] becomes 6 per call inside the loop, 17 in total.
-    (`codegen.py` fails on the same program too — differently, since its
-    straight-line code is different: it ends with [c = 5, d = 10], see
-    tools/rocq_proc_crosscheck.py; PyJanus gives [c = 15, d = 0].)  The
-    program is excluded from [compile_p_spec] only by the [has_call c =
-    false] clause of [wf_p]. *)
+    [g_s2] (a call in S2, formerly excluded by [wf_p]) is now an instance
+    of [compile_p_program]: the source has an execution, every execution
+    ends with [c = 15], and the verified layout, run from `start` by the
+    fuel executor, halts past `finish` with memory representing that store
+    and every register but [r1 = 8] clean. *)
 
-Definition g_s2 : penv :=
-  [ inc 3 5
-  ; PSeq (inc 0 1)
-         (PSeq (PLoop (Var 0) (PBase Skip) (PSeq (PCall 0) rotp) (Var 2)) (PCall 0)) ].
-
-Example ex_s2_src : run_src g_s2 1 = Some [0; 0; 1; 15; 0; 0; 0].
-Proof. vm_compute. reflexivity. Qed.
-
-Example ex_s2_mach :
-  run_mach g_s2 1 = Some (true, 0, 0%nat, [0; 0; 1; 17; 0; 0; 0], [0; 0; 0; 0; 0; 0; 0], 8).
-Proof. vm_compute. reflexivity. Qed.
-
-Lemma g_s2_not_wf : ~ (forall f body, nth_error g_s2 f = Some body -> wf_p body).
-Proof. intro H. specialize (H 1%nat _ eq_refl). cbn in H. destruct H as [_ [[_ [_ H]] _]]. discriminate. Qed.
-
-Lemma run_mach_facts : forall Γ main fin br d m rs r1,
-  run_mach Γ main = Some (fin, br, d, m, rs, r1) ->
-  exists c k,
-    pexec_fuel mach_fuel (ptab (length Γ)) (whole Γ main 8) (start_state Γ) = Some (c, k) /\
-    Nat.eqb (cpc c) (length (whole Γ main 8)) = fin /\
-    map (fun a => mem (cst c) (Z.of_nat a)) (seq 0 7) = m.
-Proof.
-  intros Γ main fin br d m rs r1 H. unfold run_mach, mach_result in H.
-  destruct (pexec_fuel mach_fuel (ptab (length Γ)) (whole Γ main 8) (start_state Γ))
-    as [[c k] |]; [| discriminate].
-  injection H as Hfin _ _ Hm _ _. exists c, k. auto.
-Qed.
-
-Theorem s2_call_counterexample :
+Theorem s2_call_works :
   (exists σ', exec_p g_s2 (PCall 1) zero_store σ') /\
-  (forall σ', exec_p g_s2 (PCall 1) zero_store σ' -> σ' 3%nat = 15) /\
-  (forall fuel c, pexec_fuel fuel (ptab (length g_s2)) (whole g_s2 1 8) (start_state g_s2) = Some c ->
-                  cpc (fst c) = length (whole g_s2 1 8) /\ mem (cst (fst c)) 3 = 17).
+  (forall σ', exec_p g_s2 (PCall 1) zero_store σ' ->
+     σ' 3%nat = 15 /\
+     exists ms' fuel,
+       pexec_fuel fuel (ptab (length g_s2)) (whole g_s2 1 8) (start_state g_s2)
+       = Some (mkC (length (whole g_s2 1 8)) 0 ms', [])
+       /\ models ms' σ' /\ regs ms' = rupd 1%nat 8 (regs zero_state)).
 Proof.
   destruct (run_p 400 g_s2 (PCall 1) zero_store) as [σ0 |] eqn:E;
     [| vm_compute in E; discriminate].
@@ -250,13 +275,19 @@ Proof.
   { pose proof ex_s2_src as H. unfold run_src in H. rewrite E in H.
     unfold option_map, obs_store in H. cbn [map seq] in H.
     injection H as _ _ _ H3 _ _ _. exact H3. }
-  split; [now exists σ0 |]. split.
-  - intros σ' H. rewrite <- (exec_p_det _ _ _ _ Hex σ' H). exact H3.
-  - intros fuel c H.
-    destruct (run_mach_facts _ _ _ _ _ _ _ _ ex_s2_mach) as [c0 [k0 [E0 [Hfin Hm]]]].
-    rewrite (pexec_fuel_det _ _ _ _ _ _ _ H E0). cbn [fst].
-    apply (f_equal (fun l => nth 3 l 0)) in Hm. cbn [nth map seq] in Hm.
-    split; [apply Nat.eqb_eq; exact Hfin | exact Hm].
+  split; [now exists σ0 |].
+  intros σ' H. pose proof (exec_p_det _ _ _ _ Hex σ' H) as Hdet. subst σ'.
+  split; [exact H3 |].
+  destruct (compile_p_program g_s2 1%nat zero_store σ0 zero_state 7%nat Hex)
+    as [ms' [fuel [Hf [Hm Hr]]]].
+  - apply env_wf_of. reflexivity.
+  - apply env_nomod_of. reflexivity.
+  - intro x; reflexivity.
+  - reflexivity.
+  - intros r _; reflexivity.
+  - reflexivity.
+  - reflexivity.
+  - exists ms', fuel. split; [exact Hf | split; [exact Hm | exact Hr]].
 Qed.
 
-Print Assumptions s2_call_counterexample.
+Print Assumptions s2_call_works.

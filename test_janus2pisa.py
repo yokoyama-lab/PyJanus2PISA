@@ -2284,5 +2284,103 @@ class TestPeepholeLabelSafety(unittest.TestCase):
         self.assertEqual(out[0].instr.rd, "r4")
 
 
+class TestCallInLoopS2(unittest.TestCase):
+    """A call/uncall in the `loop` part (S2) of a `from` loop.
+
+    Regression tests: `_gen_from` used to run S2 with its flag register at 1
+    (`loop: XORI rt 1 ; <S2> ; ... ; XORI rt 1`), while a callee's body is
+    compiled assuming r3, r4, ... are 0.  A call in S2 therefore ran the
+    callee on a dirty register (found by the Rocq model, PR #9:
+    `s2_call_counterexample`; PyJanus gives the expected values below).
+    Every procedure except in INLINED is called at least twice, so it is not
+    inlined and really runs as a callee.
+    """
+
+    CALL = ("int i\nint c\nprocedure f\n  c += 5\nprocedure main\n"
+            "  from i = 0 do i += 1 loop call f until i = 3\n  call f")
+    UNCALL = ("int i\nint c\nprocedure f\n  c += 5\nprocedure main\n"
+              "  from i = 0 do i += 1 loop uncall f until i = 3\n  uncall f")
+    INLINED = ("int i\nint c\nprocedure f\n  c += 5\nprocedure main\n"
+               "  from i = 0 do i += 1 loop call f until i = 3")
+    # q recurses through the S2 of its own loop (one level per d, d < 2)
+    RECURSION = ("int d\nint c\nint xs[4]\nprocedure q\n  c += 1\n"
+                 "  if d < 2 then\n    d += 1\n"
+                 "    from xs[d] = 0 do xs[d] += 1 loop call q until xs[d] = 2\n"
+                 "    xs[d] -= 2\n    d -= 1\n  else\n    skip\n  fi d < 2\n"
+                 "procedure main\n  call q\n  call q")
+    # the inner loop's flag is r4, the outer's r3: both must be 0 in f
+    NESTED = ("int i\nint j\nint c\nint e\nprocedure f\n  c += 1\n"
+              "procedure g\n  e += c\nprocedure main\n"
+              "  from i = 0 do i += 1 loop\n"
+              "    from j = 0 do j += 1 loop call f until j = 3\n"
+              "    j -= 3\n    call g\n    uncall f\n  until i = 3\n  call g")
+    # the callee has a loop of its own (its flag is r3 as well)
+    CALLEE_LOOP = ("int i\nint k\nint c\nprocedure h\n"
+                   "  from k = 0 do k += 1 loop c += k until k = 4\n  k -= 4\n"
+                   "procedure main\n"
+                   "  from i = 0 do i += 1 loop call h until i = 3\n  uncall h")
+
+    def _run(self, src):
+        from pisa_interp import PISAMachine
+        m = PISAMachine(compile_program(parse(tokenize(src))))
+        m.run()   # the garbage check at FINISH is on
+        for r in range(3, 32):
+            self.assertEqual(m._read_reg(f"r{r}"), 0, f"r{r} dirty")
+        return m
+
+    def _mem(self, src, n):
+        m = self._run(src)
+        return [m.mem.get(a, 0) for a in range(n)]
+
+    def test_call_in_s2(self):
+        # S2 runs twice, then one more call: 3 * 5 (the old code gave c = 5)
+        self.assertEqual(self._mem(self.CALL, 3), [3, 15, 0])
+
+    def test_uncall_in_s2(self):
+        self.assertEqual(self._mem(self.UNCALL, 3), [3, -15, 0])
+
+    def test_inlined_call_in_s2(self):
+        self.assertEqual(self._mem(self.INLINED, 2), [3, 10])
+
+    def test_recursion_through_s2(self):
+        # each `call q` runs q at depths 0, 1, 2: c = 2 * 3
+        self.assertEqual(self._mem(self.RECURSION, 6), [0, 6, 0, 0, 0, 0])
+
+    def test_nested_loops_with_calls_in_s2(self):
+        # outer S2, first round: the inner S2 twice (c = 2), e += c (2),
+        # uncall f (c = 1); second round: c = 3, e = 5, c = 2; then e += c
+        self.assertEqual(self._mem(self.NESTED, 4), [3, 0, 2, 7])
+
+    def test_callee_with_its_own_loop(self):
+        # h adds 1 + 2 + 3; two calls in S2, one uncall after
+        self.assertEqual(self._mem(self.CALLEE_LOOP, 3), [3, 0, 6])
+
+    def test_round_trips(self):
+        """P⁻¹(P(0)) = 0; P⁻¹ puts the calls into S2 of the inverted loop too."""
+        from test_inverse import round_trip
+        for name in ("CALL", "UNCALL", "INLINED", "RECURSION", "NESTED",
+                     "CALLEE_LOOP"):
+            with self.subTest(name):
+                self.assertTrue(all(v == 0 for v in round_trip(getattr(self, name)).values()))
+
+    def test_flag_is_not_touched_around_s2(self):
+        """Unoptimised layout: `from_loop` heads a NOP, and between it and the
+        back edge `BRA from_do` nothing but the re-entry XOR writes the flag."""
+        prog = parse(tokenize(self.CALL))
+        code = CodeGen().gen_program(prog)
+        start = next(k for k, li in enumerate(code)
+                     if li.label and li.label.startswith("from_loop"))
+        self.assertIsInstance(code[start].instr, ADDI)
+        self.assertEqual((code[start].instr.rd, code[start].instr.c), ("r0", 0))
+        end = next(k for k in range(start, len(code))
+                   if isinstance(code[k].instr, BRA)
+                   and code[k].instr.label.startswith("from_do"))
+        body = [li.instr for li in code[start + 1:end]]
+        self.assertEqual(body[0], BRA("f"))
+        self.assertFalse(any(isinstance(i, XORI) and i.rd == "r3" for i in body))
+        self.assertIsInstance(body[-1], BNE)
+        self.assertEqual((body[-1].rd, body[-1].rs, body[-1].label), ("r3", "r0", "finish"))
+
+
 if __name__ == "__main__":
     unittest.main()
