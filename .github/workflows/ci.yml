@@ -58,10 +58,30 @@ jobs:
           script: |
             set -o pipefail
             {
+            # Without -e a failing check in the middle would be masked by the
+            # exit status of the last command in this group.
+            set -e
             startGroup "Build proofs"
               cd rocq
               rocq makefile -f _CoqProject -o Makefile
               make -j2
+              cd ..
+            endGroup
+            # The proofs are about a Rocq re-implementation of codegen.py, so
+            # tie them back to the Python code on every run: the crosscheck
+            # compares compile_l's layout and results with codegen.py and
+            # pisa_interp.py; rocq_diff runs the extracted straight-line
+            # compiler against codegen.py.
+            startGroup "Python for the tie-back checks"
+              command -v python3 || { sudo apt-get update -qq && sudo apt-get install -y -qq python3; }
+              python3 --version
+            endGroup
+            startGroup "Crosscheck: verified if/loop compiler vs codegen.py"
+              python3 tools/rocq_loop_crosscheck.py
+            endGroup
+            startGroup "Differential test: extracted compiler vs codegen.py"
+              make -C rocq -f Makefile.driver
+              python3 tools/rocq_diff.py
             endGroup
             } 2>&1 | tee ci-log.txt
       - name: Revert permissions
