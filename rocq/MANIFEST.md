@@ -10,9 +10,14 @@ with the Pendulum paired-branch mechanism, and the `_gen_if` and `_gen_from`
 layouts of `codegen.py` **as of main a1088e2** (PR #4 test normalisation, PR #6
 assertion checks) proved correct on it — see "Control flow" below; violated
 `fi` / entry / re-entry assertions are proved to reach `finish` with a dirty
-flag — see "Loops"). It is the PISA counterpart of the "whole-translator
-semantic preservation" that `RevLowering.v` in the PyJanus development
-explicitly leaves open.
+flag — see "Loops") and **`call f` / `uncall f`** of parameterless
+global-variable procedures, recursion included (PISAProc.v / SrcProc.v /
+CompileProc.v: the machine gets `pisa_interp.py`'s software call stack, and
+`gen_proc`'s `f_top`/prologue/`f_bot` layout, `BRA f` and `BRA f_inv` are proved
+correct and clean for whole programs, with one necessary restriction — see
+"Procedures"). It is the PISA counterpart of the "whole-translator semantic
+preservation" that `RevLowering.v` in the PyJanus development explicitly leaves
+open.
 
 ## Modules
 
@@ -26,6 +31,10 @@ explicitly leaves open.
 | PISACtl.v | **control-flow machine**: labeled program, pc, `br`, paired branches, `cstep`/`steps`/`exec_fuel` |
 | CompileIf.v | **`If`**: base-parametrised body compiler, `_as_flag` (`flag_block`), `exec_c`, `compile_c`, `compile_c_spec` |
 | CompileLoop.v | **`from/loop/until`**: `lstmt` (subsumes `cstmt`), `exec_l`/`lp_l`, `compile_l` = `_gen_if`/`_gen_from`'s layouts, `compile_l_spec`, the three violation theorems |
+| PISAProc.v | **procedure machine**: PISACtl.v plus `pisa_interp.py`'s call stack (CALL/RETURN by label, epilogue as data), `pstep`/`psteps`/`pexec_fuel` |
+| SrcProc.v | source with `call`/`uncall` (`pstmt`, `exec_p`/`lp_p`, `invert_p`), reversibility, determinism, frame lemma, fuel interpreter `run_p` (sound) |
+| CompileProc.v | **`compile_p`** (`BRA f` / `BRA f_inv`), `proc_code` = `gen_proc`, `whole` = `gen_program`, the `If`/loop layouts re-proved on the procedure machine, `compile_p_spec`, `compile_p_program` |
+| TestProc.v | executable checks (8 programs, source vs machine) and the machine-checked counterexample `s2_call_counterexample` |
 | Test.v | executable checks and `Print Assumptions` |
 | Extract.v | OCaml extraction of the straight-line compiler (driven by `driver.ml`) |
 
@@ -63,6 +72,12 @@ explicitly leaves open.
 | **`compile_l_loop_reentry_violation`** | CompileLoop.v | a true re-entry assertion after the first round jumps to `finish` with the flag = 1 |
 | `compile_l_lift` | CompileLoop.v | on `If`-only programs `compile_l` *is* `compile_c` |
 | `entry_violation_no_exec`, `reentry_violation_no_exec`, `if_violation_no_exec` | CompileLoop.v | the three example programs Janus rejects have no execution in `exec_l`; `ex_*_violation_detected` show the code ends with r3 = 1 |
+| `exec_p_rev`, `exec_p_det`, `exec_p_frame`, `run_p_sound` | SrcProc.v | the source with procedures is reversible (`uncall` undoes `call`), deterministic, leaves unassigned variables alone; `run_p` is sound |
+| `prologue_id` | CompileProc.v | with `br = 0` and the stack cell 0, `SUBI r1 1; EXCH r2 r1; SWAPBR r2; NEG r2; EXCH r2 r1; ADDI r1 1` is the identity (as code on entry and as data on return) |
+| **`compile_p_spec`** | CompileProc.v | **semantic preservation + cleanliness with calls**, any call-stack depth, recursion included — see "Procedures" |
+| **`compile_p_program`** | CompileProc.v | the whole program from `start` halts past `finish` with the right memory, `br = 0`, an empty call stack and the start registers (r1 = k) |
+| `procs_in_whole` | CompileProc.v | `whole` lays every procedure and companion out as `gen_proc` does, with fresh labels |
+| **`s2_call_counterexample`** | TestProc.v | a call in a loop's `loop` part (S2): Janus gives c = 15, the `_gen_from` layout (as reproduced by the verified compiler) gives c = 17 — the restriction of `compile_p_spec` is necessary |
 
 ### The main theorem
 
@@ -133,7 +148,7 @@ The semantics is that of `pisa_interp.py`, checked line by line:
 | `r0` reads 0 | **not modelled** (PISA.v's register file is uniform); the theorems assume `regs ms 0 = 0`, which compiled code preserves |
 | `finish: FINISH` as the target of `BNE rt r0 finish` | a label `fin` the enclosing program defines; `with_finish` appends it as a NOP line and the fuel executor halts by falling off the end |
 | garbage check at `FINISH` | stated, not executed: the violation theorems conclude "at `fin` with the flag register = 1" |
-| software call stack, procedure detection (`f_top`/`f_bot`), `START`/`DATA` | **not modelled** — milestone 2 |
+| software call stack, procedure detection (`f_top`/`f_bot`), `START`/`DATA` | not in PISACtl.v; **the call stack and procedure detection are PISAProc.v** (see "Procedures"); `START` is a NOP line, `DATA` is the initial memory |
 | direction bit / reverse execution | **not modelled** — `pisa_interp.py` does not implement it either |
 
 So the model covers every control instruction the interpreter executes inside a
@@ -413,6 +428,216 @@ same mutation and every proof admitted, so that it measures the script alone.
 | `BRA do` → `BRA test` (loop back edge, consistently in the layout lemmas) | fails in `paired_Bk` (the back edge no longer targets `do`) | 8/11 DIFF (every program with a loop) |
 | drop the `BNE rt r0 finish` after `end:` in `if_code` | fails in `len_if_code` (layout pinned) | 5/11 DIFF (every program with an `if`) |
 
+## Procedures: `call f` / `uncall f` (PISAProc.v, SrcProc.v, CompileProc.v, TestProc.v)
+
+### The machine (PISAProc.v)
+
+`pisa_interp.py` does not return through Pendulum's `br`: it keeps a software
+call stack of `(return pc, saved br)` and recognises calls and returns by
+label. `pstep T P : cstate * list (nat * Z) -> option _` is PISACtl.v's
+`cstep` plus exactly that. `T : ptable` lists the triples `(f, f_top, f_bot)`:
+labels are numbers here, while the interpreter derives the same set from the
+`_top`/`_bot` naming convention (`_proc_names` requires all three labels to
+exist, and so do `is_proc`/`bot_of`). Line by line:
+
+| `pisa_interp.py` (`run`, BRA/RBRA branch) | model (`pstep`) |
+|---|---|
+| `target_pc = self.label_map[target_label]` (KeyError if missing) | `find_label l P = None` → stuck |
+| at a line labeled `f_bot` of a procedure, stack non-empty: `_exec_data` on the 6 lines from label `f` (SWAPBR included), then `pc, br = pop()` | `bot_of T P lo = Some e`, `data_run P ep 6 br s`, pop |
+| target is a procedure name: `push(pc + 1, br)`, `br = 0`, `pc = target` | `is_proc T P l = true` → `(mkC t 0 s, (S pc, br) :: k)` |
+| `f_bot` with an empty stack: "RETURN without CALL" | stuck |
+| otherwise paired / direct branch | PISACtl.v's `bra_step`, stack unchanged |
+| every other instruction | PISACtl.v's `cstep`, stack unchanged (`RBRA` = `BRA` as before) |
+| `FINISH` halts | the fuel executor halts when the pc leaves the program; `finish` is the last line |
+
+`ex_call_demo` / `ex_return_without_call` are sanity checks; the cross-check
+below runs the verified code on `pisa_interp.py` itself.
+
+**How `uncall` is executed today.** `_gen_uncall` emits `BRA f_inv`, a call of
+the companion procedure `f_inv` whose body is `invert_stmt(f.body)`
+(`gen_program` step 3b). `RBRA` is never emitted, and would be executed as
+`BRA` anyway (the interpreter's `dir` bit is never used). So an `uncall` is a
+forward run of a second, inverted copy of the code. The model does the same:
+`compile_p (PUncall f) = [BRA (pe f true)]`, and `whole` emits the inverted
+companion of every procedure.
+
+### The source (SrcProc.v)
+
+`pstmt` = `lstmt` + `PCall f` + `PUncall f`; a program is a list of bodies
+`Γ : penv`, and
+
+```coq
+| EP_Call   : nth_error Γ f = Some body -> exec_p Γ body σ σ' -> exec_p Γ (PCall f) σ σ'
+| EP_Uncall : nth_error Γ f = Some body -> exec_p Γ (invert_p body) σ σ' -> exec_p Γ (PUncall f) σ σ'
+```
+
+— `RevProc.v`'s rules without parameters. Nothing restricts the call graph:
+recursion is covered by the induction on the derivation. `exec_p_rev`
+(`uncall` undoes `call`), `exec_p_det`, `exec_p_frame` (a variable no body
+assigns is unchanged) and `run_p_sound` (a fuel interpreter, used to state the
+expected stores of the examples) are proved.
+
+### The layout (CompileProc.v)
+
+`compile_p` is `compile_l` plus `PCall f ↦ [BRA f]`, `PUncall f ↦ [BRA f_inv]`;
+`if`/`from` use `if_code`/`loop_code` of CompileIf.v/CompileLoop.v verbatim.
+`proc_code e t bt B` is `gen_proc`:
+
+```
+f_top:  BRA f_bot
+f:      SUBI r1 1 ; EXCH r2 r1 ; SWAPBR r2 ; NEG r2 ; EXCH r2 r1 ; ADDI r1 1
+        <body at scratch base r3>
+f_bot:  BRA f_top
+```
+
+and `whole Γ main k` is every procedure, then every inverted companion, then
+`start: START; ADDI r1 k; BRA main; finish: FINISH` (`gen_program`; the
+`SUBI r1 k` after `FINISH` is never executed and is omitted; `codegen.py` emits
+only reachable, non-inlined procedures, which changes positions only). Label
+numbers: `finish` = 0; procedure `f`'s `f`/`f_top`/`f_bot` are `1 + 6f`, `+1`,
+`+2`, its companion's `+3..+5`; statement labels start at `L0 = 1 + 6|Γ|`.
+
+Why a call is clean: the CALL clears `br`; with `br = 0` and the stack cell
+`M[r1 - 1] = 0` the prologue is the identity on registers, memory and `br`
+(`prologue_id`: `r2` goes into the cell and back, the `SWAPBR` swaps
+`r2 = 0` with `br = 0`); the body runs; RETURN runs the same six instructions
+as data (identity again) and pops. `r1` is restored by every statement, so all
+calls, at any depth, share one cell; `codegen.py` puts it at
+`k - 1 = nvars + max(2·depth, 4) - 1`, past every declared variable. In the
+theorems it is the variable `slot`, which must start at 0 and which no body
+assigns (`env_nomod`).
+
+The `If`/loop layout proofs are re-done on `psteps` (Sections `IfLayoutP`,
+`LoopLayoutP`), for two reasons: the machine is different, and the layout's
+first line may carry a label `lo`. `_gen_from` puts `from_do` on the first line
+of S1; when S1 is inside a procedure that S1 may call (recursion), the old
+argument (`steps_relabel`: run S1's code unlabeled, then transfer the run) is
+unavailable, because the unlabeled program's copy of that procedure would lack
+`from_do`. So the main theorem is stated for `relab lo p` (the code with an
+optional label on its first line), and S1's run is obtained for the code *as
+labeled*. A call heading S1 makes `from_do` label a `BRA f`; `BRA do` stays a
+direct jump because it sits on an unlabeled line (`paired_unlabeled`).
+
+### The theorems
+
+```coq
+Theorem compile_p_spec : forall Γ P slot,
+  procs_in Γ P -> env_wf Γ -> env_nomod Γ slot ->
+  forall st σ σ', exec_p Γ st σ σ' ->
+  forall b n p n' ms pre post lo k,
+  wf_p st -> pmods st slot = false ->
+  compile_p st b n = (p, n') -> (scratch <= b)%nat -> (L0 Γ <= n)%nat ->
+  P = pre ++ relab lo p ++ post ->
+  (forall l, In l (labels pre)  -> ~ (n <= l < n')%nat) ->
+  (forall l, In l (labels post) -> ~ (n <= l < n')%nat) ->
+  (forall l, lo = Some l -> ~ (n <= l < n')%nat /\ (L0 Γ <= l)%nat) ->
+  models ms σ -> σ slot = 0 -> clean_above b ms -> regs ms 0%nat = 0 ->
+  regs ms 1%nat = Z.of_nat slot + 1 ->
+  (has_call st = true -> clean_above scratch ms) ->
+  exists ms',
+    psteps (ptab (length Γ)) P (mkC (length pre) 0 ms, k)
+                               (mkC (length pre + length (relab lo p)) 0 ms', k)
+    /\ models ms' σ' /\ regs ms' = regs ms.
+
+Theorem compile_p_program : forall Γ main σ σ' ms slot,
+  exec_p Γ (PCall main) σ σ' -> env_wf Γ -> env_nomod Γ slot ->
+  models ms σ -> σ slot = 0 ->
+  clean_above scratch ms -> regs ms 0%nat = 0 -> regs ms 1%nat = 0 ->
+  exists ms' fuel,
+    pexec_fuel fuel (ptab (length Γ)) (whole Γ main (Z.of_nat slot + 1))
+               (mkC (length (procs_code Γ)) 0 ms, [])
+    = Some (mkC (length (whole Γ main (Z.of_nat slot + 1))) 0 ms', [])
+    /\ models ms' σ' /\ regs ms' = rupd 1%nat (Z.of_nat slot + 1) (regs ms).
+```
+
+`procs_in Γ P` says every procedure and every companion sits in `P` as
+`proc_code`, its body compiled at base r3 with fresh labels; `procs_in_whole`
+proves it for `whole`. `compile_p_spec` holds at every call-stack depth `k`
+(a callee runs at `(S pc, 0) :: k`), which is what lets the induction go
+through calls and recursion. Its last premise is where the restriction below
+enters: a callee's body is compiled at base r3, so a call is only correct where
+r3, r4, … are all 0.
+
+**Restriction: no call in the `loop` part (S2) of a `from` loop** (`wf_p`:
+`has_call c = false`). `_gen_from` runs S2 with its flag register at 1
+(`loop: XORI rt 1 ; <S2>`), so a callee sees a dirty r3. This is not a
+limitation of the proof: `s2_call_counterexample` (TestProc.v, closed under the
+global context) shows, for
+`f: c += 5; main: x0 += 1; from x0 do skip loop call f; rot until x2; call f`,
+that the source has exactly one result, with c = 15, while the machine runs the
+layout to `finish` with c = 17. Calls in `if` branches, in S1, and inside `if`s
+and loops nested in S1 are fine (the enclosing flags are 0 while those bodies
+run). Everything else is Janus: tests are `_as_flag`-normalised, recursion is
+allowed, `uncall` of procedures that call and uncall is allowed.
+
+Other side conditions: `wf_stmt` (no aliased swap), the stack cell `slot`
+(above), `regs ms 0 = 0` (r0), and — not modelled — procedure **inlining**:
+`codegen.py` inlines a procedure called at most once (`_inline_procs`); the
+model always emits `BRA f`, and the cross-check's programs call every procedure
+at least twice. Only valid executions are covered: the violation theorems of
+CompileLoop.v are stated for the PISACtl machine, and none is stated for the
+procedure machine (a violated assertion inside a procedure).
+
+### Python defects found
+
+1. **A call in S2 of a loop is miscompiled** (the restriction above).
+   `codegen.py`'s own straight-line code fails differently: for the program
+   above it ends with c = 5 and d = 10 (the dirty r3 is used as an address
+   offset); PyJanus gives c = 15, d = 0. Suggested fix (not applied): let S2 run
+   with the flag at 0 — after `BEQ rt r0 loop` is taken the flag *is* 0, so the
+   two `XORI rt 1` around S2 (at `loop:` and after the re-entry flag
+   computation) can be dropped.
+2. **Label collisions.** Procedure names and generated labels share one string
+   namespace and nothing checks for clashes: procedures `f` and `f_inv` with an
+   `uncall f` (the companion is also called `f_inv`: `x0`/`x1` end at −2/0
+   instead of 2/200), a procedure named like a generated label (`if_false_1`:
+   c = 1 instead of 201), or procedures `g` and `g_top` (c = 2 instead of 202)
+   all compile silently to wrong code (`label_map` keeps the last definition).
+   The model uses injective numeric labels, which is why `g_finv` in TestProc.v
+   is right there. Suggested fix: reject such names, or mangle generated labels.
+
+### Cross-check
+
+`tools/rocq_proc_crosscheck.py` evaluates `whole Γ main k` (with the `k`
+`codegen.py` picks for the same source), the verified machine and the source
+fuel interpreter by `vm_compute` for the nine programs of TestProc.v; renders
+the verified code as PISA (labels `pF`, `pF_top`, `pF_bot`, `pF_inv`, …) and
+runs it on `pisa_interp.py` (store, r1..r8 and `br` must equal the verified
+machine's — this validates the call-stack model); compiles the Janus source
+with `codegen.py` and runs it; compares, per procedure and companion, the
+prologue exactly and the body's control skeleton (as in
+`rocq_loop_crosscheck.py`) with `codegen.py`'s unoptimised output, and the
+`start` wrapper; and runs the source under PyJanus when a checkout is
+available. Result (2026-09-26, against main a21787a): **9/9 as expected** —
+seven programs (call; uncall; nested calls and the uncall of a procedure that
+calls; a call heading a loop's S1, so `from_do` labels a `BRA f`; calls and an
+uncall in `if` branches; recursion forwards and backwards; a call in an `if`
+in S1) agree on every count, 22 procedure bodies' skeletons agree, PyJanus
+agrees on all nine; `g_s2` and `g_finv` reproduce the two defects (Janus
+c = 15 / verified layout 17 / codegen 5 with d = 10; Janus x0, x1 = 2, 200 /
+verified 2, 200 / codegen −2, 0). Not in CI: it needs `rocq` and the built
+`.vo` files.
+
+`Print Assumptions` (end of CompileProc.v / TestProc.v):
+
+```
+compile_p_spec, compile_p_program, prologue_id, exec_p_rev : functional_extensionality_dep
+procs_in_whole, exec_p_det, exec_p_frame, run_p_sound      : Closed under the global context
+s2_call_counterexample                                     : Closed under the global context
+```
+
+**Mutation tests** (2026-09-26; each applied to the worktree, rebuilt,
+restored with sha256 checked; "cross-check" is the script run on a scratch
+copy with the same mutation and every proof of the four procedure files
+admitted):
+
+| mutation | proof | cross-check |
+|---|---|---|
+| `uncall f` → `BRA f` (the old bug: the body runs forwards) | fails in `compile_p_spec` (PUncall case) | 4/9 — DIFF on the five programs with an `uncall` |
+| prologue `ADDI r1 1` → `ADDI r1 2` (in `proc_code` and `prologue_lines`) | fails in `prologue_list` | 0/9 |
+| machine: CALL pushes `pc` instead of `pc + 1` | fails in `pstep_call` | 0/9 |
+| drop the S2 restriction from `wf_p` | fails in `compile_p_spec` (loop case: the round invariant needs it to discharge S2's callee-cleanliness premise) | 9/9 (the script does not use `wf_p`; `s2_call_counterexample` is the semantic witness) |
+
 ## Not covered (next milestones)
 
 1. **Control flow** — `If` and **`Loop`** are DONE (above) for the layouts of
@@ -426,12 +651,12 @@ same mutation and every proof admitted, so that it measures the script alone.
    round k > 1 (only the first round is stated), and `finish` as an executed
    `FINISH` with the garbage check (here: a label plus the "flag = 1"
    conclusion).
-2. **Procedures** — `Call` / `Uncall`. The source-side contract is *already*
-   machine-checked in `RevProc.v` of the PyJanus development (see below), in the
-   more general by-reference-parameter form; what is missing is only that the
-   *emitted code* meets it. The Python compiler now does, by branching to an
-   inverted companion `f_inv` (the bug where `uncall` ran the body forward is
-   fixed), but nothing here proves it.
+2. **Procedures** — `Call` / `Uncall` are DONE (see "Procedures") for
+   parameterless global-variable procedures, non-inlined, recursion included,
+   with the S2 restriction. What remains: inlining (`_inline_procs`), the
+   by-reference parameters of `RevProc.v`, `local`/`delocal`, violated
+   assertions inside procedures (only valid executions are covered), and the
+   two Python defects found (a call in S2; label collisions).
 3. **Arrays**, constant multiplication, comparison operators.
 4. **The optimizer** — `peephole` and `remove_nops` are DONE for straight-line
    code (Opt.v: `optimize_run`; writing the proof exposed and fixed an unsound
@@ -465,10 +690,18 @@ framework there may supply most of milestones 1–2 for free.
   `iter_steps`, `s2_steps`, `reentry_check`, `back_steps`,
   `back_violation`), so a layout change is local — and add a program to
   `tools/rocq_loop_crosscheck.py`.
-- **Procedures** (milestone 2) are the next milestone of this directory; the
-  labeled-fragment theorem (`pre`/`post` quantification) is the interface a
-  procedure body will be proved against. `finish` is already a parameter
-  (`fin`), which is how a procedure body will refer to the program's exit.
+- **Procedures** (milestone 2): DONE on branch `feat/rocq-procedures`
+  (2026-09-26), see "Procedures". When `gen_proc` / `_gen_call` /
+  `_gen_uncall` / `gen_program`'s wrapper change: edit `proc_code`,
+  `prologue_lines`, `compile_p`'s `PCall`/`PUncall` cases, `start_code`, and
+  re-run `tools/rocq_proc_crosscheck.py`. **When `_gen_if` / `_gen_from`
+  change**, the layouts are shared (`if_code`, `loop_code`), but their proofs
+  exist twice: Sections `IfLayout`/`LoopLayout` (PISACtl machine) and
+  `IfLayoutP`/`LoopLayoutP` of CompileProc.v (procedure machine, head label
+  `lo`) — update both (a later clean-up could derive the former from the
+  latter). If the S2 defect is fixed in `_gen_from` (e.g. no `XORI rt 1`
+  around S2), drop `has_call c = false` from `wf_p` and the `rupd b 1 R` from
+  the S2 case.
 - **Comparisons in Src.expr** (milestone 3): `_as_flag` leaves comparisons and
   `&&`/`||` alone; once Src.expr has them, `is_bool_const` must grow to
   "comparison or logical operator or 0/1 constant" (and `flag_block_spec`
@@ -632,8 +865,8 @@ inverter.
 ## Axiom footprint
 
 `functional_extensionality_dep`, and nothing else (`Print Assumptions` in
-`Test.v` and at the end of `CompileIf.v` and `CompileLoop.v` reports it at build
-time; PISACtl.v's own lemmas and `steps_relabel` are axiom-free). It is used only to promote pointwise equality
+`Test.v` and at the end of `CompileIf.v`, `CompileLoop.v`, `CompileProc.v` and
+`TestProc.v` reports it at build time; PISACtl.v's own lemmas and `steps_relabel` are axiom-free). It is used only to promote pointwise equality
 of the register file and memory — both higher-order maps, `reg -> Z` and
 `addr -> Z` — to Leibniz equality. Removing it would require a first-order
 machine state (e.g. a bounded vector of registers). This is the same trade-off

@@ -79,6 +79,9 @@ jobs:
             startGroup "Crosscheck: verified if/loop compiler vs codegen.py"
               python3 tools/rocq_loop_crosscheck.py
             endGroup
+            startGroup "Crosscheck: verified procedure compiler vs codegen.py"
+              python3 tools/rocq_proc_crosscheck.py
+            endGroup
             startGroup "Differential test: extracted compiler vs codegen.py"
               make -C rocq -f Makefile.driver
               python3 tools/rocq_diff.py
