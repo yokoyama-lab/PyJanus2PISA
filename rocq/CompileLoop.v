@@ -324,7 +324,8 @@ Proof. induction st; simpl; tauto. Qed.
 
 (** ** The compiler *)
 
-(** `ADDI r0 0`, the NOP `_gen_from` emits for an empty [S1] and at [exit]. *)
+(** `ADDI r0 0`, the NOP `_gen_from` emits for an empty [S1], at [loop] and
+    at [exit]. *)
 Definition nop : instr := IAddi 0%nat 0.
 
 Lemma step_nop : forall s, step nop s = s.
@@ -340,7 +341,10 @@ Definition label_first (l : label) (p : lprog) : lprog :=
   end.
 
 (** [loop_code fin b n e1 e2 pa pb]: flag register [b], labels [n .. n+3],
-    compiled bodies [pa] (S1) and [pb] (S2), `finish` label [fin]. *)
+    compiled bodies [pa] (S1) and [pb] (S2), `finish` label [fin].  The flag
+    is 0 while S1 and S2 run: `loop:` is a NOP (the `BEQ` that jumps there is
+    taken only when the flag is 0), and the re-entry assertion leaves
+    [rt = e1 != 0], which the `BNE` checks directly. *)
 Definition loop_code (fin : label) (b : reg) (n : label) (e1 e2 : expr)
                      (pa pb : lprog) : lprog :=
   ops (flag_block e1 b)
@@ -351,11 +355,10 @@ Definition loop_code (fin : label) (b : reg) (n : label) (e1 e2 : expr)
   ++ (None, CBeq b 0%nat (S n))
   :: (None, COp (IXori b 1))
   :: (None, CBra (n + 2)%nat)
-  :: (Some (S n), COp (IXori b 1))
+  :: (Some (S n), COp nop)
   :: pb
   ++ ops (flag_block e1 b)
-  ++ (None, COp (IXori b 1))
-  :: (None, CBne b 0%nat fin)
+  ++ (None, CBne b 0%nat fin)
   :: (None, CBra (n + 3)%nat)
   :: (Some (n + 2)%nat, COp nop)
   :: [].
@@ -546,11 +549,10 @@ Let pT  := (pDo + la)%nat.    (* test: the exit test *)
 Let pQ  := (pT + t2)%nat.     (* BEQ rt r0 loop *)
 Let pC2 := S pQ.              (* XORI *)
 Let pJ  := S pC2.             (* BRA exit *)
-Let pL  := S pJ.              (* loop: XORI rt 1 *)
+Let pL  := S pJ.              (* loop: NOP *)
 Let pS  := S pL.              (* S2 *)
 Let pR  := (pS + lb)%nat.     (* the re-entry assertion *)
-Let pC3 := (pR + t1)%nat.     (* XORI *)
-Let pN3 := S pC3.             (* BNE rt r0 finish (re-entry) *)
+Let pN3 := (pR + t1)%nat.     (* BNE rt r0 finish (re-entry) *)
 Let pBk := S pN3.             (* BRA do *)
 Let pX  := S pBk.             (* exit: NOP *)
 
@@ -558,17 +560,16 @@ Let pX  := S pBk.             (* exit: NOP *)
 Let A0 := pre ++ ops T1 ++ [(None, COp (IXori b 1)); (None, CBne b 0%nat fin)].
 Let A1 := A0 ++ LA ++ ops_l ltest T2.
 Let A4 := A1 ++ [(None, CBeq b 0%nat lloop); (None, COp (IXori b 1)); (None, CBra lexit)].
-Let A5 := A4 ++ [(Some lloop, COp (IXori b 1))].
+Let A5 := A4 ++ [(Some lloop, COp nop)].
 Let A6 := A5 ++ pb ++ ops T1.
-Let A8 := A6 ++ [(None, COp (IXori b 1)); (None, CBne b 0%nat fin); (None, CBra ldo)].
+Let A8 := A6 ++ [(None, CBne b 0%nat fin); (None, CBra ldo)].
 Let Z9 := (Some lexit, COp nop) :: post.
-Let postS := ops T1 ++ (None, COp (IXori b 1)) :: (None, CBne b 0%nat fin)
-             :: (None, CBra ldo) :: Z9.
+Let postS := ops T1 ++ (None, CBne b 0%nat fin) :: (None, CBra ldo) :: Z9.
 Let postD := ops_l ltest T2 ++ (None, CBeq b 0%nat lloop) :: (None, COp (IXori b 1))
-             :: (None, CBra lexit) :: (Some lloop, COp (IXori b 1)) :: pb ++ postS.
+             :: (None, CBra lexit) :: (Some lloop, COp nop) :: pb ++ postS.
 
 Ltac len_solve :=
-  unfold pX, pBk, pN3, pC3, pR, pS, pL, pJ, pC2, pQ, pT, pDo, pE1, pK, lb, la, t2, t1, n0,
+  unfold pX, pBk, pN3, pR, pS, pL, pJ, pC2, pQ, pT, pDo, pE1, pK, lb, la, t2, t1, n0,
          A8, A6, A5, A4, A1, A0, T1, T2 in *;
   repeat first [ rewrite length_app | rewrite length_ops | rewrite length_ops_l
                | progress cbn [length] ];
@@ -641,28 +642,21 @@ Proof.
   eapply nth_error_at. unfold P, A1, A0, loop_code; norm_app; reflexivity.
 Qed.
 
-Lemma nth_L : nth_error P pL = Some (Some lloop, COp (IXori b 1)).
+Lemma nth_L : nth_error P pL = Some (Some lloop, COp nop).
 Proof.
   replace pL with (length A4) by len_solve.
   eapply nth_error_at. unfold P, A4, A1, A0, loop_code; norm_app; reflexivity.
 Qed.
 
-Lemma nth_C3 : nth_error P pC3 = Some (None, COp (IXori b 1)).
-Proof.
-  replace pC3 with (length A6) by len_solve.
-  eapply nth_error_at. unfold P, A6, A5, A4, A1, A0, loop_code; norm_app; reflexivity.
-Qed.
-
 Lemma nth_N3 : nth_error P pN3 = Some (None, CBne b 0%nat fin).
 Proof.
-  replace pN3 with (length (A6 ++ [(None, COp (IXori b 1))])) by len_solve.
+  replace pN3 with (length A6) by len_solve.
   eapply nth_error_at. unfold P, A6, A5, A4, A1, A0, loop_code; norm_app; reflexivity.
 Qed.
 
 Lemma nth_Bk : nth_error P pBk = Some (None, CBra ldo).
 Proof.
-  replace pBk with (length (A6 ++ [(None, COp (IXori b 1)); (None, CBne b 0%nat fin)]))
-    by len_solve.
+  replace pBk with (length (A6 ++ [(None, CBne b 0%nat fin)])) by len_solve.
   eapply nth_error_at. unfold P, A6, A5, A4, A1, A0, loop_code; norm_app; reflexivity.
 Qed.
 
@@ -840,12 +834,12 @@ Proof.
   now rewrite step_nop.
 Qed.
 
-(** *** The exit test when it fails: [rt := 0], jump to [loop], [rt := 1] *)
+(** *** The exit test when it fails: [rt] stays 0, jump to [loop] (a NOP) *)
 
 Lemma iter_steps : forall R M σ,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   eval σ e2 = 0 ->
-  steps P (mkC pT 0 (mkState R M)) (mkC pS 0 (mkState (rupd b 1 R) M)).
+  steps P (mkC pT 0 (mkState R M)) (mkC pS 0 (mkState R M)).
 Proof.
   intros R M σ Hmod Hcl H0 He2.
   assert (Hb0 : R b = 0) by (apply Hcl; lia).
@@ -867,10 +861,10 @@ Proof.
   eapply steps_step.
   { eapply cstep_beq_direct_taken; [apply nth_Q | apply find_lloop |].
     cbn [regs]. congruence. }
-  (* loop: XORI rt 1 *)
+  (* loop: NOP *)
   apply steps_one.
-  rewrite (cstep_op P pL 0 _ (Some lloop) (IXori b 1)) by apply nth_L.
-  cbn [step regs mem]. now rewrite Hb0.
+  rewrite (cstep_op P pL 0 _ (Some lloop) nop) by apply nth_L.
+  now rewrite step_nop.
 Qed.
 
 (** *** S2 *)
@@ -888,43 +882,39 @@ Proof.
   exact Hst.
 Qed.
 
-(** *** Re-entry: [rt := (1 xor (e1 != 0)) xor 1], reaching the re-entry `BNE` *)
+(** *** Re-entry: [rt := e1 != 0], reaching the re-entry `BNE` *)
 
 Lemma reentry_check : forall R M σ,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
-  steps P (mkC pR 0 (mkState (rupd b 1 R) M))
-          (mkC pN3 0 (mkState (rupd b (Z.lxor (Z.lxor 1 (truth (eval σ e1))) 1) R) M)).
+  steps P (mkC pR 0 (mkState R M))
+          (mkC pN3 0 (mkState (rupd b (truth (eval σ e1)) R) M)).
 Proof.
   intros R M σ Hmod Hcl H0.
-  assert (HT1 : run T1 (mkState (rupd b 1 R) M)
-                = mkState (rupd b (Z.lxor 1 (truth (eval σ e1))) R) M).
+  assert (Hb0 : R b = 0) by (apply Hcl; lia).
+  assert (HT1 : run T1 (mkState R M) = mkState (rupd b (truth (eval σ e1)) R) M).
   { unfold T1. rewrite (flag_block_spec e1 b _ σ).
-    - cbn [regs mem]. now rewrite rupd_same, rupd_shadow.
+    - cbn [regs mem]. now rewrite Hb0, Z.lxor_0_l.
     - exact Hmod.
-    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia.
-    - cbn [regs]; rewrite rupd_other by lia; exact H0.
+    - intros r Hr; apply Hcl; lia.
+    - exact H0.
     - exact Hb. }
   replace pR with (length (A5 ++ pb)) by len_solve.
-  eapply steps_trans.
-  { eapply (steps_ops T1 P (A5 ++ pb)).
-    unfold P, A5, A4, A1, A0, LA, loop_code; norm_app; reflexivity. }
-  rewrite HT1.
-  replace (length (A5 ++ pb) + length T1)%nat with pC3 by len_solve.
-  apply steps_one.
-  rewrite (cstep_op P pC3 0 _ None (IXori b 1)) by apply nth_C3.
-  cbn [step regs mem]. now rewrite rupd_same, rupd_shadow.
+  replace pN3 with (length (A5 ++ pb) + length T1)%nat by len_solve.
+  rewrite <- HT1.
+  eapply (steps_ops T1 P (A5 ++ pb)).
+  unfold P, A5, A4, A1, A0, LA, loop_code; norm_app; reflexivity.
 Qed.
 
-(** A false re-entry assertion (as the source requires): restore, jump back to [do]. *)
+(** A false re-entry assertion (as the source requires): [rt] is 0, jump back to [do]. *)
 Lemma back_steps : forall R M σ,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   eval σ e1 = 0 ->
-  steps P (mkC pR 0 (mkState (rupd b 1 R) M)) (mkC pDo 0 (mkState R M)).
+  steps P (mkC pR 0 (mkState R M)) (mkC pDo 0 (mkState R M)).
 Proof.
   intros R M σ Hmod Hcl H0 He1.
   assert (Hb0 : R b = 0) by (apply Hcl; lia).
   eapply steps_trans; [apply (reentry_check R M σ Hmod Hcl H0) |].
-  rewrite He1, truth_0. change (Z.lxor (Z.lxor 1 0) 1) with 0.
+  rewrite He1, truth_0.
   rewrite rupd_zero by exact Hb0.
   eapply steps_step.
   { eapply cstep_bne_direct_not_taken; [apply nth_N3 | cbn [regs]; congruence]. }
@@ -936,11 +926,11 @@ Qed.
 Lemma back_violation : forall R M σ f,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   eval σ e1 <> 0 -> find_label fin P = Some f ->
-  steps P (mkC pR 0 (mkState (rupd b 1 R) M)) (mkC f 0 (mkState (rupd b 1 R) M)).
+  steps P (mkC pR 0 (mkState R M)) (mkC f 0 (mkState (rupd b 1 R) M)).
 Proof.
   intros R M σ f Hmod Hcl H0 He1 Hf.
   eapply steps_trans; [apply (reentry_check R M σ Hmod Hcl H0) |].
-  rewrite (truth_nz _ He1). change (Z.lxor (Z.lxor 1 1) 1) with 1.
+  rewrite (truth_nz _ He1).
   apply steps_one.
   eapply cstep_bne_direct_taken; [apply nth_N3 | exact Hf |].
   cbn [regs]. rewrite rupd_same, rupd_other by lia. lia.
@@ -977,8 +967,8 @@ Qed.
 Lemma loop_round : forall R M σ σ1 σ2,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   frag_spec pa (n + 4)%nat na σ σ1 (mkState R M) -> eval σ1 e2 = 0 ->
-  (forall M1, models (mkState (rupd b 1 R) M1) σ1 ->
-              frag_spec pb na nc σ1 σ2 (mkState (rupd b 1 R) M1)) ->
+  (forall M1, models (mkState R M1) σ1 ->
+              frag_spec pb na nc σ1 σ2 (mkState R M1)) ->
   eval σ2 e1 = 0 ->
   exists M2,
     steps P (mkC (length pre + S (S (length (flag_block e1 b)))) 0 (mkState R M))
@@ -987,8 +977,7 @@ Lemma loop_round : forall R M σ σ1 σ2,
 Proof.
   intros R M σ σ1 σ2 Hmod Hcl H0 IHa He2 IHc He1.
   destruct (do_steps _ _ _ IHa) as [[R1 M1] [Hst1 [Hm1 Hr1]]]; cbn [regs] in Hr1; subst R1.
-  assert (Hm1' : models (mkState (rupd b 1 R) M1) σ1) by exact Hm1.
-  destruct (s2_steps _ _ _ (IHc M1 Hm1')) as [[R2 M2] [Hst2 [Hm2 Hr2]]];
+  destruct (s2_steps _ _ _ (IHc M1 Hm1)) as [[R2 M2] [Hst2 [Hm2 Hr2]]];
     cbn [regs] in Hr2; subst R2.
   exists M2. split; [| exact Hm2].
   rewrite pDo_eq.
@@ -1003,8 +992,8 @@ Qed.
 Lemma loop_more : forall R M σ σ1 σ2 σ',
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   frag_spec pa (n + 4)%nat na σ σ1 (mkState R M) -> eval σ1 e2 = 0 ->
-  (forall M1, models (mkState (rupd b 1 R) M1) σ1 ->
-              frag_spec pb na nc σ1 σ2 (mkState (rupd b 1 R) M1)) ->
+  (forall M1, models (mkState R M1) σ1 ->
+              frag_spec pb na nc σ1 σ2 (mkState R M1)) ->
   eval σ2 e1 = 0 ->
   (forall M2, models (mkState R M2) σ2 ->
      exists ms',
@@ -1028,8 +1017,8 @@ Lemma loop_first_reentry_violation : forall R M σ σ1 σ2 f,
   models (mkState R M) σ -> clean_above b (mkState R M) -> R 0%nat = 0 ->
   eval σ e1 <> 0 ->
   frag_spec pa (n + 4)%nat na σ σ1 (mkState R M) -> eval σ1 e2 = 0 ->
-  (forall M1, models (mkState (rupd b 1 R) M1) σ1 ->
-              frag_spec pb na nc σ1 σ2 (mkState (rupd b 1 R) M1)) ->
+  (forall M1, models (mkState R M1) σ1 ->
+              frag_spec pb na nc σ1 σ2 (mkState R M1)) ->
   eval σ2 e1 <> 0 -> find_label fin P = Some f ->
   exists M2,
     steps P (mkC (length pre) 0 (mkState R M)) (mkC f 0 (mkState (rupd b 1 R) M2))
@@ -1037,8 +1026,7 @@ Lemma loop_first_reentry_violation : forall R M σ σ1 σ2 f,
 Proof.
   intros R M σ σ1 σ2 f Hmod Hcl H0 He1 IHa He2 IHc He1' Hf.
   destruct (do_steps _ _ _ IHa) as [[R1 M1] [Hst1 [Hm1 Hr1]]]; cbn [regs] in Hr1; subst R1.
-  assert (Hm1' : models (mkState (rupd b 1 R) M1) σ1) by exact Hm1.
-  destruct (s2_steps _ _ _ (IHc M1 Hm1')) as [[R2 M2] [Hst2 [Hm2 Hr2]]];
+  destruct (s2_steps _ _ _ (IHc M1 Hm1)) as [[R2 M2] [Hst2 [Hm2 Hr2]]];
     cbn [regs] in Hr2; subst R2.
   exists M2. split; [| exact Hm2].
   eapply steps_trans; [eapply entry_steps; eassumption |].
@@ -1247,14 +1235,11 @@ Proof.
     { intros pre' post' Hpre' Hpost'.
       apply (IHa (S b) (n + 4)%nat pa na (mkState R M) pre' post' Hwfa Ea ltac:(lia) Hmod);
         [intros r Hr; apply Hcl; lia | exact H0 | exact Hpre' | exact Hpost']. }
-    assert (IHc' : forall M1, models (mkState (rupd b 1 R) M1) σ1 ->
-                   frag_spec pc na nc σ1 σ2 (mkState (rupd b 1 R) M1)).
+    assert (IHc' : forall M1, models (mkState R M1) σ1 ->
+                   frag_spec pc na nc σ1 σ2 (mkState R M1)).
     { intros M1 Hm1 pre' post' Hpre' Hpost'.
-      apply (IHc (S b) na pc nc (mkState (rupd b 1 R) M1) pre' post' Hwfc Ec ltac:(lia) Hm1).
-      - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia.
-      - cbn [regs]; rewrite rupd_other by lia; exact H0.
-      - exact Hpre'.
-      - exact Hpost'. }
+      apply (IHc (S b) na pc nc (mkState R M1) pre' post' Hwfc Ec ltac:(lia) Hm1);
+        [intros r Hr; apply Hcl; lia | exact H0 | exact Hpre' | exact Hpost']. }
     assert (IHlp' : forall M2, models (mkState R M2) σ2 ->
        exists ms',
          steps (pre ++ loop_code fin b n e1 e2 pa pc ++ post)
@@ -1452,15 +1437,12 @@ Proof.
     apply (compile_l_spec fin a σ σ1 Ha (S b) (n + 4)%nat pa na (mkState R M) pre' post'
              Hwfa Ea ltac:(lia) Hmod);
       [intros r Hr; apply Hcl; lia | exact H0 | exact Hpre' | exact Hpost']. }
-  assert (IHc' : forall M1, models (mkState (rupd b 1 R) M1) σ1 ->
-                 frag_spec pc na nc σ1 σ2 (mkState (rupd b 1 R) M1)).
+  assert (IHc' : forall M1, models (mkState R M1) σ1 ->
+                 frag_spec pc na nc σ1 σ2 (mkState R M1)).
   { intros M1 Hm1 pre' post' Hpre' Hpost'.
-    apply (compile_l_spec fin c σ1 σ2 Hc (S b) na pc nc (mkState (rupd b 1 R) M1) pre' post'
-             Hwfc Ec ltac:(lia) Hm1).
-    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia.
-    - cbn [regs]; rewrite rupd_other by lia; exact H0.
-    - exact Hpre'.
-    - exact Hpost'. }
+    apply (compile_l_spec fin c σ1 σ2 Hc (S b) na pc nc (mkState R M1) pre' post'
+             Hwfc Ec ltac:(lia) Hm1);
+      [intros r Hr; apply Hcl; lia | exact H0 | exact Hpre' | exact Hpost']. }
   eapply (loop_first_reentry_violation pre post b n na nc e1 e2 pa pc fin)
     with (σ := σ) (σ1 := σ1).
   all: loop_side.

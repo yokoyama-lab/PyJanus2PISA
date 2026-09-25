@@ -263,17 +263,16 @@ Fixpoint has_call (st : pstmt) : bool :=
   end.
 
 (** Well-formedness: [wf_stmt] on the straight-line leaves (no aliased
-    swap), and **no call in the [loop] part of a loop**.  The latter is not
-    a Janus restriction; it is what the layout of `codegen.py` needs, and it
-    is necessary: `_gen_from` runs S2 with the loop's flag register at 1,
-    while a procedure body is compiled assuming every scratch register is 0
-    (see [s2_call_counterexample] in TestProc.v). *)
+    swap), and nothing else: calls may occur anywhere.  (While `_gen_from`
+    ran the [loop] part S2 with the loop's flag register at 1, a call in S2
+    was miscompiled, and [wf_p] required [has_call c = false] there; now S2
+    runs with the flag at 0 — see [s2_call_works] in TestProc.v.) *)
 Fixpoint wf_p (st : pstmt) : Prop :=
   match st with
   | PBase s         => wf_stmt s
   | PSeq a c        => wf_p a /\ wf_p c
   | PIf _ a c _     => wf_p a /\ wf_p c
-  | PLoop _ a c _   => wf_p a /\ wf_p c /\ has_call c = false
+  | PLoop _ a c _   => wf_p a /\ wf_p c
   | PCall _ | PUncall _ => True
   end.
 
@@ -294,7 +293,7 @@ Qed.
 Lemma wf_p_invert : forall st, wf_p st -> wf_p (invert_p st).
 Proof.
   induction st; simpl; try tauto.
-  all: first [ apply wf_invert | intros [H1 [H2 H3]]; rewrite ?has_call_invert; tauto ].
+  apply wf_invert.
 Qed.
 
 (** ** A fuel interpreter, sound for [exec_p] *)

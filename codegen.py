@@ -1117,30 +1117,39 @@ class CodeGen:
         from e1 do S1 loop S2 until e2
 
                 <rt ^= e1>           ; entry assertion: e1 must hold
-                XORI rt 1
+                XORI rt 1            ; rt = 0 iff e1
                 BNE rt r0 finish     ; violated -> halt with rt = 1
-        do:     <S1 (do body)>
+        do:     <S1 (do body)>       ; rt = 0
         test:   <rt ^= e2>           ; exit test
-                BEQ rt r0 loop_body
-                XORI rt 1
+                BEQ rt r0 loop       ; e2 false: rt is already 0
+                XORI rt 1            ; e2 true: rt 1 -> 0
                 BRA exit
-        loop_body:
-                XORI rt 1
-                <S2 (loop body)>
-                <rt ^= e1>           ; re-entry assertion: e1 must NOT hold
-                XORI rt 1
-                BNE rt r0 finish     ; violated -> halt with rt = 1
-                BRA do
-        exit:   ...
+        loop:   ADDI r0 0            ; landing NOP (removed by remove_nops)
+                <S2 (loop body)>     ; rt = 0
+                <rt ^= e1>           ; re-entry assertion: rt = e1
+                BNE rt r0 finish     ; e1 must NOT hold; violated -> rt = 1
+                BRA do               ; rt = 0
+        exit:   ADDI r0 0            ; rt = 0
 
-        rt is 0 at `do` and at `exit`.  e1 and e2 are normalised to 0/1 by
-        _as_flag, so every flag update is an XOR with a known bit and rt is
-        restored by XORI instead of being wiped (`XOR rt rt`, which discarded
-        the assertion and is not reversible).  A violated assertion cannot be
-        left in rt as `_gen_if` does, because rt steers the loop test: a stale
-        1 at `test` would flip the exit decision and could clear itself.  So
-        the violation jumps to `finish`, where the interpreter reports the
-        nonzero rt as garbage.  A correct program never takes these branches.
+        rt is 0 whenever S1 or S2 runs, and at `do`, `loop` and `exit`.  This
+        matters beyond tidiness: a `call` in S1 or S2 runs a callee whose body
+        was compiled assuming the registers from r3 up are clean, and rt is one
+        of them.  S2 used to run with rt = 1 (`loop: XORI rt 1 ; <S2> ; <rt ^=
+        e1> ; XORI rt 1 ; ...`), so in `from i = 0 do i += 1 loop call f until
+        i = 3; call f` with `f: c += 5` f's body ran on a dirty r3 and the
+        program ended with c = 5 instead of Janus's 15.  After `BEQ rt r0
+        loop` is taken rt *is* 0, so the two XORIs around S2 were dropped; `loop:`
+        heads a labeled NOP (instead of S2's first line, as `do:` does for
+        S1) so that the layout does not depend on S2's first instruction.
+
+        e1 and e2 are normalised to 0/1 by _as_flag, so every flag update is
+        an XOR with a known bit and rt is restored by XORI instead of being
+        wiped (`XOR rt rt`, which discarded the assertion and is not
+        reversible).  A violated assertion cannot be left in rt as `_gen_if`
+        does, because rt steers the loop test: a stale 1 at `test` would flip
+        the exit decision and could clear itself.  So the violation jumps to
+        `finish`, where the interpreter reports the nonzero rt as garbage.  A
+        correct program never takes these branches.
         """
         test_label = self.fresh_label("from_test")
         loop_body = self.fresh_label("from_loop")
@@ -1178,14 +1187,15 @@ class CodeGen:
         code.append(self._emit(BRA(exit_label)))
 
         # --- Loop body ---
-        loop_code = [self._emit(XORI(rt, 1), loop_body)]
+        # The BEQ above is taken only when rt = 0, so S2 runs with a clean
+        # flag (a callee in S2 relies on it).  The label sits on a NOP.
+        loop_code = [self._emit(ADDI("r0", 0), loop_body)]  # NOP with label
 
         body_code = self.gen_stmt(stmt.loop_)
         loop_code.extend(body_code)
 
-        # Re-entry assertion: rt = 1 ^ e1, which is 1 exactly when e1 is false.
+        # Re-entry assertion: rt = e1, which must be 0 (e1 false).
         loop_code.extend(self._gen_flag_xor(rt, from_))
-        loop_code.append(self._emit(XORI(rt, 1)))
         loop_code.append(self._emit(BNE(rt, "r0", ASSERT_FAIL_LABEL)))
 
         loop_code.append(self._emit(BRA(entry_do)))
