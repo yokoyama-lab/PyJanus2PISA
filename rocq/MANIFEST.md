@@ -519,11 +519,12 @@ cd .. && python3 tools/rocq_diff.py
 
 Currently 8/8 programs agree (re-run 2026-09-25 after `ISltx` was added to
 `PISA.instr`: the extracted `.ml`/`.mli` files were regenerated from
-Extract.v and `driver.ml` prints `SLTX`). Known issue, not fixed here:
-`Makefile.driver`'s `DRIVER_ML` lists only `PISA.ml Src.ml Compile.ml
-driver.ml`, but the extracted modules `open BinInt` etc., so the driver has to
-be linked with the full list in dependency order (`BinNums Datatypes PeanoNat
-PosDef NatDef ListDef List BinInt PISA Src Compile driver`). `ExtrOcamlNatInt`/`ExtrOcamlZInt` realise `nat`
+Extract.v and `driver.ml` prints `SLTX`). `Makefile.driver` used to list only
+`PISA.ml Src.ml Compile.ml driver.ml`, which stopped linking (`Unbound module
+"BinInt"`) once the extracted modules started to `open BinInt` etc.; it now
+links every extracted `.ml`/`.mli` in `ocamldep -sort` order and builds the
+`.vo` it needs itself, so it works from a clean checkout (2026-09-25).
+`ExtrOcamlNatInt`/`ExtrOcamlZInt` realise `nat`
 and `Z` by OCaml's native `int`, which the theorems do *not* cover — they are
 about unbounded `nat`/`Z`, so the extracted code inherits them only while no
 value overflows a 63-bit int.

@@ -23,6 +23,7 @@ PosDef.ml*
 Src.ml*
 # driver.ml is hand-written and IS tracked
 driver
+.extracted
 *.cmi
 *.cmx
 *.cmo
