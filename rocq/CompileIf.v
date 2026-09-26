@@ -24,9 +24,10 @@
             BNE rt r0 finish                               -- violated: halt, rt = 1
 >>
 
-    [rt ^= _as_flag(e)] is [flag_block]: `_as_flag` leaves the constants
-    0 and 1 alone and turns every other expression of [Src.expr] into
-    [e != 0], computed with two [SLTX] against [r0] (see [nz_block]).
+    [rt ^= _as_flag(e)] is [flag_block]: `_as_flag` leaves comparisons,
+    [&&] / [||] and the constants 0 and 1 alone ([is_flag_expr]) and turns
+    every other expression of [Src.expr] into [e != 0], computed with two
+    [SLTX] against [r0] (see [nz_block]).
 
     Three facts about this layout drive the proof:
 
@@ -69,7 +70,7 @@ Definition gen_assign_at (b : reg) (x : var) (o : aop) (e : expr) : code :=
      ; aop_instr o (S (S b)) b
      ; IExch (S (S b)) (S b)
      ; ISubi (S b) (Z.of_nat x) ]
-  ++ invert_code (gen_expr e b).
+  ++ ungen_expr e b.
 
 Definition gen_swap_at (b : reg) (x y : var) : code :=
   [ IAddi b (Z.of_nat x)
@@ -92,28 +93,28 @@ Fixpoint compile_at (b : reg) (st : stmt) : code :=
 Lemma compile_at_scratch : forall st, compile_at scratch st = compile st.
 Proof. induction st; simpl; try reflexivity. now rewrite IHst1, IHst2. Qed.
 
-Lemma wf_compile_at : forall b st, wf_code (compile_at b st).
+Lemma wf_compile_at : forall b st, arith_stmt st = true -> wf_code (compile_at b st).
 Proof.
-  intros b st; induction st as [| x o e | x y | s1 IH1 s2 IH2]; simpl.
+  intros b st; induction st as [| x o e | x y | s1 IH1 s2 IH2]; simpl; intro H.
   - apply Forall_nil.
-  - unfold gen_assign_at.
-    apply wf_code_app; [apply wf_gen_expr |].
+  - unfold gen_assign_at. rewrite (ungen_arith e b H).
+    apply wf_code_app; [apply wf_gen_expr, H |].
     repeat (apply Forall_cons; [destruct o; simpl; first [exact I | lia] |]).
-    apply wf_invert_code, wf_gen_expr.
+    apply wf_invert_code, wf_gen_expr, H.
   - unfold gen_swap_at; wf_list.
-  - now apply wf_code_app.
+  - apply andb_prop in H as [H1 H2]. apply wf_code_app; auto.
 Qed.
 
 (** The proofs below are those of Compile.v with [scratch] generalized. *)
 
 Lemma gen_assign_at_spec : forall b x o e s σ,
   occurs x e = false ->
-  models s σ -> clean_above b s ->
+  models s σ -> clean_above b s -> regs s 0%nat = 0 -> b <> 0%nat ->
   run (gen_assign_at b x o e) s
   = mkState (regs s)
             (mupd (Z.of_nat x) (adenote o (σ x) (eval σ e)) (mem s)).
 Proof.
-  intros b x o e [R M] σ Hocc Hmod Hcl; cbn [regs mem] in *.
+  intros b x o e [R M] σ Hocc Hmod Hcl Hr0 Hb; cbn [regs mem] in *.
   assert (H0 : R b = 0) by (apply Hcl; lia).
   assert (H1 : R (S b) = 0) by (apply Hcl; lia).
   assert (H2 : R (S (S b)) = 0) by (apply Hcl; lia).
@@ -136,23 +137,15 @@ Proof.
          try (now rewrite H1); try (now rewrite H2); try reflexivity);
     try (rewrite mupd_shadow; reflexivity). }
   unfold gen_assign_at.
-  rewrite run_app, (gen_expr_spec e b (mkState R M) σ Hmod Hcl); cbn [regs mem].
+  rewrite run_app, (gen_expr_spec e b (mkState R M) σ Hmod Hcl Hr0 Hb); cbn [regs mem].
   rewrite run_app, Hblock.
   assert (Hmod' : models (mkState R (mupd (Z.of_nat x) (adenote o (σ x) (eval σ e)) M))
                          (update σ x (adenote o (σ x) (eval σ e))))
     by (apply (models_update (mkState R M) σ x (adenote o (σ x) (eval σ e))); exact Hmod).
-  assert (Hcl' : clean_above b
-                   (mkState R (mupd (Z.of_nat x) (adenote o (σ x) (eval σ e)) M)))
-    by exact Hcl.
   assert (Hev : eval (update σ x (adenote o (σ x) (eval σ e))) e = eval σ e)
     by (now apply eval_update_notin).
-  assert (Hunc : mkState (rupd b (eval σ e) R)
-                         (mupd (Z.of_nat x) (adenote o (σ x) (eval σ e)) M)
-                 = run (gen_expr e b)
-                       (mkState R (mupd (Z.of_nat x) (adenote o (σ x) (eval σ e)) M))).
-  { rewrite (gen_expr_spec e b _ _ Hmod' Hcl'); cbn [regs mem]. now rewrite Hev. }
-  rewrite Hunc.
-  apply run_invert_code; apply wf_gen_expr.
+  rewrite <- Hev at 1.
+  exact (ungen_expr_spec e b R _ _ Hmod' Hcl Hr0 Hb).
 Qed.
 
 Lemma gen_swap_at_spec : forall b x y s σ,
@@ -188,13 +181,14 @@ Qed.
 
 Theorem compile_at_spec : forall b st σ σ' ms,
   exec st σ σ' -> wf_stmt st ->
-  models ms σ -> clean_above b ms ->
+  models ms σ -> clean_above b ms -> regs ms 0%nat = 0 -> b <> 0%nat ->
   models (run (compile_at b st) ms) σ' /\ regs (run (compile_at b st) ms) = regs ms.
 Proof.
-  intros b st σ σ' ms H; revert ms; induction H; intros ms Hwf Hmod Hcl.
+  intros b st σ σ' ms H Hwf0 Hmod0 Hcl0 Hr00 Hb; revert ms Hwf0 Hmod0 Hcl0 Hr00.
+  induction H; intros ms Hwf Hmod Hcl Hr0.
   - split; [exact Hmod | reflexivity].
   - cbn [compile_at].
-    rewrite (gen_assign_at_spec b x o e ms s H Hmod Hcl); cbn [regs mem]; split.
+    rewrite (gen_assign_at_spec b x o e ms s H Hmod Hcl Hr0 Hb); cbn [regs mem]; split.
     + apply (models_update ms s x). exact Hmod.
     + reflexivity.
   - cbn [wf_stmt] in Hwf; cbn [compile_at].
@@ -212,37 +206,39 @@ Proof.
         apply Hmod.
   - cbn [wf_stmt] in Hwf; destruct Hwf as [Hwf1 Hwf2]; cbn [compile_at].
     rewrite run_app.
-    destruct (IHexec1 ms Hwf1 Hmod Hcl) as [Hm1 Hr1].
+    destruct (IHexec1 ms Hwf1 Hmod Hcl Hr0) as [Hm1 Hr1].
     assert (Hcl1 : clean_above b (run (compile_at b s1) ms))
       by (intros r Hr; rewrite Hr1; now apply Hcl).
-    destruct (IHexec2 (run (compile_at b s1) ms) Hwf2 Hm1 Hcl1) as [Hm2 Hr2].
+    destruct (IHexec2 (run (compile_at b s1) ms) Hwf2 Hm1 Hcl1 ltac:(now rewrite Hr1))
+      as [Hm2 Hr2].
     split; [exact Hm2 | now rewrite Hr2, Hr1].
 Qed.
 
 (** ** The test / assertion block: [rt := rt xor e]
 
-    Evaluate [e] into [S rt], XOR it into [rt], unevaluate.  Memory and every
-    register other than [rt] are untouched; [rt] may hold anything. *)
+    Evaluate [e] into [S rt], XOR it into [rt], unevaluate (`_gen_flag_xor`).
+    Memory and every register other than [rt] are untouched; [rt] may hold
+    anything. *)
 
 Definition xor_block (e : expr) (rt : reg) : code :=
-  gen_expr e (S rt) ++ IXor rt (S rt) :: invert_code (gen_expr e (S rt)).
+  gen_expr e (S rt) ++ IXor rt (S rt) :: ungen_expr e (S rt).
 
 Lemma xor_block_spec : forall e rt s σ,
-  models s σ -> clean_above (S rt) s ->
+  models s σ -> clean_above (S rt) s -> regs s 0%nat = 0 -> rt <> 0%nat ->
   run (xor_block e rt) s
   = mkState (rupd rt (Z.lxor (regs s rt) (eval σ e)) (regs s)) (mem s).
 Proof.
-  intros e rt [R M] σ Hmod Hcl; unfold xor_block; cbn [regs mem].
-  rewrite run_app, (gen_expr_spec e (S rt) (mkState R M) σ Hmod Hcl); cbn [regs mem].
+  intros e rt [R M] σ Hmod Hcl H0 Hrt; unfold xor_block; cbn [regs mem] in *.
+  rewrite run_app, (gen_expr_spec e (S rt) (mkState R M) σ Hmod Hcl H0) by lia;
+    cbn [regs mem].
   rewrite run_cons; cbn [step regs mem].
   rewrite rupd_same, rupd_other by lia.
-  assert (HX : mkState (rupd rt (Z.lxor (R rt) (eval σ e)) (rupd (S rt) (eval σ e) R)) M
-             = run (gen_expr e (S rt)) (mkState (rupd rt (Z.lxor (R rt) (eval σ e)) R) M)).
-  { rewrite (gen_expr_spec e (S rt) _ σ).
-    - cbn [regs mem]. now rewrite (rupd_comm rt (S rt)) by lia.
-    - exact Hmod.
-    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia. }
-  rewrite HX, run_invert_code by apply wf_gen_expr. reflexivity.
+  rewrite (rupd_comm rt (S rt)) by lia.
+  apply (ungen_expr_spec e (S rt) _ M σ).
+  - exact Hmod.
+  - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia.
+  - rewrite rupd_other by lia; exact H0.
+  - lia.
 Qed.
 
 Lemma xor_block_nonempty : forall e rt, xor_block e rt <> [].
@@ -252,17 +248,15 @@ Proof. intros e rt; unfold xor_block; destruct (gen_expr e (S rt)); discriminate
 
     Janus reads a test as true when it is nonzero.  `codegen.py` XORs tests
     and assertions into a 0/1 path flag, so `_as_flag` keeps a test that is
-    already 0/1 — a comparison, a logical operator, or the constant 0 or 1 —
-    and rewrites every other [e] to [e != 0].  The source expressions here
-    ([Src.expr]: constants, variables, [+ - ^]) contain no comparison, so the
-    rule is: [Cst 0] and [Cst 1] unchanged ([xor_block]), anything else
-    through [e != 0].
+    already 0/1 — a comparison, a logical operator, or the constant 0 or 1
+    ([is_flag_expr], Compile.v) — and rewrites every other [e] to [e != 0].
 
     [e != 0] is compiled by `_gen_nonzero` / `_nonzero_into` into a fresh
     register [rf]: evaluate [e], [SLTX rf v r0 ; SLTX rf r0 v] (the two bits
     [v < 0] and [0 < v] are exclusive, so their XOR is [v <> 0]), unevaluate
-    [e].  `_gen_flag_xor` XORs [rf] into the flag and unevaluates [e != 0]
-    by running `_nonzero_into` once more, which clears [rf]:
+    [e] ([Compile.nz_code]).  `_gen_flag_xor` XORs [rf] into the flag and
+    unevaluates [e != 0] by running `_nonzero_into` once more, which clears
+    [rf]:
 
 <<
      <rf ^= (e != 0)> ; XOR rt rf ; <rf ^= (e != 0)>
@@ -277,18 +271,16 @@ Proof. reflexivity. Qed.
 Lemma truth_nz : forall v, v <> 0 -> truth v = 1.
 Proof. intros v H; unfold truth; destruct (Z.eqb_spec v 0); [contradiction | reflexivity]. Qed.
 
+Lemma truth_b2z : forall v, b2z (negb (v =? 0)) = truth v.
+Proof. intro v; unfold truth, b2z; destruct (v =? 0); reflexivity. Qed.
+
 Lemma sltx_pair : forall v,
   Z.lxor (if v <? 0 then 1 else 0) (if 0 <? v then 1 else 0) = truth v.
-Proof.
-  intro v; unfold truth.
-  destruct (Z.ltb_spec v 0), (Z.ltb_spec 0 v), (Z.eqb_spec v 0); try lia; reflexivity.
-Qed.
+Proof. intro v; rewrite <- truth_b2z; apply Compile.sltx_pair. Qed.
 
 (** [rf ^= (e != 0)], with [e]'s value in [S rf] while it is needed. *)
 Definition nz_block (e : expr) (rf : reg) : code :=
-  gen_expr e (S rf)
-  ++ ISltx rf (S rf) 0%nat :: ISltx rf 0%nat (S rf)
-  :: invert_code (gen_expr e (S rf)).
+  nz_code (gen_expr e) (ungen_expr e) rf.
 
 Lemma nz_block_spec : forall e rf s σ,
   models s σ -> clean_above (S rf) s -> regs s 0%nat = 0 -> rf <> 0%nat ->
@@ -296,26 +288,14 @@ Lemma nz_block_spec : forall e rf s σ,
   = mkState (rupd rf (Z.lxor (regs s rf) (truth (eval σ e))) (regs s)) (mem s).
 Proof.
   intros e rf [R M] σ Hmod Hcl H0 Hrf; unfold nz_block; cbn [regs mem] in *.
-  rewrite run_app, (gen_expr_spec e (S rf) (mkState R M) σ Hmod Hcl); cbn [regs mem].
-  rewrite !run_cons; cbn [step regs mem].
-  repeat first [ rewrite rupd_same | rewrite rupd_other by lia ].
-  rewrite H0, rupd_shadow, Z.lxor_assoc, sltx_pair.
-  assert (HX : mkState (rupd rf (Z.lxor (R rf) (truth (eval σ e))) (rupd (S rf) (eval σ e) R)) M
-             = run (gen_expr e (S rf))
-                   (mkState (rupd rf (Z.lxor (R rf) (truth (eval σ e))) R) M)).
-  { rewrite (gen_expr_spec e (S rf) _ σ).
-    - cbn [regs mem]. now rewrite (rupd_comm rf (S rf)) by lia.
-    - exact Hmod.
-    - intros r Hr; cbn [regs]; rewrite rupd_other by lia; apply Hcl; lia. }
-  rewrite HX, run_invert_code by apply wf_gen_expr. reflexivity.
+  rewrite (nz_code_ok _ _ rf (eval σ e) M R (gen_ungen_spec σ M Hmod e (S rf) ltac:(lia))
+             Hrf H0 Hcl).
+  now rewrite truth_b2z.
 Qed.
-
-Definition is_bool_const (e : expr) : bool :=
-  match e with Cst k => (k =? 0) || (k =? 1) | _ => false end.
 
 (** [rt ^= _as_flag(e)]: the block `_gen_flag_xor(rt, _as_flag(e))` emits. *)
 Definition flag_block (e : expr) (rt : reg) : code :=
-  if is_bool_const e then xor_block e rt
+  if is_flag_expr e then xor_block e rt
   else nz_block e (S rt) ++ IXor rt (S rt) :: nz_block e (S rt).
 
 Lemma flag_block_spec : forall e rt s σ,
@@ -324,11 +304,10 @@ Lemma flag_block_spec : forall e rt s σ,
   = mkState (rupd rt (Z.lxor (regs s rt) (truth (eval σ e))) (regs s)) (mem s).
 Proof.
   intros e rt [R M] σ Hmod Hcl H0 Hrt; unfold flag_block; cbn [regs mem] in *.
-  destruct (is_bool_const e) eqn:Eb.
-  - rewrite (xor_block_spec e rt _ σ Hmod Hcl); cbn [regs mem].
-    destruct e as [k | x | o e1 e2]; try discriminate.
-    cbn [eval] in *. apply orb_true_iff in Eb.
-    destruct Eb as [E | E]; apply Z.eqb_eq in E; subst k; reflexivity.
+  destruct (is_flag_expr e) eqn:Eb.
+  - (* a comparison, [&&] / [||], or 0 / 1: already a truth value *)
+    rewrite (xor_block_spec e rt _ σ Hmod Hcl H0 Hrt); cbn [regs mem].
+    destruct (is_flag_expr_01 σ e Eb) as [E | E]; rewrite E; reflexivity.
   - assert (HS : R (S rt) = 0) by (apply Hcl; lia).
     rewrite run_app, (nz_block_spec e (S rt) (mkState R M) σ Hmod) by
       (cbn [regs]; first [intros r Hr; apply Hcl; lia | exact H0 | lia]).
@@ -348,18 +327,21 @@ Qed.
 
 Lemma flag_block_nonempty : forall e rt, flag_block e rt <> [].
 Proof.
-  intros e rt; unfold flag_block; destruct (is_bool_const e);
+  intros e rt; unfold flag_block; destruct (is_flag_expr e);
     [apply xor_block_nonempty |].
-  unfold nz_block; destruct (gen_expr e (S (S rt))); discriminate.
+  unfold nz_block, nz_code; destruct (gen_expr e (S (S rt))); discriminate.
 Qed.
 
-(** Unlike the old `XOR rt rt` flag clear, everything in the block is a
-    well-formed (locally invertible) instruction. *)
-Lemma wf_flag_block : forall e rt, wf_code (flag_block e rt).
+(** On the original fragment ([+ - ^] tests) everything in the block is a
+    well-formed (locally invertible) instruction — unlike the old
+    `XOR rt rt` flag clear.  A comparison in a test brings `codegen.py`'s
+    garbage clears and ORX along ([Compile.compile_not_reversible]). *)
+Lemma wf_flag_block : forall e rt, arith_expr e = true -> wf_code (flag_block e rt).
 Proof.
-  intros e rt; unfold flag_block, xor_block, nz_block.
-  destruct (is_bool_const e);
-    repeat first [ apply wf_code_app | apply wf_gen_expr
+  intros e rt H; unfold flag_block, xor_block, nz_block, nz_code.
+  rewrite !ungen_arith by exact H.
+  destruct (is_flag_expr e);
+    repeat first [ apply wf_code_app | apply wf_gen_expr, H
                  | apply wf_invert_code
                  | apply Forall_cons; [cbn [wf_instr]; first [split; lia | lia] |] ].
 Qed.
@@ -1018,7 +1000,7 @@ Proof.
     intros b n p n' ms pre post Hwf Hcomp Hb Hmod Hcl H0 Hpre Hpost; simpl in Hcomp.
   - (* CBase *)
     injection Hcomp as <- <-.
-    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmod Hcl) as [Hm Hr].
+    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmod Hcl H0 Hb) as [Hm Hr].
     exists (run (compile_at b s) ms). split; [| split; assumption].
     rewrite length_ops. eapply steps_ops. reflexivity.
   - (* CSeq *)

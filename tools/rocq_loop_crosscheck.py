@@ -14,10 +14,12 @@ For each of those programs this script
   3. compiles the same program, written in Janus, with **`codegen.py`**
      (`compile_program`) and runs it on `pisa_interp.py` — same store and
      registers expected;
-  4. compares the control-flow skeleton (labels, branches, flag updates and
-     the SLTX pairs of the `e != 0` normalisation) of `codegen.py`'s
+  4. compares the control-flow skeleton (labels, branches, flag updates, the
+     SLTX pairs of the `e != 0` normalisation, and the SLTX / XORI / ORX /
+     ANDX of comparisons and `&&` / `||`, in order) of `codegen.py`'s
      *unoptimized* output with the Rocq layout, up to label renaming — i.e.
-     that `compile_l` really is `_gen_if` / `_gen_from`'s layout.
+     that `compile_l` really is `_gen_if` / `_gen_from`'s layout and emits
+     `_gen_binop` / `_gen_uneval_binop`'s operator code.
 
 The last three programs violate an entry / re-entry / `fi` assertion.  Janus
 rejects them; both compilers jump to `finish` with the flag r3 = 1, which
@@ -43,7 +45,7 @@ from parser import parse                        # noqa: E402
 from codegen import CodeGen, compile_program    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
-                  BRA, BEQ, BNE, START, FINISH, LabeledInstr)
+                  ORX, ANDX, BRA, BEQ, BNE, START, FINISH, LabeledInstr)
 
 # Overridable so that a mutated copy of the development can be checked
 # (mutation testing of this script itself).
@@ -75,6 +77,19 @@ PROGRAMS = {
     "prog_v1": f"x2 += 1\nfrom x0 do c += 1 loop {ROT} until x2\n",
     "prog_v2": "x0 += 1\nfrom x0 do c += 1 loop x2 += 1 until x2\n",
     "prog_if_v": "x2 += 5\nif x2 then c += 1 else skip fi x0\n",
+    # milestone 3: comparisons and && / || in tests (`_as_flag` keeps them)
+    "prog_cmp_and": ("x0 += 2\nx1 += 5\n"
+                     "if (x0 < 3) && (x1 != 0) then c += 1 else c += 2 fi c = 1\n"),
+    "prog_cmp_or": ("x0 += 5\n"
+                    "if (x0 < 3) || (x0 >= 7) then c += 1 else c += 2 fi (c = 1) || (c > 5)\n"),
+    "prog_cmp_loop": "from c = 0 do c += 1 loop x1 += 1 until 3 <= c\n",
+    "prog_cmp_loop2": ("from (c = 0) && (d <= 0) do c += 2 loop d += 1 "
+                       "until (c > 5) || (x1 = 7)\n"),
+    # && / || on non-Boolean operands (`_logical_operands`: 1 && 2 is 1, not 1 & 2)
+    "prog_logic_nonbool": ("x2 += 1\nx1 += 2\nif x2 && x1 then c += 1 else skip fi c\n"
+                           "if x1 || x0 then c += 10 else skip fi c\n"),
+    "prog_cmp_neg": ("x0 -= 4\nif (x0 < 0) && (x0 > 0 - 5) then c += 1 else skip fi c = 1\n"
+                     "if (x0 <= 0 - 4) && (x0 >= 0 - 4) then d += 1 else skip fi d\n"),
 }
 NVARS = 7
 
@@ -126,6 +141,8 @@ def parse_lprog(term: str) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
+                "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](args)
         else:
             args = [int(a) for a in m.group(7).split()]
@@ -149,6 +166,16 @@ def parse_result(term: str) -> dict:
             "mem": ints(m.group(3)), "regs": ints(m.group(4))}
 
 
+# Registers compared on pisa_interp.py: r3..r8 must equal the verified
+# machine's (`observe_l` reports those), r9..r31 must be 0 — comparisons and
+# `&&` / `||` use scratch registers above r8.
+ALL_REGS = range(3, 32)
+
+
+def padded(regs: list) -> list:
+    return regs + [0] * (len(ALL_REGS) - len(regs))
+
+
 def run_on_interp(code: list) -> tuple:
     wrapped = ([LabeledInstr("start", START())] + code
                + [LabeledInstr("finish", FINISH())])
@@ -156,7 +183,7 @@ def run_on_interp(code: list) -> tuple:
     m.check_clean = False          # violations end dirty; registers are compared below
     m.run()
     return ([m.mem.get(v, 0) for v in range(NVARS)],
-            [m._read_reg(f"r{r}") for r in range(3, 9)], m.br)
+            [m._read_reg(f"r{r}") for r in ALL_REGS], m.br)
 
 
 def run_codegen(src: str) -> tuple:
@@ -164,11 +191,18 @@ def run_codegen(src: str) -> tuple:
     m.check_clean = False
     m.run()
     return ([m.mem.get(v, 0) for v in range(NVARS)],
-            [m._read_reg(f"r{r}") for r in range(3, 9)])
+            [m._read_reg(f"r{r}") for r in ALL_REGS])
 
 
 def skeleton(code: list) -> list:
-    """Labels, branches, flag updates and SLTX pairs, labels renamed by first use."""
+    """Labels, branches, flag updates and SLTX pairs, labels renamed by first use.
+
+    SLTX / XORI name their register only when it is a flag register (one
+    that is branched on): the value registers of comparisons differ, because
+    Compile.v puts an operator's result in its target register and the
+    operands above it, while `codegen.py` allocates the result after the
+    operands.  ORX / ANDX (`=`, `!=`, `&&`, `||`) are listed by name.
+    """
     names = {}
 
     def ren(lab):
@@ -190,11 +224,14 @@ def skeleton(code: list) -> list:
         elif isinstance(i, XOR) and i.rd == i.rs and i.rd in flags:
             out.append((lb, "XOR", i.rd, i.rs))
         elif isinstance(i, XORI):
-            out.append((lb, "XORI", i.rd, i.c))
+            out.append((lb, "XORI", i.rd if i.rd in flags else "v", i.c))
         elif isinstance(i, SLTX):
             # the value register differs (Compile.v's gen_expr vs codegen's
             # register allocator); the flag register and the r0 side do not
-            out.append((lb, "SLTX", i.rd, i.rs == "r0", i.rt == "r0"))
+            out.append((lb, "SLTX", i.rd if i.rd in flags else "v",
+                        i.rs == "r0", i.rt == "r0"))
+        elif isinstance(i, (ORX, ANDX)):
+            out.append((lb, kind))
         elif isinstance(i, ADDI) and i.rd == "r0":
             out.append((lb, "NOP"))
         elif li.label:
@@ -220,11 +257,11 @@ def main() -> int:
         if not want["end"] or want["br"] != 0:
             problems.append(f"verified machine did not terminate cleanly: {want}")
         mem, regs, br = run_on_interp(code)
-        if (mem, regs, br) != (want["mem"], want["regs"], 0):
+        if (mem, regs, br) != (want["mem"], padded(want["regs"]), 0):
             problems.append(f"pisa_interp on verified code: {mem} {regs} br={br}"
                             f" != verified {want['mem']} {want['regs']}")
         py_mem, py_regs = run_codegen(src)
-        if (py_mem, py_regs) != (want["mem"], want["regs"]):
+        if (py_mem, py_regs) != (want["mem"], padded(want["regs"])):
             problems.append(f"codegen.py: {py_mem} {py_regs} != verified")
         sk_rocq, sk_py = skeleton(code), skeleton(codegen_body(src))
         if sk_rocq != sk_py:

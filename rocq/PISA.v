@@ -88,8 +88,11 @@ Qed.
 (** ** Instructions
 
     The straight-line fragment of PISA: the arithmetic/logic updates, the
-    memory exchange, and [SLTX] (which `codegen.py` uses to normalise a
-    non-Boolean `if`/`from` test to [e != 0]; see CompileIf.v).  Control flow (BRA/RBRA/BEQ/…) is deliberately absent —
+    memory exchange, [SLTX] (the comparisons, and the normalisation of a
+    non-Boolean `if`/`from` test to [e != 0]; see CompileIf.v), and the two
+    compiler pseudo-instructions [ORX] / [ANDX] with exactly the semantics
+    `pisa_interp.py` gives them (they zero a source register, so they are
+    not reversible; `=`/`!=`/`&&`/`||` use them — Compile.v).  Control flow (BRA/RBRA/BEQ/…) is deliberately absent —
     see MANIFEST.md for the milestone structure. *)
 
 Inductive instr : Type :=
@@ -101,7 +104,9 @@ Inductive instr : Type :=
 | IXori (rd : reg) (c : Z)
 | INeg  (rd : reg)
 | IExch (rd ra : reg)    (** swap register [rd] with the memory cell addressed by [ra] *)
-| ISltx (rd rs rt : reg). (** [rd ^= (rs < rt)], used by the [e != 0] normalisation *)
+| ISltx (rd rs rt : reg) (** [rd ^= (rs < rt)]: comparisons, and the [e != 0] normalisation *)
+| IOrx  (rd rs : reg)    (** `pisa_interp.py`'s ORX: [rd := rd lor rs; rs := 0] — NOT reversible *)
+| IAndx (rd1 rd2 rs : reg). (** `pisa_interp.py`'s ANDX: [rd1 ^= rd2 land rs; rd2 := 0] — NOT reversible *)
 
 Definition code := list instr.
 
@@ -124,6 +129,14 @@ Definition step (i : instr) (s : state) : state :=
   | ISltx rd rs rt =>
       mkState (rupd rd (Z.lxor (regs s rd) (if regs s rs <? regs s rt then 1 else 0))
                     (regs s)) (mem s)
+  (* pisa_interp.py: write rd := rd | rs, then write rs := 0 (in this order,
+     so [IOrx r r] leaves r = 0, as there) *)
+  | IOrx rd rs =>
+      mkState (rupd rs 0 (rupd rd (Z.lor (regs s rd) (regs s rs)) (regs s))) (mem s)
+  (* pisa_interp.py: val := rd2 & rs; write rd1 := rd1 ^ val; write rd2 := 0 *)
+  | IAndx rd1 rd2 rs =>
+      mkState (rupd rd2 0 (rupd rd1 (Z.lxor (regs s rd1) (Z.land (regs s rd2) (regs s rs)))
+                                (regs s))) (mem s)
   end.
 
 Definition run (c : code) (s : state) : state := fold_left (fun st i => step i st) c s.
@@ -153,6 +166,8 @@ Definition invert_instr (i : instr) : instr :=
   | INeg  rd    => INeg  rd         (* self-inverse *)
   | IExch rd ra => IExch rd ra      (* self-inverse *)
   | ISltx rd rs rt => ISltx rd rs rt  (* self-inverse *)
+  | IOrx  rd rs    => IOrx rd rs      (* codegen.py's _invert_instr; NOT an inverse *)
+  | IAndx a b c    => IAndx a b c     (* likewise: see [orx_not_injective] *)
   end.
 
 Definition invert_code (c : code) : code := rev (map invert_instr c).
@@ -166,6 +181,12 @@ Definition wf_instr (i : instr) : Prop :=
   | IAdd  rd rs | ISub rd rs | IXor rd rs | IExch rd rs => rd <> rs
   | IAddi _ _ | ISubi _ _ | IXori _ _ | INeg _ => True
   | ISltx rd rs rt => rd <> rs /\ rd <> rt
+  (* ORX / ANDX zero a source register: no operand condition makes them
+     invertible ([orx_not_injective], [andx_not_injective]), so they are
+     never well-formed.  Code containing them (comparisons `=`/`!=`, `&&`,
+     `||`) is proved correct by state equations on the states the compiler
+     actually reaches (Compile.v, [gen_expr_spec]), not by [step_invert]. *)
+  | IOrx _ _ | IAndx _ _ _ => False
   end.
 
 Definition wf_code (c : code) : Prop := Forall wf_instr c.
@@ -201,6 +222,48 @@ Proof.
     rewrite rupd_same, (rupd_other rd rs), (rupd_other rd rt)
       by (now apply not_eq_sym).
     rewrite rupd_shadow, xor_involutive. now rewrite rupd_id.
+  - (* IOrx *) contradiction.
+  - (* IAndx *) contradiction.
+Qed.
+
+(** ORX and ANDX, with `pisa_interp.py`'s semantics, are not injective for
+    ANY choice of operand registers: a state and its successor step to the
+    same state.  So no instruction undoes them — in particular not
+    [invert_instr], which mirrors `codegen.py`'s [_invert_instr]
+    (ORX ↦ ORX, ANDX ↦ ANDX) — and excluding them from [wf_instr] loses
+    nothing. *)
+Lemma orx_src_zero : forall rd rs t, regs t rs = 0 -> step (IOrx rd rs) t = t.
+Proof.
+  intros rd rs [R M] H; cbn [step regs mem] in *.
+  rewrite H, Z.lor_0_r, rupd_id. f_equal. rewrite <- H. apply rupd_id.
+Qed.
+
+Lemma andx_src_zero : forall rd1 rd2 rs t, regs t rd2 = 0 -> step (IAndx rd1 rd2 rs) t = t.
+Proof.
+  intros rd1 rd2 rs [R M] H; cbn [step regs mem] in *.
+  rewrite H, Z.land_0_l, Z.lxor_0_r, rupd_id. f_equal. rewrite <- H. apply rupd_id.
+Qed.
+
+Lemma orx_not_injective : forall rd rs, exists s1 s2,
+  s1 <> s2 /\ step (IOrx rd rs) s1 = step (IOrx rd rs) s2.
+Proof.
+  intros rd rs.
+  set (s2 := mkState (rupd rs 1 (fun _ => 0)) (fun _ => 0)).
+  exists (step (IOrx rd rs) s2), s2. split.
+  - intro H. apply (f_equal (fun s => regs s rs)) in H.
+    unfold s2 in H; cbn [step regs] in H. rewrite !rupd_same in H. discriminate.
+  - apply orx_src_zero. unfold s2; cbn [step regs]. apply rupd_same.
+Qed.
+
+Lemma andx_not_injective : forall rd1 rd2 rs, exists s1 s2,
+  s1 <> s2 /\ step (IAndx rd1 rd2 rs) s1 = step (IAndx rd1 rd2 rs) s2.
+Proof.
+  intros rd1 rd2 rs.
+  set (s2 := mkState (rupd rd2 1 (fun _ => 0)) (fun _ => 0)).
+  exists (step (IAndx rd1 rd2 rs) s2), s2. split.
+  - intro H. apply (f_equal (fun s => regs s rd2)) in H.
+    unfold s2 in H; cbn [step regs] in H. rewrite !rupd_same in H. discriminate.
+  - apply andx_src_zero. unfold s2; cbn [step regs]. apply rupd_same.
 Qed.
 
 Lemma wf_code_app : forall c1 c2, wf_code c1 -> wf_code c2 -> wf_code (c1 ++ c2).

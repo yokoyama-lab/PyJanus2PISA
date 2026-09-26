@@ -58,7 +58,7 @@ from parser import parse                        # noqa: E402
 from codegen import CodeGen, compile_program, _proc_label    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
-                  BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
+                  ORX, ANDX, BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
 from rocq_loop_crosscheck import skeleton, split_evals   # noqa: E402
 
 ROCQ_DIR = os.environ.get("ROCQ_DIR", os.path.join(ROOT, "rocq"))
@@ -113,6 +113,12 @@ PROGRAMS = {
                "procedure f_inv\n  x1 += 100\n"
                "procedure main\n  call f\n  call f\n  call f_inv\n  call f_inv\n  uncall f\n",
                "ok"),
+    # milestone 3: comparisons and && in a recursive procedure and a loop
+    "g_rec_cmp": (["f", "main"], 1,
+                  "procedure f\n  if (x0 > 0) && (c < 100) then\n    x0 -= 1\n    c += 1\n"
+                  "    call f\n    x0 += 1\n  else skip fi x0 > 0\n"
+                  "procedure main\n  x0 += 3\n  call f\n  call f\n  uncall f\n"
+                  "  from d = 0 do d += 1 loop skip until d >= 2\n", "ok"),
 }
 
 
@@ -185,6 +191,8 @@ def parse_lprog(term: str, np: int) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
+                "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](a)
         else:
             kind = m.group(5)

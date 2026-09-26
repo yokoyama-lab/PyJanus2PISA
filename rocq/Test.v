@@ -73,7 +73,7 @@ Proof. reflexivity. Qed.
 (** ** Machine-level reversibility, on this concrete program *)
 
 Example prog_reversible : run (invert_code (compile prog)) final = zero_state.
-Proof. apply compile_reversible. Qed.
+Proof. apply compile_reversible. reflexivity. Qed.
 
 (** ** The store block of an assignment really is a paired exchange *)
 
@@ -97,3 +97,25 @@ Proof. reflexivity. Qed.
 Print Assumptions compile_spec.
 Print Assumptions compile_reversible.
 Print Assumptions gen_expr_spec.
+Print Assumptions Compile.gen_ungen_spec.
+Print Assumptions Compile.ungen_expr_spec.
+Print Assumptions Compile.compile_not_reversible.
+Print Assumptions PISA.orx_not_injective.
+Print Assumptions PISA.andx_not_injective.
+
+(** ** Milestone 3: comparisons and [&&] / [||] on the machine
+
+    [x += 3 ; y += 5 ; z += x < y ; w += (x = y) || ((y - 5) && 1)]:
+    [z = 1], [w = 0] (since [y - 5 = 0]), registers r3..r12 clean. *)
+Definition prog_cmp : stmt :=
+  Seq (Assign 0%nat AAdd (Cst 3))
+  (Seq (Assign 1%nat AAdd (Cst 5))
+  (Seq (Assign 2%nat AAdd (Bin OLt (Var 0%nat) (Var 1%nat)))
+       (Assign 3%nat AAdd (Bin OOr (Bin OEq (Var 0%nat) (Var 1%nat))
+                                   (Bin OAnd (Bin OSub (Var 1%nat) (Cst 5)) (Cst 1)))))).
+
+Example prog_cmp_run :
+  let s := run (compile prog_cmp) zero_state in
+  map (mem s) [0; 1; 2; 3] = [3; 5; 1; 0]
+  /\ map (regs s) (seq 3 10) = repeat 0 10.
+Proof. vm_compute. split; reflexivity. Qed.

@@ -75,6 +75,13 @@ module Z =
 
   let compare = fun x y -> if x=y then Eq else if x<y then Lt else Gt
 
+  (** val leb : int -> int -> bool **)
+
+  let leb x y =
+    match compare x y with
+    | Gt -> false
+    | _ -> true
+
   (** val ltb : int -> int -> bool **)
 
   let ltb x y =
@@ -117,6 +124,46 @@ module Z =
   (** val of_N : int -> int **)
 
   let of_N = fun p -> p
+
+  (** val coq_lor : int -> int -> int **)
+
+  let coq_lor a b =
+    (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+      (fun _ -> b)
+      (fun a0 ->
+      (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+        (fun _ -> a)
+        (fun b0 -> (Pos.coq_lor a0 b0))
+        (fun b0 -> (~-) (N.succ_pos (N.ldiff (Pos.pred_N b0) a0)))
+        b)
+      (fun a0 ->
+      (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+        (fun _ -> a)
+        (fun b0 -> (~-) (N.succ_pos (N.ldiff (Pos.pred_N a0) b0)))
+        (fun b0 -> (~-)
+        (N.succ_pos (N.coq_land (Pos.pred_N a0) (Pos.pred_N b0))))
+        b)
+      a
+
+  (** val coq_land : int -> int -> int **)
+
+  let coq_land a b =
+    (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+      (fun _ -> 0)
+      (fun a0 ->
+      (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+        (fun _ -> 0)
+        (fun b0 -> of_N (Pos.coq_land a0 b0))
+        (fun b0 -> of_N (N.ldiff a0 (Pos.pred_N b0)))
+        b)
+      (fun a0 ->
+      (fun f0 fp fn z -> if z=0 then f0 () else if z>0 then fp z else fn (-z))
+        (fun _ -> 0)
+        (fun b0 -> of_N (N.ldiff b0 (Pos.pred_N a0)))
+        (fun b0 -> (~-)
+        (N.succ_pos (N.coq_lor (Pos.pred_N a0) (Pos.pred_N b0))))
+        b)
+      a
 
   (** val coq_lxor : int -> int -> int **)
 
