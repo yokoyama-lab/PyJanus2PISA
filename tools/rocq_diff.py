@@ -33,11 +33,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lexer import tokenize
 from parser import parse
-from codegen import compile_program
+from codegen import CodeGen, compile_program
 from pisa_interp import PISAMachine
-from rocq_legacy import legacy_orx, legacy_andx
-from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,
-                  LabeledInstr)
+from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX, ORX, ANDX,
+                  LabeledInstr, is_wf)
+
+_INVERT = CodeGen()        # only its _invert_instr (ADD<->SUB, ADDI<->SUBI, rest self-inverse)
 
 DRIVER = os.path.join(os.path.dirname(__file__), "..", "rocq", "driver")
 
@@ -52,9 +53,8 @@ _BUILD = {
     "NEG":  lambda a: NEG(f"r{a[0]}"),
     "EXCH": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
     "SLTX": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-    # legacy 2-operand ORX / clearing ANDX of the Rocq model (rocq_legacy.py)
-    "ORX":  lambda a: legacy_orx(f"r{a[0]}", f"r{a[1]}"),
-    "ANDX": lambda a: legacy_andx(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+    "ORX":  lambda a: ORX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+    "ANDX": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
 }
 
 
@@ -72,8 +72,7 @@ def parse_driver_output(text: str) -> list:
             cur["nvars"] = int(rest)
         elif head == "I":
             op, *args = rest.split()
-            built = _BUILD[op]([int(a) for a in args])
-            cur["instrs"].extend(built if isinstance(built, list) else [built])
+            cur["instrs"].append(_BUILD[op]([int(a) for a in args]))
         elif head == "VAR":
             k, v = rest.split()
             cur["vars"][int(k)] = int(v)
@@ -115,6 +114,17 @@ def main() -> int:
     for case in cases:
         name, nvars = case["name"], case["nvars"]
         problems = []
+
+        # 0. every verified instruction is locally invertible (pisa.is_wf),
+        # and the code followed by its instruction-wise inverse restores the
+        # machine on pisa_interp.py (Compile.v wf_compile / compile_reversible)
+        bad = [i for i in case["instrs"] if not is_wf(i)]
+        if bad:
+            problems.append(f"verified code is not locally invertible (is_wf): {bad}")
+        inv = [_INVERT._invert_instr(i) for i in reversed(case["instrs"])]
+        back, back_regs = run_bare(case["instrs"] + inv, nvars)
+        if any(back.values()) or any(back_regs.values()):
+            problems.append(f"code ; code^-1 does not restore the machine: {back} {back_regs}")
 
         # 1. the Python interpreter against the verified machine
         store, regs = run_bare(case["instrs"], nvars)

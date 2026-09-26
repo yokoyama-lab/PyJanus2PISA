@@ -42,7 +42,7 @@ Definition cancels (a b : instr) : bool :=
 (** A cancelling pair is exactly "a well-formed instruction followed by its
     inverse" — so [step_invert] does all the semantic work. *)
 Lemma cancels_spec : forall a b,
-  cancels a b = true -> b = invert_instr a /\ wf_instr a.
+  cancels a b = true -> b = invert_instr a /\ inv_instr a.
 Proof.
   intros a b H; destruct a; destruct b; simpl in H; try discriminate;
   repeat (apply andb_prop in H as [H ?]);
@@ -58,7 +58,7 @@ Theorem cancels_undo : forall a b s,
   cancels a b = true -> step b (step a s) = s.
 Proof.
   intros a b s H; destruct (cancels_spec a b H) as [-> Hwf].
-  now apply step_invert.
+  now apply step_invert_inv.
 Qed.
 
 (** ** One peephole pass *)

@@ -2124,8 +2124,62 @@ Proof.
   rewrite Hr. reflexivity.
 Qed.
 
+(** ** Every line of the whole program is well-formed (`pisa.is_wf`)
+
+    Statement code, test blocks, the procedure prologues (`EXCH r2 r1`,
+    `SWAPBR r2`, …) and the `start` wrapper: every instruction of
+    [whole Γ main k] is locally invertible, for every environment. *)
+
+Theorem wf_compile_p : forall st b n p n', b <> 0%nat ->
+  compile_p st b n = (p, n') -> wf_lprog p.
+Proof.
+  induction st as [s | a IHa c IHc | e1 a IHa c IHc e2 | e1 a IHa c IHc e2 | f | f];
+    intros b n p n' Hb Hc; simpl in Hc.
+  - injection Hc as <- <-. now apply wf_ops, wf_compile_at.
+  - destruct (compile_p a b n) as [p1 n1] eqn:E1.
+    destruct (compile_p c b n1) as [p2 n2] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_lprog_app; [exact (IHa b n p1 n1 Hb E1) | exact (IHc b n1 p2 n2 Hb E2)].
+  - destruct (compile_p a (S b) (n + 5)%nat) as [pa na] eqn:E1.
+    destruct (compile_p c (S b) na) as [pc nc] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_if_code; [exact (IHa (S b) _ _ _ ltac:(lia) E1) | exact (IHc (S b) _ _ _ ltac:(lia) E2)].
+  - destruct (compile_p a (S b) (n + 4)%nat) as [pa na] eqn:E1.
+    destruct (compile_p c (S b) na) as [pc nc] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_loop_code; [exact (IHa (S b) _ _ _ ltac:(lia) E1) | exact (IHc (S b) _ _ _ ltac:(lia) E2)].
+  - injection Hc as <- <-. wf_lp.
+  - injection Hc as <- <-. wf_lp.
+Qed.
+
+Lemma wf_proc_code : forall e t bt B, wf_lprog B -> wf_lprog (proc_code e t bt B).
+Proof. intros e t bt B H; unfold proc_code; wf_lp. Qed.
+
+Lemma wf_emit_list : forall d bs f n p n', emit_list d f bs n = (p, n') -> wf_lprog p.
+Proof.
+  intros d bs; induction bs as [| body bs IH]; intros f n p n' He; cbn [emit_list] in He.
+  - injection He as <- <-. constructor.
+  - destruct (compile_p (dirb d body) scratch n) as [B n1] eqn:E1.
+    destruct (emit_list d (S f) bs n1) as [rest n2] eqn:E2.
+    injection He as <- <-.
+    assert (HP : wf_lprog (proc_code (pe f d) (pt f d) (pbt f d) B)).
+    { apply wf_proc_code, (wf_compile_p (dirb d body) scratch n B n1); [unfold scratch; lia | exact E1]. }
+    exact (wf_lprog_app _ _ HP (IH _ _ _ _ E2)).
+Qed.
+
+Theorem wf_whole : forall Γ main k, wf_lprog (whole Γ main k).
+Proof.
+  intros Γ main k; unfold whole, procs_code.
+  destruct (emit_list false 0 Γ (L0 Γ)) as [Fw n1] eqn:E1.
+  destruct (emit_list true 0 Γ n1) as [Iv n2] eqn:E2.
+  apply wf_lprog_app; [apply wf_lprog_app; [exact (wf_emit_list _ _ _ _ _ _ E1)
+                                           | exact (wf_emit_list _ _ _ _ _ _ E2)] |].
+  unfold start_code, nop; wf_lp.
+Qed.
+
 (** ** Axiom footprint *)
 
+Print Assumptions wf_whole.
 Print Assumptions compile_p_spec.
 Print Assumptions compile_p_program.
 Print Assumptions procs_in_whole.

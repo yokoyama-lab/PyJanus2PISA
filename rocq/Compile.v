@@ -19,16 +19,19 @@
     Both are captured by a single state equation ([gen_expr_spec],
     [compile_spec]).
 
-    Comparisons and [&&] / [||] (milestone 3) are compiled as `_gen_binop`
-    and `_gen_uneval_binop` compile them — [SLTX], [XORI], and the
-    compiler pseudo-instructions ORX / ANDX, which zero a source register
-    and have no inverse ([PISA.orx_not_injective]).  Their unevaluation is
-    therefore not "the code run backwards" but `_gen_uneval_binop`'s
-    recomputation ([ungen_expr]), and the operand registers are zeroed by
-    [XOR r r] as `_clear_garbage` does.  The state equations still hold
-    ([gen_ungen_spec]); instruction-level reversibility
-    ([compile_reversible]) holds for [+ - ^] programs only
-    ([compile_not_reversible]).
+    Since 2026-09 (docs/EXPR_LOWERING.md) every expression, comparisons and
+    [&&]/[||] included, is compiled in the clean shape
+
+<<
+      re ; <e1 → rl> ; <e2 → rr> ; combine re rl rr ; <e2 → rr>⁻¹ ; <e1 → rl>⁻¹
+>>
+
+    with the operands uncomputed at once by running their code backwards,
+    no [XOR r r] clears, and [ORX] / [ANDX] with Pendulum's 3-operand
+    XOR-accumulating semantics (PISA.v).  Hence [ungen_expr e] is
+    [invert_code (gen_expr e)] for *every* expression, every emitted
+    instruction is well-formed ([wf_gen_expr], [wf_compile]), and
+    [compile_reversible] holds for every program.
 
     Memory layout: variable [x : nat] lives at address [Z.of_nat x], matching
     the [DATA] words emitted by [codegen.py].  Registers 0,1,2 are reserved
@@ -69,8 +72,7 @@ Proof. intros; now apply Nat2Z.inj. Qed.
 
 (** ** The compiler *)
 
-(** Only reached for the arithmetic operators ([arith_op]); the others are
-    compiled by [cmp_fwd] and the logical cases of [gen_expr]. *)
+(** [+ - ^] as a register-register instruction ([_INPLACE]). *)
 Definition op_instr (o : binop) (rd rs : reg) : instr :=
   match o with
   | OAdd => IAdd rd rs
@@ -85,6 +87,44 @@ Definition aop_instr (o : aop) (rd rs : reg) : instr :=
   | AXor => IXor rd rs
   end.
 
+(** A constant into a zero register (`_gen_const`): [ADDI r k] for [k > 0],
+    [SUBI r (-k)] for [k < 0], nothing for [k = 0].  In general it adds [n]. *)
+Definition cst_code (n : Z) (rt : reg) : code :=
+  if n =? 0 then []
+  else if 0 <? n then [IAddi rt n] else [ISubi rt (- n)].
+
+(** [rt op= k] for a compile-time constant [k] (`_inplace_imm`). *)
+Definition imm_code (o : binop) (k : Z) (rt : reg) : code :=
+  match o with
+  | OXor => if k =? 0 then [] else [IXori rt k]
+  | OSub => cst_code (- k) rt
+  | _    => cst_code k rt
+  end.
+
+(** `CodeGen._const_value`: the value of an expression built from literals
+    by [+ - ^] (the parser's unary minus [0 - e] included); [None] otherwise
+    (comparisons and logical operators are not evaluated, as there). *)
+Fixpoint const_value (e : expr) : option Z :=
+  match e with
+  | Cst n => Some n
+  | Var _ => None
+  | Bin o e1 e2 =>
+      if arith_op o then
+        match const_value e1, const_value e2 with
+        | Some a, Some b => Some (denote o a b)
+        | _, _ => None
+        end
+      else None
+  end.
+
+(** The constant folding at the top of `_gen_binop`: both operands are
+    literals (every operator of [Src.expr] is folded there). *)
+Definition fold_csts (o : binop) (e1 e2 : expr) : option Z :=
+  match e1, e2 with
+  | Cst a, Cst b => Some (denote o a b)
+  | _, _ => None
+  end.
+
 (** Load variable [x] into [rt], using [S rt] as the address register and
     [S (S rt)] as the exchange buffer.  The value is copied out with XOR and
     the cell is put straight back, so memory is unchanged. *)
@@ -95,7 +135,7 @@ Definition gen_var (x : var) (rt : reg) : code :=
   ; IExch (S (S rt)) (S rt)
   ; ISubi (S rt) (Z.of_nat x) ].
 
-(** *** Comparisons and logical operators (`_gen_binop` / `_gen_uneval_binop`)
+(** *** Comparisons and logical operators
 
     `_as_flag` keeps an expression that is already 0/1 — a comparison, a
     logical operator, or the constant 0 or 1 — and turns anything else into
@@ -116,128 +156,81 @@ Definition is_nz_test (o : binop) (e2 : expr) : bool :=
   | _, _ => false
   end.
 
-(** `_nonzero_into(r, e)`: evaluate [e] into [S r], [r ^= (v < 0)],
-    [r ^= (0 < v)] (the bits are exclusive, so [r ^= (v != 0)]),
-    unevaluate [e].  Self-inverse, so it is also its own uneval.  [g] / [u]
-    are [e]'s evaluation and unevaluation code as functions of the target. *)
-Definition nz_code (g u : reg -> code) (r : reg) : code :=
-  g (S r) ++ ISltx r (S r) 0%nat :: ISltx r 0%nat (S r) :: u (S r).
+Definition is_logic (o : binop) : bool :=
+  match o with OAnd | OOr => true | _ => false end.
 
-(** The operand [_as_flag(e)] of [&&] / [||] (`_logical_operands`): [e]
-    itself if [p = is_flag_expr e], else [e != 0]. *)
-Definition flag_code (p : bool) (g u : reg -> code) (r : reg) : code :=
-  if p then g r else nz_code g u r.
+(** `_gen_nonzero`: [rf ^= (e != 0)] with [e]'s value in [S rf] while it is
+    needed, [e] uncomputed at once.  [g] is [e]'s code as a function of its
+    target register. *)
+Definition nz_code (g : reg -> code) (r : reg) : code :=
+  g (S r) ++ [ISltx r (S r) 0%nat; ISltx r 0%nat (S r)] ++ invert_code (g (S r)).
 
-Definition unflag_code (p : bool) (g u : reg -> code) (r : reg) : code :=
-  if p then u r else nz_code g u r.
+(** The operand [_as_flag(e)] of [&&] / [||] (`_logical_operands`), as code:
+    [e] itself if it is already 0/1; a literal [k] becomes the literal
+    [k != 0] (folded by `_gen_binop`); anything else [e != 0]. *)
+Definition flag_gen (e : expr) (g : reg -> code) : reg -> code :=
+  if is_flag_expr e then g
+  else match e with
+       | Cst k => cst_code (b2z (negb (k =? 0)))
+       | _ => nz_code g
+       end.
 
-(** The instructions `_gen_binop` emits for a comparison, result in [rd]
-    (initially 0), operands in [r1] / [r2], temporary [t] (initially 0,
-    zeroed by the ORX).  [_gen_uneval_binop] emits the same block into a
-    fresh [sub_re] (and [sub_rt]). *)
-Definition cmp_fwd (o : binop) (rd r1 r2 t : reg) : code :=
+(** `_COMBINE`: [re ^= f(rl, rr)] into a zero register [re]. *)
+Definition comb_code (o : binop) (re rl rr : reg) : code :=
   match o with
-  | OEq => [ISltx rd r1 r2; ISltx t r2 r1; IOrx rd t; IXori rd 1]
-  | ONe => [ISltx rd r1 r2; ISltx t r2 r1; IOrx rd t]
-  | OLt => [ISltx rd r1 r2]
-  | OGt => [ISltx rd r2 r1]
-  | OLe => [ISltx rd r2 r1; IXori rd 1]
-  | OGe => [ISltx rd r1 r2; IXori rd 1]
-  | _   => []
+  | OLt  => [ISltx re rl rr]
+  | OGt  => [ISltx re rr rl]
+  | OLe  => [ISltx re rr rl; IXori re 1]
+  | OGe  => [ISltx re rl rr; IXori re 1]
+  | ONe  => [ISltx re rl rr; ISltx re rr rl]
+  | OEq  => [ISltx re rl rr; ISltx re rr rl; IXori re 1]
+  | OAnd => [IAndx re rl rr]
+  | OOr  => [IOrx re rl rr]
+  | _    => []          (* [+ - ^] are compiled in place *)
   end.
 
-(** [gen_expr e rt] evaluates [e] into [rt]; [ungen_expr e rt] clears [rt]
-    again (`_gen_uneval_expr`).  Both leave every other register as they
-    found it.
+(** `_gen_combine`: result register first, operands above it, operands
+    uncomputed right after the combine, right before left. *)
+Definition comb_block (o : binop) (g1 g2 : reg -> code) (rt : reg) : code :=
+  g1 (S rt) ++ g2 (S (S rt)) ++ comb_code o rt (S rt) (S (S rt))
+  ++ invert_code (g2 (S (S rt))) ++ invert_code (g1 (S rt)).
 
-    - Arithmetic ([+ - ^]): the clean translation of Compile.v's first
-      version, unchanged — the right operand is evaluated into [S rt],
-      combined, and unevaluated.  On arithmetic expressions
-      [ungen_expr e = invert_code (gen_expr e)] ([ungen_arith]), so the code
-      is literally the old one.
-    - [e != 0]: `_gen_nonzero` ([nz_code]).
-    - Comparisons: left into [S rt], right into [S (S rt)], `_gen_binop`'s
-      block ([cmp_fwd], result in [rt]), then the two operand registers are
-      zeroed by [XOR r r] — `codegen.py` marks them garbage and
-      `_clear_garbage` emits exactly these [XOR r r] at the end of the
-      statement; here they come right away.  The uneval is
-      `_gen_uneval_binop`'s: re-evaluate both operands, recompute the
-      comparison into [sub_re], [XOR result sub_re], [XOR sub_re sub_re],
-      unevaluate the right, then the left operand.
-    - [&&] / [||]: operands through `_logical_operands` ([flag_code]);
-      [ANDX rt rl rr] (which zeroes [rl]) and a garbage clear of [rr], resp.
-      [ORX rt rl ; ORX rt rr] (which zero both); the uneval copies the
-      operands first (`rl_copy`, `rr_copy`), exactly as `_gen_uneval_binop`.
+(** [gen_expr e rt] evaluates [e] into [rt], which must be 0, using only
+    registers above [rt] as temporaries, and leaves every other register as
+    it found it.  The case analysis is `_gen_binop`'s, in its order:
+    constant folding, `e != 0` ([nz_code]), [+ - ^] in place (immediate if
+    the right operand is a compile-time constant), and the combine of the
+    other operators ([&&]/[||] with `_logical_operands`).
 
-    Registers: `codegen.py` allocates the result register *after* the
-    operands; here it is the target [rt] and the operands live above it.
-    The values computed are the same (see [gen_ungen_spec]); the register
-    numbers are not. *)
+    Registers: `codegen.py`'s allocator picks the lowest free register, so
+    e.g. the address register of a variable load sits between the target and
+    the value register there; here the target is [rt] and the temporaries
+    are [S rt], [S (S rt)], ….  The instructions per operator are the same;
+    the register numbers are not. *)
 Fixpoint gen_expr (e : expr) (rt : reg) {struct e} : code :=
   match e with
-  | Cst n => [IAddi rt n]
+  | Cst n => cst_code n rt
   | Var x => gen_var x rt
   | Bin o e1 e2 =>
-      if arith_op o then
-        gen_expr e1 rt ++ gen_expr e2 (S rt) ++ [op_instr o rt (S rt)]
-        ++ ungen_expr e2 (S rt)
-      else if is_nz_test o e2 then
-        nz_code (gen_expr e1) (ungen_expr e1) rt
-      else
-        match o with
-        | OAnd =>
-            flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-            ++ flag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ [IAndx rt (S rt) (S (S rt)); IXor (S (S rt)) (S (S rt))]
-        | OOr =>
-            flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-            ++ flag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ [IOrx rt (S rt); IOrx rt (S (S rt))]
-        | _ =>
-            gen_expr e1 (S rt) ++ gen_expr e2 (S (S rt))
-            ++ cmp_fwd o rt (S rt) (S (S rt)) (S (S (S rt)))
-            ++ [IXor (S rt) (S rt); IXor (S (S rt)) (S (S rt))]
-        end
-  end
-with ungen_expr (e : expr) (rt : reg) {struct e} : code :=
-  match e with
-  | Cst n => [ISubi rt n]
-  | Var x => invert_code (gen_var x rt)
-  | Bin o e1 e2 =>
-      if arith_op o then
-        gen_expr e2 (S rt) ++ [invert_instr (op_instr o rt (S rt))]
-        ++ ungen_expr e2 (S rt) ++ ungen_expr e1 rt
-      else if is_nz_test o e2 then
-        nz_code (gen_expr e1) (ungen_expr e1) rt
-      else
-        match o with
-        | OAnd =>
-            flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-            ++ flag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ [ IXor (S (S (S rt))) (S rt)
-               ; IAndx (S (S (S (S rt)))) (S (S (S rt))) (S (S rt))
-               ; IXor rt (S (S (S (S rt))))
-               ; IXor (S (S (S (S rt)))) (S (S (S (S rt)))) ]
-            ++ unflag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ unflag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-        | OOr =>
-            flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-            ++ flag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ [ IXor (S (S (S rt))) (S rt)
-               ; IOrx (S (S (S (S (S rt))))) (S (S (S rt)))
-               ; IXor (S (S (S (S rt)))) (S (S rt))
-               ; IOrx (S (S (S (S (S rt))))) (S (S (S (S rt))))
-               ; IXor rt (S (S (S (S (S rt)))))
-               ; IXor (S (S (S (S (S rt))))) (S (S (S (S (S rt))))) ]
-            ++ unflag_code (is_flag_expr e2) (gen_expr e2) (ungen_expr e2) (S (S rt))
-            ++ unflag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1) (S rt)
-        | _ =>
-            gen_expr e1 (S rt) ++ gen_expr e2 (S (S rt))
-            ++ cmp_fwd o (S (S (S rt))) (S rt) (S (S rt)) (S (S (S (S rt))))
-            ++ [IXor rt (S (S (S rt))); IXor (S (S (S rt))) (S (S (S rt)))]
-            ++ ungen_expr e2 (S (S rt)) ++ ungen_expr e1 (S rt)
-        end
+      match fold_csts o e1 e2 with
+      | Some k => cst_code k rt
+      | None =>
+          if is_nz_test o e2 then nz_code (gen_expr e1) rt
+          else if arith_op o then
+            gen_expr e1 rt
+            ++ match const_value e2 with
+               | Some k => imm_code o k rt
+               | None => gen_expr e2 (S rt) ++ [op_instr o rt (S rt)]
+                         ++ invert_code (gen_expr e2 (S rt))
+               end
+          else if is_logic o then
+            comb_block o (flag_gen e1 (gen_expr e1)) (flag_gen e2 (gen_expr e2)) rt
+          else comb_block o (gen_expr e1) (gen_expr e2) rt
+      end
   end.
+
+(** `_uneval`: the expression's code run backwards clears [rt] again. *)
+Definition ungen_expr (e : expr) (rt : reg) : code := invert_code (gen_expr e rt).
 
 (** [x op= e]: evaluate [e] into [scratch], apply it to the memory cell of
     [x] through an exchange, then unevaluate [e]. *)
@@ -269,15 +262,7 @@ Fixpoint compile (st : stmt) : code :=
   | Seq s1 s2    => compile s1 ++ compile s2
   end.
 
-(** ** On the original fragment the code is the old code, and well-formed
-
-    For arithmetic expressions [ungen_expr] is the instruction-wise inverse
-    of [gen_expr] — the clean translation of the first version of this
-    file — and every instruction is well-formed, so [PISA.run_invert_code]
-    applies.  With comparisons this is no longer so: the operand clears
-    [XOR r r] and ORX / ANDX are not invertible ([PISA.orx_not_injective]),
-    and [compile_not_reversible] below shows that running the
-    instruction-wise inverse of such code does not restore the machine. *)
+(** ** Inversion lemmas *)
 
 Lemma invert_instr_invol : forall i, invert_instr (invert_instr i) = i.
 Proof. destruct i; reflexivity. Qed.
@@ -290,16 +275,6 @@ Lemma invert_code_invol : forall c, invert_code (invert_code c) = c.
 Proof.
   intro c; unfold invert_code; rewrite map_rev, rev_involutive, map_map.
   rewrite (map_ext _ (fun i => i)) by apply invert_instr_invol. apply map_id.
-Qed.
-
-Lemma ungen_arith : forall e rt, arith_expr e = true ->
-  ungen_expr e rt = invert_code (gen_expr e rt).
-Proof.
-  induction e as [n | x | o e1 IH1 e2 IH2]; intros rt H; try reflexivity.
-  cbn [arith_expr] in H. apply andb_prop in H as [H H2]. apply andb_prop in H as [Ho H1].
-  cbn [gen_expr ungen_expr]. rewrite Ho.
-  rewrite !invert_code_app, (IH2 (S rt) H2), invert_code_invol, (IH1 rt H1).
-  rewrite <- !app_assoc. reflexivity.
 Qed.
 
 Lemma wf_invert_instr : forall i, wf_instr i -> wf_instr (invert_instr i).
@@ -318,32 +293,7 @@ Ltac wf_list :=
   repeat (apply Forall_cons; [simpl; first [exact I | lia] |]);
   apply Forall_nil.
 
-Lemma wf_gen_expr : forall e rt, arith_expr e = true -> wf_code (gen_expr e rt).
-Proof.
-  induction e as [n | x | o e1 IH1 e2 IH2]; intros rt H; simpl.
-  - wf_list.
-  - unfold gen_var; wf_list.
-  - cbn [arith_expr] in H. apply andb_prop in H as [H H2]. apply andb_prop in H as [Ho H1].
-    rewrite Ho, (ungen_arith e2 (S rt) H2).
-    apply wf_code_app; [apply IH1, H1 |].
-    apply wf_code_app; [apply IH2, H2 |].
-    apply Forall_cons; [destruct o; simpl; lia |].
-    apply wf_invert_code, IH2, H2.
-Qed.
-
-Lemma wf_compile : forall st, arith_stmt st = true -> wf_code (compile st).
-Proof.
-  induction st as [| x o e | x y | s1 IH1 s2 IH2]; simpl; intro H.
-  - apply Forall_nil.
-  - unfold gen_assign. rewrite (ungen_arith e scratch H).
-    apply wf_code_app; [apply wf_gen_expr, H |].
-    repeat (apply Forall_cons; [destruct o; simpl; first [exact I | lia] |]).
-    apply wf_invert_code, wf_gen_expr, H.
-  - unfold gen_swap; wf_list.
-  - apply andb_prop in H as [H1 H2]. apply wf_code_app; auto.
-Qed.
-
-(** ** Expression compilation is correct and clean *)
+(** ** Tactics for state equations *)
 
 (** Reduce a [run] of a literal block to a nest of [rupd]/[mupd] with all
     register and memory lookups resolved. *)
@@ -374,13 +324,54 @@ Ltac zcase :=
          end;
   cbn; try lia; try reflexivity.
 
-(** Close one register of a [regs_ext] case split. *)
-Ltac vclose :=
-  first [ reflexivity
-        | apply Z.lxor_nilpotent
-        | rewrite Z.lxor_0_l; reflexivity
-        | rewrite Z.lor_0_l; reflexivity
-        | zcase ].
+(** ** The building blocks, one lemma each *)
+
+(** [gok g v M]: at every target [r <> 0], [g r] is well-formed, and from
+    any register file with [r0 = 0] that is clean from [r] up it puts [v]
+    into [r] and changes nothing else. *)
+Definition gok (g : reg -> code) (v : Z) (M : addr -> Z) : Prop :=
+  forall r, r <> 0%nat ->
+    wf_code (g r) /\
+    forall R, R 0%nat = 0 -> clean_above r (mkState R M) ->
+      run (g r) (mkState R M) = mkState (rupd r v R) M.
+
+(** The clean shape: running the code backwards clears the target again. *)
+Lemma gok_uncompute : forall g v M r R, gok g v M -> r <> 0%nat ->
+  R 0%nat = 0 -> clean_above r (mkState R M) ->
+  run (invert_code (g r)) (mkState (rupd r v R) M) = mkState R M.
+Proof.
+  intros g v M r R Hg Hr H0 Hcl. destruct (Hg r Hr) as [W G].
+  rewrite <- (G R H0 Hcl). now apply run_invert_code.
+Qed.
+
+Lemma clean_S : forall r s, clean_above r s -> clean_above (S r) s.
+Proof. intros r s H k Hk; apply H; lia. Qed.
+
+Lemma clean_rupd : forall r k a R M, (k < r)%nat ->
+  clean_above r (mkState R M) -> clean_above r (mkState (rupd k a R) M).
+Proof. intros r k a R M Hk H j Hj; cbn [regs]; rewrite rupd_other by lia; apply H, Hj. Qed.
+
+Lemma zero_rupd : forall k a R, R 0%nat = 0 -> k <> 0%nat -> rupd k a R 0%nat = 0.
+Proof. intros; rewrite rupd_other by lia; assumption. Qed.
+
+Lemma wf_cst_code : forall n r, wf_code (cst_code n r).
+Proof. intros; unfold cst_code; destruct (n =? 0), (0 <? n); wf_list. Qed.
+
+Lemma cst_code_run : forall n r R M,
+  run (cst_code n r) (mkState R M) = mkState (rupd r (R r + n) R) M.
+Proof.
+  intros n r R M; unfold cst_code.
+  destruct (Z.eqb_spec n 0) as [-> | Hn].
+  - cbn. rewrite Z.add_0_r, rupd_id. reflexivity.
+  - destruct (Z.ltb_spec 0 n); cbn [run fold_left step regs mem]; f_equal; f_equal; lia.
+Qed.
+
+Lemma cst_gok : forall n M, gok (cst_code n) n M.
+Proof.
+  intros n M r Hr; split; [apply wf_cst_code |].
+  intros R H0 Hcl. rewrite cst_code_run.
+  assert (HR : R r = 0) by (apply Hcl; lia). now rewrite HR, Z.add_0_l.
+Qed.
 
 Lemma gen_var_spec : forall x rt s σ,
   models s σ -> clean_above rt s ->
@@ -406,53 +397,34 @@ Proof.
     rewrite mupd_shadow, <- Hmod, mupd_id. reflexivity.
 Qed.
 
-(** [g] / [u] evaluate a value [v] into register [r] and clear it again,
-    touching nothing else, from any register file with [r0 = 0] that is
-    clean from [r] up, over the memory [M]. *)
-Definition expr_ok (g u : reg -> code) (r : reg) (v : Z) (M : addr -> Z) : Prop :=
-  forall R, R 0%nat = 0 -> clean_above r (mkState R M) ->
-    run (g r) (mkState R M) = mkState (rupd r v R) M /\
-    run (u r) (mkState (rupd r v R) M) = mkState R M.
+Lemma var_gok : forall σ M x, (forall y : var, M (Z.of_nat y) = σ y) ->
+  gok (gen_var x) (σ x) M.
+Proof.
+  intros σ M x Hmod r Hr; split; [unfold gen_var; wf_list |].
+  intros R H0 Hcl. exact (gen_var_spec x r (mkState R M) σ Hmod Hcl).
+Qed.
 
 Lemma sltx_pair : forall v,
   Z.lxor (if v <? 0 then 1 else 0) (if 0 <? v then 1 else 0) = b2z (negb (v =? 0)).
 Proof. intro v; zcase. Qed.
 
-Lemma nz_code_ok : forall g u r v M R,
-  expr_ok g u (S r) v M -> r <> 0%nat ->
-  R 0%nat = 0 -> clean_above (S r) (mkState R M) ->
-  run (nz_code g u r) (mkState R M)
-  = mkState (rupd r (Z.lxor (R r) (b2z (negb (v =? 0)))) R) M.
+Lemma nz_gok : forall g v M, gok g v M -> gok (nz_code g) (b2z (negb (v =? 0))) M.
 Proof.
-  intros g u r v M R Hok Hr H0 Hcl. unfold nz_code.
-  rewrite run_app. destruct (Hok R H0 Hcl) as [Hg _]. rewrite Hg.
-  rewrite !run_cons. cbn [step regs mem].
-  repeat first [ rewrite rupd_same | rewrite rupd_other by lia ].
-  rewrite H0, rupd_shadow, Z.lxor_assoc, sltx_pair.
-  rewrite (rupd_comm r (S r)) by lia.
-  apply (Hok (rupd r (Z.lxor (R r) (b2z (negb (v =? 0)))) R)).
-  - rewrite rupd_other by lia. exact H0.
-  - intros k Hk; cbn [regs]. rewrite rupd_other by lia. apply Hcl; lia.
-Qed.
-
-Lemma flag_code_ok : forall p g u r v M,
-  (forall r', r' <> 0%nat -> expr_ok g u r' v M) ->
-  (p = true -> v = 0 \/ v = 1) -> r <> 0%nat ->
-  expr_ok (flag_code p g u) (unflag_code p g u) r (b2z (negb (v =? 0))) M.
-Proof.
-  intros p g u r v M Hok H01 Hr R H0 Hcl. unfold flag_code, unflag_code.
-  destruct p.
-  - destruct (H01 eq_refl) as [-> | ->]; apply Hok; assumption.
-  - assert (HR : R r = 0) by (apply Hcl; cbn; lia).
-    assert (Hcl' : clean_above (S r) (mkState R M)) by (intros k Hk; apply Hcl; lia).
-    split.
-    + rewrite (nz_code_ok g u r v M R (Hok (S r) ltac:(lia)) Hr H0 Hcl').
-      now rewrite HR, Z.lxor_0_l.
-    + rewrite (nz_code_ok g u r v M _ (Hok (S r) ltac:(lia)) Hr).
-      * rewrite rupd_same, Z.lxor_nilpotent, rupd_shadow, rupd_zero by exact HR.
-        reflexivity.
-      * rewrite rupd_other by lia. exact H0.
-      * intros k Hk; cbn [regs]. rewrite rupd_other by lia. apply Hcl; lia.
+  intros g v M Hg r Hr. destruct (Hg (S r) ltac:(lia)) as [Wg Gg]. split.
+  - unfold nz_code. apply wf_code_app; [exact Wg |].
+    apply wf_code_app; [wf_list | now apply wf_invert_code].
+  - intros R H0 Hcl.
+    assert (HR : R r = 0) by (apply Hcl; lia).
+    unfold nz_code. rewrite run_app, (Gg R H0 (clean_S _ _ Hcl)), run_app.
+    assert (E : run [ISltx r (S r) 0%nat; ISltx r 0%nat (S r)] (mkState (rupd (S r) v R) M)
+                = mkState (rupd (S r) v (rupd r (b2z (negb (v =? 0))) R)) M).
+    { rewrite !run_cons, run_nil. cbn [step regs mem].
+      repeat first [ rewrite rupd_same | rewrite rupd_other by lia ].
+      rewrite H0, HR, rupd_shadow, Z.lxor_0_l, sltx_pair.
+      rewrite (rupd_comm r (S r)) by lia. reflexivity. }
+    rewrite E. apply (gok_uncompute g v M (S r)); try assumption; try lia.
+    + now apply zero_rupd.
+    + apply clean_rupd; [lia | now apply clean_S].
 Qed.
 
 Lemma is_flag_expr_01 : forall σ e, is_flag_expr e = true ->
@@ -464,288 +436,213 @@ Proof.
   - now apply denote_flag.
 Qed.
 
-Definition cmp_op (o : binop) : bool :=
-  match o with OEq | ONe | OLt | OGt | OLe | OGe => true | _ => false end.
-
-Lemma cmp_fwd_spec : forall o rd r1 r2 t R M,
-  cmp_op o = true ->
-  rd <> r1 -> rd <> r2 -> rd <> t -> t <> r1 -> t <> r2 ->
-  R rd = 0 -> R t = 0 ->
-  run (cmp_fwd o rd r1 r2 t) (mkState R M)
-  = mkState (rupd rd (denote o (R r1) (R r2)) R) M.
+Lemma flag_gen_gok : forall e g v M, gok g v M ->
+  (is_flag_expr e = true -> v = 0 \/ v = 1) -> (forall k, e = Cst k -> v = k) ->
+  gok (flag_gen e g) (b2z (negb (v =? 0))) M.
 Proof.
-  intros o rd r1 r2 t R M Ho H1 H2 H3 H4 H5 Hrd Ht.
-  destruct o; try discriminate; simp_state; rewrite ?Hrd, ?Ht; f_equal;
-    regs_ext; rewrite ?Hrd, ?Ht; zcase.
+  intros e g v M Hg H01 Hk. unfold flag_gen.
+  destruct (is_flag_expr e) eqn:E.
+  - destruct (H01 eq_refl) as [-> | ->]; exact Hg.
+  - destruct e as [k | x | o e1 e2].
+    + rewrite (Hk k eq_refl). apply cst_gok.
+    + now apply nz_gok.
+    + now apply nz_gok.
 Qed.
 
-(** The five shapes of [gen_expr] / [ungen_expr] on [Bin], each proved once
-    for arbitrary operand code [g1]/[u1], [g2]/[u2] that is correct at every
-    register ([expr_ok]). *)
+(** The value [comb_code] XORs into its (zero) target. *)
+Definition cval (o : binop) (a b : Z) : Z :=
+  match o with
+  | OAnd => Z.land a b
+  | OOr  => Z.lor a b
+  | _    => denote o a b
+  end.
 
-Section Cases.
+Lemma wf_comb_code : forall o re rl rr, re <> rl -> re <> rr ->
+  wf_code (comb_code o re rl rr).
+Proof. intros o re rl rr H1 H2; destruct o; cbn [comb_code]; wf_list. Qed.
 
-Variables (g1 u1 g2 u2 : reg -> code) (v1 v2 : Z) (M : addr -> Z) (rt : reg).
-Hypothesis Hrt : rt <> 0%nat.
-Hypothesis Hok1 : forall r, r <> 0%nat -> expr_ok g1 u1 r v1 M.
-Hypothesis Hok2 : forall r, r <> 0%nat -> expr_ok g2 u2 r v2 M.
-
-(** Starting points of the operand code: [R] with [rt] (and more) updated. *)
-Lemma start_ok : forall R a k, R 0%nat = 0 -> (forall j, (k <= j)%nat -> R j = 0) ->
-  k <> 0%nat -> rupd k a R 0%nat = 0 /\ clean_above (S k) (mkState (rupd k a R) M).
+Lemma comb_code_run : forall o re rl rr R M, arith_op o = false ->
+  re <> rl -> re <> rr -> R re = 0 ->
+  run (comb_code o re rl rr) (mkState R M) = mkState (rupd re (cval o (R rl) (R rr)) R) M.
 Proof.
-  intros R a k H0 Hz Hk; split; [rewrite rupd_other by lia; exact H0 |].
-  intros j Hj; cbn [regs]; rewrite rupd_other by lia; apply Hz; lia.
+  intros o re rl rr R M Ho H1 H2 Hre.
+  destruct o; try discriminate; cbn [comb_code cval];
+    rewrite ?run_cons, ?run_nil; cbn [step regs mem];
+    repeat first [ rewrite rupd_same | rewrite rupd_other by lia ];
+    rewrite ?rupd_shadow, Hre, ?Z.lxor_0_l; f_equal; f_equal; zcase.
 Qed.
 
-Lemma arith_case_ok : forall o, arith_op o = true ->
-  expr_ok (fun r => g1 r ++ g2 (S r) ++ [op_instr o r (S r)] ++ u2 (S r))
-          (fun r => g2 (S r) ++ [invert_instr (op_instr o r (S r))] ++ u2 (S r) ++ u1 r)
-          rt (denote o v1 v2) M.
+Lemma comb_gok : forall o g1 g2 v1 v2 M, arith_op o = false ->
+  gok g1 v1 M -> gok g2 v2 M -> gok (comb_block o g1 g2) (cval o v1 v2) M.
 Proof.
-  intros o Ea R H0 Hcl.
-  assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-  assert (Hop : step (op_instr o rt (S rt)) (mkState (rupd (S rt) v2 (rupd rt v1 R)) M)
-                = mkState (rupd (S rt) v2 (rupd rt (denote o v1 v2) R)) M).
-  { destruct o; try discriminate; simp_state; f_equal;
-      rewrite (rupd_comm rt (S rt)) by lia; now rewrite rupd_shadow. }
-  assert (Hinv : step (invert_instr (op_instr o rt (S rt)))
-                      (mkState (rupd (S rt) v2 (rupd rt (denote o v1 v2) R)) M)
-                 = mkState (rupd (S rt) v2 (rupd rt v1 R)) M).
-  { destruct o; try discriminate; simp_state; f_equal;
-      rewrite (rupd_comm rt (S rt)), rupd_shadow by lia; repeat f_equal.
-    - ring.
-    - ring.
-    - apply xor_involutive. }
-  destruct (Hok1 rt Hrt R H0 Hcl) as [G1 U1].
-  destruct (start_ok R v1 rt H0 Hz Hrt) as [H01 C1].
-  destruct (start_ok R (denote o v1 v2) rt H0 Hz Hrt) as [H0d Cd].
-  destruct (Hok2 (S rt) ltac:(lia) _ H01 C1) as [G2 U2].
-  destruct (Hok2 (S rt) ltac:(lia) _ H0d Cd) as [G2d U2d].
+  intros o g1 g2 v1 v2 M Ho H1 H2 r Hr.
+  destruct (H1 (S r) ltac:(lia)) as [W1 G1].
+  destruct (H2 (S (S r)) ltac:(lia)) as [W2 G2].
   split.
-  - rewrite run_app, G1, run_app, G2, run_app, run_one, Hop, U2d. reflexivity.
-  - rewrite run_app, G2d, run_app, run_one, Hinv, run_app, U2, U1. reflexivity.
+  - unfold comb_block.
+    repeat apply wf_code_app; try assumption; try (now apply wf_invert_code).
+    apply wf_comb_code; lia.
+  - intros R H0 Hcl. unfold comb_block.
+    assert (HR : R r = 0) by (apply Hcl; lia).
+    set (c := cval o v1 v2).
+    rewrite run_app, (G1 R H0 (clean_S _ _ Hcl)).
+    rewrite run_app, G2.
+    2: { now apply zero_rupd. }
+    2: { apply clean_rupd; [lia | now apply clean_S, clean_S]. }
+    rewrite run_app, comb_code_run by
+      (first [exact Ho | lia | rewrite !rupd_other by lia; exact HR]).
+    rewrite (rupd_same (S (S r))), rupd_other, rupd_same by lia.
+    fold c.
+    rewrite (rupd_comm r (S (S r))), (rupd_comm r (S r)) by lia.
+    rewrite run_app, (gok_uncompute g2 v2 M (S (S r))); try assumption; try lia.
+    + rewrite (gok_uncompute g1 v1 M (S r)); try assumption; try lia.
+      * reflexivity.
+      * now apply zero_rupd.
+      * apply clean_rupd; [lia | now apply clean_S].
+    + apply zero_rupd; [now apply zero_rupd | lia].
+    + apply clean_rupd; [lia |]. apply clean_rupd; [lia |].
+      now apply clean_S, clean_S.
 Qed.
 
-Lemma nz_case_ok :
-  expr_ok (nz_code g1 u1) (nz_code g1 u1) rt (b2z (negb (v1 =? 0))) M.
+Lemma inplace_reg_gok : forall o g1 g2 v1 v2 M, arith_op o = true ->
+  gok g1 v1 M -> gok g2 v2 M ->
+  gok (fun r => g1 r ++ g2 (S r) ++ [op_instr o r (S r)] ++ invert_code (g2 (S r)))
+      (denote o v1 v2) M.
 Proof.
-  intros R H0 Hcl.
-  assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-  assert (HR : R rt = 0) by (apply Hz; lia).
-  assert (Hcl' : clean_above (S rt) (mkState R M)) by (intros k Hk; apply Hz; lia).
+  intros o g1 g2 v1 v2 M Ho H1 H2 r Hr.
+  destruct (H1 r Hr) as [W1 G1].
+  destruct (H2 (S r) ltac:(lia)) as [W2 G2].
   split.
-  - rewrite (nz_code_ok g1 u1 rt v1 M R (Hok1 (S rt) ltac:(lia)) Hrt H0 Hcl').
-    now rewrite HR, Z.lxor_0_l.
-  - rewrite (nz_code_ok g1 u1 rt v1 M _ (Hok1 (S rt) ltac:(lia)) Hrt).
-    + rewrite rupd_same, Z.lxor_nilpotent, rupd_shadow, rupd_zero by exact HR.
-      reflexivity.
-    + rewrite rupd_other by lia. exact H0.
-    + intros k Hk; cbn [regs]. rewrite rupd_other by lia. apply Hz; lia.
+  - repeat apply wf_code_app; try assumption; try (now apply wf_invert_code).
+    apply Forall_cons; [destruct o; cbn; lia | apply Forall_nil].
+  - intros R H0 Hcl.
+    rewrite run_app, (G1 R H0 Hcl), run_app, G2.
+    2: { now apply zero_rupd. }
+    2: { apply clean_rupd; [lia | now apply clean_S]. }
+    rewrite run_app, run_one.
+    assert (Hop : step (op_instr o r (S r)) (mkState (rupd (S r) v2 (rupd r v1 R)) M)
+                  = mkState (rupd (S r) v2 (rupd r (denote o v1 v2) R)) M).
+    { destruct o; try discriminate; simp_state; f_equal;
+        rewrite (rupd_comm r (S r)) by lia; now rewrite rupd_shadow. }
+    rewrite Hop, (gok_uncompute g2 v2 M (S r)); try assumption; try lia.
+    + reflexivity.
+    + now apply zero_rupd.
+    + apply clean_rupd; [lia | now apply clean_S].
 Qed.
 
-Lemma cmp_case_ok : forall o, cmp_op o = true ->
-  expr_ok (fun r => g1 (S r) ++ g2 (S (S r))
-                    ++ cmp_fwd o r (S r) (S (S r)) (S (S (S r)))
-                    ++ [IXor (S r) (S r); IXor (S (S r)) (S (S r))])
-          (fun r => g1 (S r) ++ g2 (S (S r))
-                    ++ cmp_fwd o (S (S (S r))) (S r) (S (S r)) (S (S (S (S r))))
-                    ++ [IXor r (S (S (S r))); IXor (S (S (S r))) (S (S (S r)))]
-                    ++ u2 (S (S r)) ++ u1 (S r))
-          rt (denote o v1 v2) M.
+Lemma imm_code_run : forall o k r R M, arith_op o = true ->
+  run (imm_code o k r) (mkState R M) = mkState (rupd r (denote o (R r) k) R) M.
 Proof.
-  intros o Ho R H0 Hcl.
-  assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-  assert (Z0 : R rt = 0) by (apply Hz; lia).
-  assert (Z1 : R (S rt) = 0) by (apply Hz; lia).
-  assert (Z2 : R (S (S rt)) = 0) by (apply Hz; lia).
-  assert (Z3 : R (S (S (S rt))) = 0) by (apply Hz; lia).
-  assert (Z4 : R (S (S (S (S rt)))) = 0) by (apply Hz; lia).
-  set (d := denote o v1 v2).
-  (* forward *)
-  assert (Hcl1 : clean_above (S rt) (mkState R M)) by (intros k Hk; apply Hz; lia).
-  destruct (Hok1 (S rt) ltac:(lia) R H0 Hcl1) as [G1 U1].
-  destruct (start_ok R v1 (S rt) H0 ltac:(intros; apply Hz; lia) ltac:(lia)) as [H01 C1].
-  destruct (Hok2 (S (S rt)) ltac:(lia) _ H01 C1) as [G2 U2].
-  (* backward: the same operand code from [rupd rt d R] *)
-  destruct (start_ok R d rt H0 Hz Hrt) as [H0d Cd].
-  assert (Cd1 : clean_above (S rt) (mkState (rupd rt d R) M)) by exact Cd.
-  destruct (Hok1 (S rt) ltac:(lia) _ H0d Cd1) as [G1d _].
-  assert (H0d1 : rupd (S rt) v1 (rupd rt d R) 0%nat = 0)
-    by (rewrite !rupd_other by lia; exact H0).
-  assert (Cd2 : clean_above (S (S rt)) (mkState (rupd (S rt) v1 (rupd rt d R)) M)).
-  { intros k Hk; cbn [regs]; rewrite !rupd_other by lia; apply Hz; lia. }
-  destruct (Hok2 (S (S rt)) ltac:(lia) _ H0d1 Cd2) as [G2d _].
-  split.
-  - rewrite run_app, G1, run_app, G2, run_app, cmp_fwd_spec by
-      (first [exact Ho | lia | cbn [regs]; rewrite !rupd_other by lia; assumption]).
-    simp_state. f_equal. regs_ext; rewrite ?Z0, ?Z1, ?Z2; unfold d; try reflexivity; try apply Z.lxor_nilpotent; zcase.
-  - rewrite run_app, G1d, run_app, G2d, run_app, cmp_fwd_spec by
-      (first [exact Ho | lia | cbn [regs]; rewrite !rupd_other by lia; assumption]).
-    repeat first [ rewrite rupd_same | rewrite rupd_other by lia ].
-    assert (E : run [IXor rt (S (S (S rt))); IXor (S (S (S rt))) (S (S (S rt)))]
-                  (mkState (rupd (S (S (S rt))) d (rupd (S (S rt)) v2 (rupd (S rt) v1 (rupd rt d R)))) M)
-                = mkState (rupd (S (S rt)) v2 (rupd (S rt) v1 R)) M).
-    { simp_state. f_equal. regs_ext; rewrite ?Z0, ?Z3; try reflexivity; try apply Z.lxor_nilpotent. }
-    fold d. rewrite run_app, E, run_app, U2, U1. reflexivity.
+  intros o k r R M Ho; destruct o; try discriminate; cbn [imm_code denote].
+  - now rewrite cst_code_run.
+  - rewrite cst_code_run. replace (R r - k) with (R r + - k) by lia. reflexivity.
+  - destruct (Z.eqb_spec k 0) as [-> | Hk].
+    + cbn. now rewrite Z.lxor_0_r, rupd_id.
+    + reflexivity.
 Qed.
 
-Section Logical.
-
-Variables (p1 p2 : bool).
-Hypothesis H01 : p1 = true -> v1 = 0 \/ v1 = 1.
-Hypothesis H02 : p2 = true -> v2 = 0 \/ v2 = 1.
-
-Let w1 := b2z (negb (v1 =? 0)).
-Let w2 := b2z (negb (v2 =? 0)).
-
-(** The two operand flags, from any register file clean from [S rt] up. *)
-Lemma operands_ok : forall R, R 0%nat = 0 -> (forall k, (S rt <= k)%nat -> R k = 0) ->
-  run (flag_code p1 g1 u1 (S rt) ++ flag_code p2 g2 u2 (S (S rt))) (mkState R M)
-  = mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 R)) M
-  /\ run (unflag_code p2 g2 u2 (S (S rt)) ++ unflag_code p1 g1 u1 (S rt))
-         (mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 R)) M) = mkState R M.
+Lemma inplace_imm_gok : forall o k g1 v1 M, arith_op o = true ->
+  gok g1 v1 M -> gok (fun r => g1 r ++ imm_code o k r) (denote o v1 k) M.
 Proof.
-  intros R H0 Hz. unfold w1, w2.
-  destruct (flag_code_ok p1 g1 u1 (S rt) v1 M Hok1 H01 ltac:(lia) R H0
-              ltac:(intros k Hk; apply Hz; lia)) as [F1 U1].
-  destruct (start_ok R (b2z (negb (v1 =? 0))) (S rt) H0 Hz ltac:(lia)) as [H01' C1].
-  destruct (flag_code_ok p2 g2 u2 (S (S rt)) v2 M Hok2 H02 ltac:(lia) _ H01' C1) as [F2 U2].
-  split.
-  - rewrite run_app, F1, F2. reflexivity.
-  - rewrite run_app, U2, U1. reflexivity.
+  intros o k g1 v1 M Ho H1 r Hr. destruct (H1 r Hr) as [W1 G1]. split.
+  - apply wf_code_app; [exact W1 |].
+    destruct o; try discriminate; cbn [imm_code];
+      try apply wf_cst_code; destruct (k =? 0); wf_list.
+  - intros R H0 Hcl.
+    rewrite run_app, (G1 R H0 Hcl), imm_code_run by exact Ho.
+    now rewrite rupd_same, rupd_shadow.
 Qed.
 
-Lemma land_b2z : forall a b, Z.land (b2z a) (b2z b) = b2z (a && b).
-Proof. destruct a, b; reflexivity. Qed.
+(** ** Expression compilation is correct, clean and well-formed *)
 
-Lemma lor_b2z : forall a b, Z.lor (b2z a) (b2z b) = b2z (a || b).
-Proof. destruct a, b; reflexivity. Qed.
-
-Lemma and_case_ok :
-  expr_ok (fun r => flag_code p1 g1 u1 (S r) ++ flag_code p2 g2 u2 (S (S r))
-                    ++ [IAndx r (S r) (S (S r)); IXor (S (S r)) (S (S r))])
-          (fun r => flag_code p1 g1 u1 (S r) ++ flag_code p2 g2 u2 (S (S r))
-                    ++ [ IXor (S (S (S r))) (S r)
-                       ; IAndx (S (S (S (S r)))) (S (S (S r))) (S (S r))
-                       ; IXor r (S (S (S (S r))))
-                       ; IXor (S (S (S (S r)))) (S (S (S (S r)))) ]
-                    ++ unflag_code p2 g2 u2 (S (S r)) ++ unflag_code p1 g1 u1 (S r))
-          rt (denote OAnd v1 v2) M.
+Lemma const_value_eval : forall σ e k, const_value e = Some k -> eval σ e = k.
 Proof.
-  intros R H0 Hcl.
-  assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-  assert (Z0 : R rt = 0) by (apply Hz; lia).
-  assert (Z1 : R (S rt) = 0) by (apply Hz; lia).
-  assert (Z2 : R (S (S rt)) = 0) by (apply Hz; lia).
-  assert (Z3 : R (S (S (S rt))) = 0) by (apply Hz; lia).
-  assert (Z4 : R (S (S (S (S rt)))) = 0) by (apply Hz; lia).
-  assert (Hd : denote OAnd v1 v2 = Z.land w1 w2) by (unfold w1, w2; now rewrite land_b2z).
-  rewrite Hd.
-  destruct (operands_ok R H0 ltac:(intros; apply Hz; lia)) as [F U].
-  destruct (start_ok R (Z.land w1 w2) rt H0 Hz Hrt) as [H0d Cd].
-  destruct (operands_ok (rupd rt (Z.land w1 w2) R) H0d Cd) as [Fd _].
-  split.
-  - rewrite app_assoc, run_app, F. simp_state. f_equal.
-    regs_ext; rewrite ?Z0, ?Z1, ?Z2; vclose.
-  - rewrite app_assoc, run_app, Fd, run_app.
-    assert (E : run [ IXor (S (S (S rt))) (S rt)
-                    ; IAndx (S (S (S (S rt)))) (S (S (S rt))) (S (S rt))
-                    ; IXor rt (S (S (S (S rt))))
-                    ; IXor (S (S (S (S rt)))) (S (S (S (S rt)))) ]
-                  (mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 (rupd rt (Z.land w1 w2) R))) M)
-                = mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 R)) M).
-    { simp_state. rewrite Z3, Z4, !Z.lxor_0_l. f_equal.
-      regs_ext; rewrite ?Z0, ?Z3, ?Z4; vclose. }
-    rewrite E, U. reflexivity.
+  intros σ e; induction e as [n | x | o e1 IH1 e2 IH2]; intros k H;
+    cbn [const_value eval] in *.
+  - congruence.
+  - discriminate.
+  - destruct (arith_op o); [| discriminate].
+    destruct (const_value e1) as [a |]; [| discriminate].
+    destruct (const_value e2) as [b |]; [| discriminate].
+    injection H as <-. now rewrite (IH1 a), (IH2 b).
 Qed.
 
-Lemma or_case_ok :
-  expr_ok (fun r => flag_code p1 g1 u1 (S r) ++ flag_code p2 g2 u2 (S (S r))
-                    ++ [IOrx r (S r); IOrx r (S (S r))])
-          (fun r => flag_code p1 g1 u1 (S r) ++ flag_code p2 g2 u2 (S (S r))
-                    ++ [ IXor (S (S (S r))) (S r)
-                       ; IOrx (S (S (S (S (S r))))) (S (S (S r)))
-                       ; IXor (S (S (S (S r)))) (S (S r))
-                       ; IOrx (S (S (S (S (S r))))) (S (S (S (S r))))
-                       ; IXor r (S (S (S (S (S r)))))
-                       ; IXor (S (S (S (S (S r))))) (S (S (S (S (S r))))) ]
-                    ++ unflag_code p2 g2 u2 (S (S r)) ++ unflag_code p1 g1 u1 (S r))
-          rt (denote OOr v1 v2) M.
+Lemma fold_csts_eval : forall σ o e1 e2 k, fold_csts o e1 e2 = Some k ->
+  denote o (eval σ e1) (eval σ e2) = k.
 Proof.
-  intros R H0 Hcl.
-  assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-  assert (Z0 : R rt = 0) by (apply Hz; lia).
-  assert (Z1 : R (S rt) = 0) by (apply Hz; lia).
-  assert (Z2 : R (S (S rt)) = 0) by (apply Hz; lia).
-  assert (Z3 : R (S (S (S rt))) = 0) by (apply Hz; lia).
-  assert (Z4 : R (S (S (S (S rt)))) = 0) by (apply Hz; lia).
-  assert (Z5 : R (S (S (S (S (S rt))))) = 0) by (apply Hz; lia).
-  assert (Hd : denote OOr v1 v2 = Z.lor w1 w2) by (unfold w1, w2; now rewrite lor_b2z).
-  rewrite Hd.
-  destruct (operands_ok R H0 ltac:(intros; apply Hz; lia)) as [F U].
-  destruct (start_ok R (Z.lor w1 w2) rt H0 Hz Hrt) as [H0d Cd].
-  destruct (operands_ok (rupd rt (Z.lor w1 w2) R) H0d Cd) as [Fd _].
-  split.
-  - rewrite app_assoc, run_app, F. simp_state. rewrite Z0, Z.lor_0_l. f_equal.
-    regs_ext; rewrite ?Z1, ?Z2; vclose.
-  - rewrite app_assoc, run_app, Fd, run_app.
-    assert (E : run [ IXor (S (S (S rt))) (S rt)
-                    ; IOrx (S (S (S (S (S rt))))) (S (S (S rt)))
-                    ; IXor (S (S (S (S rt)))) (S (S rt))
-                    ; IOrx (S (S (S (S (S rt))))) (S (S (S (S rt))))
-                    ; IXor rt (S (S (S (S (S rt)))))
-                    ; IXor (S (S (S (S (S rt))))) (S (S (S (S (S rt))))) ]
-                  (mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 (rupd rt (Z.lor w1 w2) R))) M)
-                = mkState (rupd (S (S rt)) w2 (rupd (S rt) w1 R)) M).
-    { simp_state. rewrite Z3, Z4, Z5, !Z.lxor_0_l, Z.lor_0_l. f_equal.
-      regs_ext; rewrite ?Z0, ?Z3, ?Z4, ?Z5; vclose. }
-    rewrite E, U. reflexivity.
+  intros σ o [a | | ] [b | | ] k H; cbn in H; try discriminate.
+  injection H as <-. reflexivity.
 Qed.
 
-End Logical.
-End Cases.
+Lemma cval_logic : forall o a b, is_logic o = true ->
+  cval o (b2z (negb (a =? 0))) (b2z (negb (b =? 0))) = denote o a b.
+Proof.
+  intros o a b H; destruct o; try discriminate; cbn;
+    destruct (a =? 0), (b =? 0); reflexivity.
+Qed.
+
+Lemma cval_cmp : forall o a b, is_logic o = false -> cval o a b = denote o a b.
+Proof. intros o a b H; destruct o; try discriminate; reflexivity. Qed.
+
+Lemma is_nz_test_eval : forall o e2 σ v, is_nz_test o e2 = true ->
+  denote o v (eval σ e2) = b2z (negb (v =? 0)).
+Proof.
+  intros o e2 σ v H; destruct o; try discriminate.
+  destruct e2 as [k | |]; try discriminate. cbn in H. apply Z.eqb_eq in H. subst k.
+  reflexivity.
+Qed.
+
+Theorem gen_gok : forall σ M, (forall x : var, M (Z.of_nat x) = σ x) ->
+  forall e, gok (gen_expr e) (eval σ e) M.
+Proof.
+  intros σ M Hmod e.
+  induction e as [n | x | o e1 IH1 e2 IH2].
+  - apply cst_gok.
+  - now apply var_gok.
+  - intros r Hr. cbn [gen_expr eval].
+    destruct (fold_csts o e1 e2) as [k |] eqn:Ef.
+    { rewrite (fold_csts_eval σ o e1 e2 k Ef). exact (cst_gok k M r Hr). }
+    destruct (is_nz_test o e2) eqn:Enz.
+    { rewrite (is_nz_test_eval o e2 σ _ Enz). exact (nz_gok _ _ M IH1 r Hr). }
+    destruct (arith_op o) eqn:Ea.
+    { destruct (const_value e2) as [k |] eqn:Ec.
+      - rewrite (const_value_eval σ e2 k Ec).
+        exact (inplace_imm_gok o k (gen_expr e1) _ M Ea IH1 r Hr).
+      - exact (inplace_reg_gok o (gen_expr e1) (gen_expr e2) _ _ M Ea IH1 IH2 r Hr). }
+    destruct (is_logic o) eqn:El.
+    + rewrite <- (cval_logic o _ _ El).
+      apply (comb_gok o _ _ _ _ M Ea); [| | exact Hr].
+      * apply flag_gen_gok; [exact IH1 | apply is_flag_expr_01 |].
+        intros k ->; reflexivity.
+      * apply flag_gen_gok; [exact IH2 | apply is_flag_expr_01 |].
+        intros k ->; reflexivity.
+    + rewrite <- (cval_cmp o _ _ El).
+      exact (comb_gok o _ _ _ _ M Ea IH1 IH2 r Hr).
+Qed.
+
+(** Every instruction [gen_expr] emits is well-formed (`pisa.is_wf`), for
+    every expression and every target register other than r0. *)
+Theorem wf_gen_expr : forall e rt, rt <> 0%nat -> wf_code (gen_expr e rt).
+Proof.
+  intros e rt Hrt.
+  exact (proj1 (gen_gok (fun _ => 0) (fun _ => 0) (fun _ => eq_refl) e rt Hrt)).
+Qed.
+
+(** [g] / [u] evaluate a value [v] into register [r] and clear it again,
+    touching nothing else, from any register file with [r0 = 0] that is
+    clean from [r] up, over the memory [M]. *)
+Definition expr_ok (g u : reg -> code) (r : reg) (v : Z) (M : addr -> Z) : Prop :=
+  forall R, R 0%nat = 0 -> clean_above r (mkState R M) ->
+    run (g r) (mkState R M) = mkState (rupd r v R) M /\
+    run (u r) (mkState (rupd r v R) M) = mkState R M.
 
 Theorem gen_ungen_spec : forall σ M, (forall x : var, M (Z.of_nat x) = σ x) ->
   forall e rt, rt <> 0%nat -> expr_ok (gen_expr e) (ungen_expr e) rt (eval σ e) M.
 Proof.
-  intros σ M Hmod e.
-  induction e as [n | x | o e1 IH1 e2 IH2]; intros rt Hrt.
-  - (* Cst *)
-    intros R H0 Hcl.
-    assert (Hz : forall k, (rt <= k)%nat -> R k = 0) by (intros k Hk; apply (Hcl k Hk)).
-    cbn [gen_expr ungen_expr eval]. simp_state. rewrite (Hz rt) by lia.
-    rewrite Z.add_0_l, Z.sub_diag, rupd_shadow, rupd_zero by (apply Hz; lia).
-    split; reflexivity.
-  - (* Var *)
-    intros R H0 Hcl.
-    pose proof (gen_var_spec x rt (mkState R M) σ Hmod Hcl) as HG; cbn [regs mem] in HG.
-    cbn [gen_expr ungen_expr eval]. split; [exact HG |].
-    rewrite <- HG. apply run_invert_code. unfold gen_var; wf_list.
-  - (* Bin *)
-    cbn [eval].
-    destruct (arith_op o) eqn:Ea.
-    + (* + - ^ : the clean translation of the first version *)
-      intros R H0 Hcl. cbn [gen_expr ungen_expr]. rewrite Ea.
-      exact (arith_case_ok (gen_expr e1) (ungen_expr e1) (gen_expr e2) (ungen_expr e2)
-               _ _ M rt Hrt IH1 IH2 o Ea R H0 Hcl).
-    + destruct (is_nz_test o e2) eqn:Enz.
-      * (* [e1 != 0]: `_gen_nonzero` *)
-        destruct o; try discriminate Enz. destruct e2 as [k | | ]; try discriminate Enz.
-        cbn [is_nz_test] in Enz; apply Z.eqb_eq in Enz; subst k.
-        intros R H0 Hcl. cbn [gen_expr ungen_expr]. rewrite Ea.
-        exact (nz_case_ok (gen_expr e1) (ungen_expr e1) _ M rt Hrt IH1 R H0 Hcl).
-      * pose proof (is_flag_expr_01 σ e1) as F1.
-        pose proof (is_flag_expr_01 σ e2) as F2.
-        intros R H0 Hcl.
-        destruct o; try discriminate Ea; cbn [gen_expr ungen_expr]; rewrite Ea, Enz;
-          first
-            [ refine (cmp_case_ok (gen_expr e1) (ungen_expr e1) (gen_expr e2) (ungen_expr e2)
-                       _ _ M rt Hrt IH1 IH2 _ _ R H0 Hcl); reflexivity
-            | exact (and_case_ok (gen_expr e1) (ungen_expr e1) (gen_expr e2) (ungen_expr e2)
-                       _ _ M rt Hrt IH1 IH2 _ _ F1 F2 R H0 Hcl)
-            | exact (or_case_ok (gen_expr e1) (ungen_expr e1) (gen_expr e2) (ungen_expr e2)
-                       _ _ M rt Hrt IH1 IH2 _ _ F1 F2 R H0 Hcl) ].
+  intros σ M Hmod e rt Hrt R H0 Hcl. unfold ungen_expr.
+  pose proof (gen_gok σ M Hmod e) as G.
+  split; [exact (proj2 (G rt Hrt) R H0 Hcl) |].
+  exact (gok_uncompute _ _ M rt R G Hrt H0 Hcl).
 Qed.
 
 Theorem gen_expr_spec : forall e rt s σ,
@@ -762,6 +659,31 @@ Theorem ungen_expr_spec : forall e rt R M σ,
 Proof.
   intros e rt R M σ Hmod Hcl H0 Hrt.
   exact (proj2 (gen_ungen_spec σ M Hmod e rt Hrt R H0 Hcl)).
+Qed.
+
+(** [nz_code] as a stand-alone block over any correct operand code — used by
+    the test normalisation of CompileIf.v. *)
+Lemma nz_code_ok : forall σ M e r, (forall x : var, M (Z.of_nat x) = σ x) ->
+  r <> 0%nat -> forall R, R 0%nat = 0 -> clean_above r (mkState R M) ->
+  run (nz_code (gen_expr e) r) (mkState R M)
+  = mkState (rupd r (b2z (negb (eval σ e =? 0))) R) M.
+Proof.
+  intros σ M e r Hmod Hr R H0 Hcl.
+  exact (proj2 (nz_gok _ _ M (gen_gok σ M Hmod e) r Hr) R H0 Hcl).
+Qed.
+
+(** ** Statement compilation is well-formed *)
+
+Lemma wf_compile : forall st, wf_code (compile st).
+Proof.
+  induction st as [| x o e | x y | s1 IH1 s2 IH2]; simpl.
+  - apply Forall_nil.
+  - unfold gen_assign, ungen_expr.
+    apply wf_code_app; [apply wf_gen_expr; unfold scratch; lia |].
+    repeat (apply Forall_cons; [destruct o; simpl; first [exact I | lia] |]).
+    apply wf_invert_code, wf_gen_expr; unfold scratch; lia.
+  - unfold gen_swap; wf_list.
+  - apply wf_code_app; auto.
 Qed.
 
 (** ** Statement compilation is correct and clean *)
@@ -856,11 +778,9 @@ Qed.
 
 (** ** Main theorem: semantic preservation with a clean register file
 
-    Generalised to comparisons and [&&]/[||]: the one new premise is
-    [regs ms 0 = 0] (register [r0], hard-wired to 0 in `pisa_interp.py`,
-    is an operand of the two [SLTX] of the [e != 0] normalisation, which
-    `_logical_operands` and the programmer's own [e != 0] produce).  Every
-    control-flow theorem already had it. *)
+    The premise [regs ms 0 = 0] is needed because register [r0], hard-wired
+    to 0 in `pisa_interp.py`, is an operand of the two [SLTX] of the
+    [e != 0] normalisation.  Every control-flow theorem has it too. *)
 
 Theorem compile_spec : forall st σ σ' ms,
   exec st σ σ' -> wf_stmt st ->
@@ -899,22 +819,16 @@ Proof.
     split; [exact Hm2 | now rewrite Hr2, Hr1].
 Qed.
 
-(** ** Corollary: on the original fragment the compiled code is reversible
+(** ** Corollary: the compiled code is reversible, for every program
 
-    Semantic preservation plus [PISA.run_invert_code] gives the machine-level
-    counterpart of [Src.exec_rev]: running the compiled code and then its
-    instruction-wise inverse restores the whole machine state — for
-    programs over [+ - ^] ([arith_stmt]).  With a comparison this fails
-    ([compile_not_reversible]): `codegen.py`'s layout zeroes garbage with
-    [XOR r r] and uses ORX, neither of which has a local inverse. *)
+    Every instruction the compiler emits is well-formed ([wf_compile]), so
+    [PISA.run_invert_code] applies: running the compiled code and then its
+    instruction-wise inverse restores the whole machine state — from ANY
+    state, not only from one that models a store.  This is the machine-level
+    counterpart of [Src.exec_rev].  (Until 2026-09 this held for [+ - ^]
+    programs only; comparisons brought `XOR r r` clears and the clearing
+    ORX / ANDX along, see PISA.v.) *)
 
-Corollary compile_reversible : forall st s, arith_stmt st = true ->
+Corollary compile_reversible : forall st s,
   run (invert_code (compile st)) (run (compile st) s) = s.
-Proof. intros st s H; apply run_invert_code, wf_compile, H. Qed.
-
-Example compile_not_reversible :
-  let st := Assign 0%nat AAdd (Bin OEq (Var 1%nat) (Var 2%nat)) in
-  run (invert_code (compile st)) (run (compile st) zero_state) <> zero_state.
-Proof.
-  intros st H. apply (f_equal (fun s => mem s 0)) in H. vm_compute in H. discriminate.
-Qed.
+Proof. intros st s; apply run_invert_code, wf_compile. Qed.

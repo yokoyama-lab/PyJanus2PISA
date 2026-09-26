@@ -1,10 +1,9 @@
 # Reversible expression lowering
 
 This is the specification of how `codegen.py` compiles Janus expressions
-since branch `fix/reversible-expr` (2026-09).  It is written so that the Rocq
-model (`rocq/Compile.v`, `CompileLoop.v`, `CompileProc.v`) can be brought in
-line with it; the Rocq model still describes the previous lowering (see
-"What changed" below).
+since branch `fix/reversible-expr` (2026-09).  The Rocq model
+(`rocq/PISA.v`, `Compile.v`, `CompileIf.v`, …) follows it since branch
+`feat/rocq-reversible-expr` (see §6).
 
 ## 1. Well-formedness: `pisa.is_wf`
 
@@ -35,8 +34,9 @@ programs.  `pisa_interp.py` still *executes* ill-formed instructions.
     ANDX rd rs rt:   rd ^= rs & rt
 
 (previously `ORX rd rs: rd |= rs; rs := 0` and `ANDX rd1 rd2 rs:
-rd1 ^= rd2 & rs; rd2 := 0`, both non-injective; rocq/PISA.v
-`orx_not_injective` / `andx_not_injective`).
+rd1 ^= rd2 & rs; rd2 := 0`, both non-injective for every operand choice;
+the Rocq model proved that as `orx_not_injective` / `andx_not_injective`
+until it adopted the new semantics — a note in rocq/PISA.v records it).
 
 ## 2. The clean-expression contract
 
@@ -207,26 +207,44 @@ assignment, swap and flag update no longer exists.
     ADDI r4 2 ; EXCH r5 r4 ; ADD r5 r3 ; EXCH r5 r4 ; SUBI r4 2   ; r += r3
     (the first five lines' reverse, i.e. the whole <a < b → r3> backwards)
 
-## 6. What changed relative to the Rocq model
+## 6. The Rocq model
 
-`rocq/Compile.v` (`gen_expr` / `ungen_expr`, `cmp_fwd`) still models the old
-lowering; `tools/rocq_*` replay its legacy `IOrx` / `IAndx` through
-`tools/rocq_legacy.py`.  Differences a model update has to take in:
+Branch `feat/rocq-reversible-expr` (2026-09-26) brought `rocq/` in line with
+this document; `rocq/MANIFEST.md` ("Expressions") has the details.  Item by
+item, against the list of differences this section used to carry:
 
-1. `IOrx`/`IAndx` → 3-operand XOR-accumulating forms (`PISA.v`).
-2. Comparisons, `&`, `|`, `&&`, `||`: operands uncomputed right after the
-   combine (no `XOR r r`); `!=`/`=` without the extra register and ORX.
-3. `ungen_expr e = invert_code (gen_expr e)` for **every** expression (not
-   only arithmetic).  In particular the nonzero test's uneval is the reversed
-   SLTX pair.
-4. `+ - ^` with a constant right operand use an immediate.
-5. `*` (not in the Rocq fragment) and array reads (index uncomputed at once).
-6. Registers: the result register of a combine / multiplication / nonzero /
-   array read is allocated before its operands — the same shape as Compile.v's
-   target-register-first scheme (`gen_expr e rt` with operands above `rt`).
-   For `+ - ^` the result is the left operand's register.  Register numbers
-   are still `RegAlloc`'s lowest-free choice, so e.g. the address register of
-   a variable load sits between the target and the value register.
+1. **Done.** `IOrx`/`IAndx` are Pendulum's `rd ^= rs | rt` / `rd ^= rs & rt`
+   (`PISA.v`), self-inverse under `wf_instr` (`rd ∉ {rs, rt}`), which is
+   `pisa.is_wf` clause by clause (`EXCH` also needs `rd ≠ r0`).
+   `orx_not_injective` / `andx_not_injective` are replaced by a note.
+2. **Done.** Comparisons, `&&`, `||` use `_gen_combine`'s shape
+   (`Compile.comb_block` / `comb_code`); `!=`/`=` are the two exclusive SLTX
+   (plus `XORI 1`), no extra register, no ORX; no `XOR r r` anywhere.
+   `&` / `|` are not in the Rocq `expr` (see below).
+3. **Done.** `ungen_expr e rt := invert_code (gen_expr e rt)` for every
+   expression; the nonzero test's uncomputation is the reversed SLTX pair
+   (Test.v `gen_nz_shape`).
+4. **Done.** A constant right operand of `+ - ^` (`const_value`, which sees
+   `0 - 3`) is an immediate (`imm_code`); constants are `ADDI`/`SUBI`/nothing
+   (`cst_code`); two literal operands are folded (`fold_csts`), also the
+   `k != 0` that `_logical_operands` makes of a literal (`flag_gen`).
+5. **Not modelled**: `*` and arrays are not in the Rocq fragment.
+6. **As before**: the model's target-register-first scheme (`gen_expr e rt`,
+   temporaries above `rt`) has the same shape; register *numbers* still
+   differ from `RegAlloc`'s, which the cross-checks factor out (value
+   registers are anonymised in the skeleton).  The statement-level `x op= k`
+   fast path for a literal `k` is not modelled either (same effect).
+
+Proved: `wf_gen_expr` / `wf_compile` (every instruction the straight-line
+compiler emits is well-formed), `wf_compile_c` / `wf_compile_l` /
+`wf_whole` (the same for `if`, loops, and whole programs with procedures),
+and `compile_reversible` — `run (invert_code (compile st)) (run (compile st)
+s) = s` for **every** program and state (it used to need `+ - ^` only);
+`compile_spec`, `compile_c_spec`, `compile_l_spec`, `compile_p_spec`,
+`compile_p_program` keep their statements.  `tools/rocq_legacy.py` is gone:
+the three cross-checks (`rocq_loop_crosscheck.py` 17/17,
+`rocq_proc_crosscheck.py` 11/11, `rocq_diff.py` 14/14) replay the model's
+own ORX/ANDX and also check `is_wf` on the verified code.
 
 Cost: on the random expressions of `.claude/handoff/stress.py` (1000 per
 depth), `RegAllocError` drops from 0 / 36.0 / 76.8 / 82.7 % (depth 2 / 3 / 4 / 5)

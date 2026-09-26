@@ -140,7 +140,7 @@ the proof is about a compiler that has drifted from `codegen.py`:
 
 ```bash
 make -C rocq -f Makefile.driver   # needs OCaml
-python3 tools/rocq_diff.py        # 8/8 programs agree
+python3 tools/rocq_diff.py        # 14/14 programs agree
 ```
 
 It checks both directions at once: the verified compiler's instructions run on
@@ -148,14 +148,11 @@ It checks both directions at once: the verified compiler's instructions run on
 Python *interpreter*), and `codegen.py`'s output on the same source must give
 the same store (validating the Python *compiler*).
 
-**Known gap (2026-09-26):** the Rocq model still describes the previous
-expression lowering (clearing 2-operand `ORX`, clearing `ANDX`, `XOR r r`
-garbage clears after comparisons).  `codegen.py` now emits the reversible
-lowering of `docs/EXPR_LOWERING.md`; the cross-check tools replay the model's
-legacy `ORX`/`ANDX` through `tools/rocq_legacy.py`, stores and registers
-still agree, but the layout comparison of `tools/rocq_loop_crosscheck.py` /
-`tools/rocq_proc_crosscheck.py` reports every program whose tests contain
-expression code (section 6 of that document lists what the model must adopt).
+The Rocq model compiles expressions with the reversible lowering of
+`docs/EXPR_LOWERING.md` (Pendulum 3-operand `ORX`/`ANDX`, operands uncomputed
+at once, no `XOR r r` clears), proves every emitted instruction locally
+invertible, and proves `compile_reversible` for every straight-line program.
+All three cross-check tools also check the verified code against `pisa.is_wf`.
 
 ## Cross-checking against PyJanus
 

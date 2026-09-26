@@ -23,8 +23,8 @@ let instr_to_string (i : PISA.instr) : string =
   | PISA.INeg  rd       -> Printf.sprintf "NEG %d"     rd
   | PISA.IExch (rd, ra) -> Printf.sprintf "EXCH %d %d" rd ra
   | PISA.ISltx (rd, rs, rt) -> Printf.sprintf "SLTX %d %d %d" rd rs rt
-  | PISA.IOrx  (rd, rs) -> Printf.sprintf "ORX %d %d"  rd rs
-  | PISA.IAndx (rd1, rd2, rs) -> Printf.sprintf "ANDX %d %d %d" rd1 rd2 rs
+  | PISA.IOrx  (rd, rs, rt) -> Printf.sprintf "ORX %d %d %d"  rd rs rt
+  | PISA.IAndx (rd, rs, rt) -> Printf.sprintf "ANDX %d %d %d" rd rs rt
 
 (* Programs are given together with the Janus source text that
    tools/rocq_diff.py feeds to codegen.py, so the two sides cannot drift. *)
@@ -88,6 +88,21 @@ let cmp_cases : case list = [
                    add 4 (bin Src.OXor (bin Src.ONe (v 0) (c 0)) (bin Src.ONe (v 1) (c 0)));
                    add 5 (bin Src.OOr (bin Src.OAnd (bin Src.OLt (v 0) (c 0)) (bin Src.OGt (v 1) (c 0)))
                                       (bin Src.OEq (v 0) (v 1))) ];
+    nvars = 8 };
+  { name  = "imm_fold";
+    (* docs/EXPR_LOWERING.md: immediates for a constant right operand of
+       + - ^ (also the parser's 0 - 2), literal folding, `k != 0` folded
+       inside && / || *)
+    janus = decls ^ "  x += 7\n  y += x - 3\n  z0 += x ^ 5\n  z1 += (x < 10) && 5\n"
+            ^ "  z2 += 3 <= 5\n  z3 += y + (0 - 2)\n  z4 += (x != 0) || 0\n"
+            ^ "  z5 += x - (1 + 2)";
+    ast   = seqs [ add 0 (c 7); add 1 (bin Src.OSub (v 0) (c 3));
+                   add 2 (bin Src.OXor (v 0) (c 5));
+                   add 3 (bin Src.OAnd (bin Src.OLt (v 0) (c 10)) (c 5));
+                   add 4 (bin Src.OLe (c 3) (c 5));
+                   add 5 (bin Src.OAdd (v 1) (bin Src.OSub (c 0) (c 2)));
+                   add 6 (bin Src.OOr (bin Src.ONe (v 0) (c 0)) (c 0));
+                   add 7 (bin Src.OSub (v 0) (bin Src.OAdd (c 1) (c 2))) ];
     nvars = 8 };
 ]
 
