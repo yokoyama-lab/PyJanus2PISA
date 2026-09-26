@@ -1,4 +1,5 @@
 open BinInt
+open Datatypes
 
 type var = int
 
@@ -8,8 +9,22 @@ type binop =
 | OAdd
 | OSub
 | OXor
+| OEq
+| ONe
+| OLt
+| OGt
+| OLe
+| OGe
+| OAnd
+| OOr
+
+val b2z : bool -> int
 
 val denote : binop -> int -> int -> int
+
+val arith_op : binop -> bool
+
+val flag_op : binop -> bool
 
 type expr =
 | Cst of int

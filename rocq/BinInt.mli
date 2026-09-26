@@ -20,6 +20,8 @@ module Z :
 
   val compare : int -> int -> comparison
 
+  val leb : int -> int -> bool
+
   val ltb : int -> int -> bool
 
   val eqb : int -> int -> bool
@@ -27,6 +29,10 @@ module Z :
   val of_nat : int -> int
 
   val of_N : int -> int
+
+  val coq_lor : int -> int -> int
+
+  val coq_land : int -> int -> int
 
   val coq_lxor : int -> int -> int
  end

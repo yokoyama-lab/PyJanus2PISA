@@ -34,7 +34,8 @@ from lexer import tokenize
 from parser import parse
 from codegen import compile_program
 from pisa_interp import PISAMachine
-from pisa import ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, LabeledInstr
+from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX, ORX, ANDX,
+                  LabeledInstr)
 
 DRIVER = os.path.join(os.path.dirname(__file__), "..", "rocq", "driver")
 
@@ -48,6 +49,9 @@ _BUILD = {
     "XORI": lambda a: XORI(f"r{a[0]}", a[1]),
     "NEG":  lambda a: NEG(f"r{a[0]}"),
     "EXCH": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
+    "SLTX": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+    "ORX":  lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
+    "ANDX": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
 }
 
 
@@ -84,7 +88,7 @@ def run_bare(instrs, nvars: int) -> tuple:
     machine = PISAMachine(wrapped)
     machine.run()
     store = {v: machine.mem.get(v, 0) for v in range(nvars)}
-    regs = {r: machine._read_reg(f"r{r}") for r in range(3, 9)}
+    regs = {r: machine._read_reg(f"r{r}") for r in range(3, 32)}
     return store, regs
 
 
@@ -117,7 +121,12 @@ def main() -> int:
             problems.append(f"interpreter left garbage: {dirty}")
 
         # 2. the Python compiler against the verified compiler
-        py_store = run_python_compiler(case["source"], nvars)
+        # (pisa_interp.py raises at FINISH when codegen.py's code leaves
+        # garbage — report that as a difference, not as a crash)
+        try:
+            py_store = run_python_compiler(case["source"], nvars)
+        except Exception as ex:          # noqa: BLE001
+            py_store = f"{type(ex).__name__}: {ex}"
         if py_store != case["vars"]:
             problems.append(f"codegen.py: {py_store} != verified {case['vars']}")
 

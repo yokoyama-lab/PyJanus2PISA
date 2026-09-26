@@ -8,8 +8,11 @@
     below are literally those of [Janus.exec].
 
     This file covers the constructors the compiler currently handles —
-    [Skip], [Assign], [Swap], [Seq].  [If] / [Loop] / [Call] / [Uncall] need
-    PISA control flow and are milestone 2 (see MANIFEST.md). *)
+    [Skip], [Assign], [Swap], [Seq]; [If] / [Loop] / [Call] / [Uncall] are
+    in CompileIf.v, CompileLoop.v and SrcProc.v.  Expressions have the
+    arithmetic operators [+ - ^], the comparisons [= != < > <= >=] and the
+    logical [&& ||] (milestone 3).  [Janus.v] has [OEq]/[OLt] with the same
+    0/1 denotation; its [OMul]/[ODiv]/[OMod] are not compiled here. *)
 
 From Stdlib Require Import ZArith List Lia Bool.
 From Stdlib Require Import FunctionalExtensionality.
@@ -38,14 +41,47 @@ Definition sw (s : store) (x y : var) : store :=
 
 (** ** Syntax *)
 
-Inductive binop := OAdd | OSub | OXor.
+(** Arithmetic [+ - ^], the comparisons [= != < > <= >=], and the logical
+    [&& ||].  Janus semantics (PyJanus `runtime.py`, `_eval_bin`): a
+    comparison yields 0/1; [&&] / [||] read their operands as true when
+    nonzero and yield 0/1.  (PyJanus short-circuits [&&]/[||]; expressions
+    have no effects, so that is unobservable.) *)
+Inductive binop :=
+| OAdd | OSub | OXor
+| OEq | ONe | OLt | OGt | OLe | OGe
+| OAnd | OOr.
+
+Definition b2z (b : bool) : Z := if b then 1 else 0.
 
 Definition denote (o : binop) (a b : Z) : Z :=
   match o with
   | OAdd => a + b
   | OSub => a - b
   | OXor => Z.lxor a b
+  | OEq  => b2z (a =? b)
+  | ONe  => b2z (negb (a =? b))
+  | OLt  => b2z (a <? b)
+  | OGt  => b2z (b <? a)
+  | OLe  => b2z (a <=? b)
+  | OGe  => b2z (b <=? a)
+  | OAnd => b2z (negb (a =? 0) && negb (b =? 0))
+  | OOr  => b2z (negb (a =? 0) || negb (b =? 0))
   end.
+
+(** [+ - ^]: the operators of the original straight-line fragment. *)
+Definition arith_op (o : binop) : bool :=
+  match o with OAdd | OSub | OXor => true | _ => false end.
+
+(** Comparisons and logical operators: exactly the operators `_as_flag`
+    in `codegen.py` leaves alone, because their value is already 0/1. *)
+Definition flag_op (o : binop) : bool := negb (arith_op o).
+
+Lemma denote_flag : forall o a b, flag_op o = true ->
+  denote o a b = 0 \/ denote o a b = 1.
+Proof.
+  intros o a b H; destruct o; try discriminate; cbn [denote];
+    match goal with |- context [b2z ?c] => destruct c end; cbn; auto.
+Qed.
 
 Inductive expr :=
 | Cst (n : Z)
@@ -100,6 +136,20 @@ Fixpoint occurs (x : var) (e : expr) : bool :=
   | Cst _ => false
   | Var y => Nat.eqb x y
   | Bin _ e1 e2 => orb (occurs x e1) (occurs x e2)
+  end.
+
+(** Expressions / statements of the original fragment: [+ - ^] only. *)
+Fixpoint arith_expr (e : expr) : bool :=
+  match e with
+  | Bin o e1 e2 => arith_op o && arith_expr e1 && arith_expr e2
+  | _ => true
+  end.
+
+Fixpoint arith_stmt (st : stmt) : bool :=
+  match st with
+  | Assign _ _ e => arith_expr e
+  | Seq s1 s2 => arith_stmt s1 && arith_stmt s2
+  | _ => true
   end.
 
 Lemma eval_update_notin : forall x v s e,

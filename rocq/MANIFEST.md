@@ -16,7 +16,11 @@ global-variable procedures, recursion included (PISAProc.v / SrcProc.v /
 CompileProc.v: the machine gets `pisa_interp.py`'s software call stack, and
 `gen_proc`'s `f_top`/prologue/`f_bot` layout, `BRA f` and `BRA f_inv` are proved
 correct and clean for whole programs, with calls allowed anywhere, the `loop`
-part of a `from` loop included — see "Procedures"). It is the PISA counterpart of the "whole-translator semantic
+part of a `from` loop included — see "Procedures"). Expressions have the
+arithmetic operators `+ - ^`, the **comparisons `= != < > <= >=`** and the
+**logical `&&` / `||`**, compiled as `_gen_binop` / `_gen_uneval_binop` compile
+them, `ORX`/`ANDX` included (milestone 3, branch `feat/rocq-comparisons`,
+2026-09-26 — see "Expressions"). It is the PISA counterpart of the "whole-translator semantic
 preservation" that `RevLowering.v` in the PyJanus development explicitly leaves
 open.
 
@@ -24,9 +28,9 @@ open.
 
 | File | Contents |
 |---|---|
-| PISA.v | straight-line machine: registers, memory, `step`/`run`, local inverses (incl. `SLTX`) |
-| Src.v | source fragment `Skip`/`Assign`/`Swap`/`Seq`, `exec`, `invert` |
-| Compile.v | the straight-line compiler and `compile_spec` |
+| PISA.v | straight-line machine: registers, memory, `step`/`run`, local inverses (incl. `SLTX`); `ORX`/`ANDX` with `pisa_interp.py`'s semantics (not invertible) |
+| Src.v | source fragment `Skip`/`Assign`/`Swap`/`Seq`, `exec`, `invert`; expressions with `+ - ^`, `= != < > <= >=`, `&& \|\|` |
+| Compile.v | the straight-line compiler (`gen_expr`/`ungen_expr`, mutually recursive) and `compile_spec` |
 | Opt.v | `peephole` / `remove_nops` preserve `run` |
 | LOpt.v | first labeled-code model (direct branches); `remove_unused_labels`, label forwarding |
 | PISACtl.v | **control-flow machine**: labeled program, pc, `br`, paired branches, `cstep`/`steps`/`exec_fuel` |
@@ -46,10 +50,14 @@ open.
 | `step_invert` | PISA.v | every well-formed instruction is undone by `invert_instr` |
 | `run_invert_code` | PISA.v | `run (invert_code c) (run c s) = s` for well-formed `c` |
 | `exec_rev` | Src.v | `exec st a b → exec (invert st) b a` (the fragment is reversible) |
-| `wf_compile` | Compile.v | every instruction the compiler emits has distinct operand registers |
+| `orx_not_injective`, `andx_not_injective` | PISA.v | ORX / ANDX (`pisa_interp.py` semantics) are not injective for any operands, so no instruction undoes them |
+| `wf_compile` | Compile.v | on `+ - ^` programs (`arith_stmt`), every instruction the compiler emits has distinct operand registers |
+| `ungen_arith` | Compile.v | on `+ - ^` expressions `ungen_expr e = invert_code (gen_expr e)`: the code of the original fragment is unchanged |
+| `gen_ungen_spec` | Compile.v | `gen_expr` puts the value in the target and `ungen_expr` clears it, touching nothing else — for every operator (see "Expressions") |
 | `gen_expr_spec` | Compile.v | expression code is correct **and clean** (see below) |
 | **`compile_spec`** | Compile.v | **semantic preservation** — see below |
-| `compile_reversible` | Compile.v | `run (invert_code (compile st)) (run (compile st) s) = s` |
+| `compile_reversible` | Compile.v | `run (invert_code (compile st)) (run (compile st) s) = s` for `+ - ^` programs (`arith_stmt st = true`) |
+| `compile_not_reversible` | Compile.v | for `x0 += (x1 = x2)` it fails: `codegen.py`'s comparison code is clean but not instruction-wise invertible |
 | `peephole_run`, `remove_nops_run`, `optimize_run` | Opt.v | the optimizer passes preserve `run`, for all straight-line code |
 | `cancels_undo` | Opt.v | a cancelling pair is exactly a well-formed instruction followed by its inverse |
 | `strip_exec` | LOpt.v | `remove_unused_labels` preserves execution, on a PC-based labeled-code machine (axiom-free) |
@@ -83,11 +91,15 @@ open.
 ### The main theorem
 
 ```coq
-Theorem compile_spec : forall st σ σ' m,
+Theorem compile_spec : forall st σ σ' ms,
   exec st σ σ' -> wf_stmt st ->
-  models m σ -> clean_above scratch m ->
-  models (run (compile st) m) σ' /\ regs (run (compile st) m) = regs m.
+  models ms σ -> clean_above scratch ms -> regs ms 0%nat = 0 ->
+  models (run (compile st) ms) σ' /\ regs (run (compile st) ms) = regs ms.
 ```
+
+(`regs ms 0 = 0` is new with milestone 3: `r0` is an operand of the two
+`SLTX` of the `e != 0` normalisation, which `&&`/`||` operands and a
+programmer's own `e != 0` get. Every control-flow theorem already had it.)
 
 `models m σ` says memory cell `Z.of_nat x` holds `σ x` (the layout `codegen.py`
 emits as `DATA` words). The conjunction states two things at once:
@@ -101,18 +113,22 @@ emits as `DATA` words). The conjunction states two things at once:
 `gen_expr_spec` is the same idea for expressions, as an exact state equation:
 
 ```coq
-run (gen_expr e rt) s = mkState (rupd rt (eval σ e) (regs s)) (mem s)
+Theorem gen_expr_spec : forall e rt s σ,
+  models s σ -> clean_above rt s -> regs s 0%nat = 0 -> rt <> 0%nat ->
+  run (gen_expr e rt) s = mkState (rupd rt (eval σ e) (regs s)) (mem s).
 ```
 
 — the target register gains the value, *everything else is untouched*, including
-memory. The proof of the `Bin` case is where clean translation actually happens:
-the right operand's code is run, used, and then cancelled by `run_invert_code`.
+memory. For `+ - ^` the proof of the `Bin` case is where clean translation actually happens:
+the right operand's code is run, used, and then cancelled by its unevaluation
+(`ungen_expr`, which on these operators is `invert_code (gen_expr …)`).
 
 ## Scope and side conditions
 
 - **Fragment**: `Skip`, `x op= e`, `x <=> y`, `S1; S2`, with `op ∈ {+=, -=, ^=}`
-  and expressions over `+`, `-`, `^`. Source definitions are kept identical in
-  shape to `Janus.v` of the PyJanus development so results transfer.
+  and expressions over `+`, `-`, `^`, `= != < > <= >=`, `&&`, `||`. Source definitions are kept identical in
+  shape to `Janus.v` of the PyJanus development so results transfer (its
+  `OEq`/`OLt` have the same 0/1 denotation).
 - **`occurs x e = false`** on assignment — carried as a premise of `E_Assign`,
   exactly as in `Janus.v`. It is what makes unevaluation after the store sound.
 - **`x <> y`** on swap (`wf_stmt`). Semantically `sw s x x = s`, but every
@@ -173,11 +189,11 @@ These are `Janus.exec`'s rules (true = nonzero). Until 2026-09-25 they read
 normalisation removed the reason.
 
 **Test normalisation (`_as_flag`).** `flag_block e rt` is
-`_gen_flag_xor(rt, _as_flag(e))`. Src.expr has no comparisons or logical
-operators, so `_as_flag` keeps exactly the constants 0 and 1
-(`is_bool_const`; code `xor_block`: evaluate into `S rt`, `XOR rt (S rt)`,
-unevaluate) and turns everything else into `e != 0`, which `_gen_nonzero` /
-`_nonzero_into` compile as
+`_gen_flag_xor(rt, _as_flag(e))`. `_as_flag` keeps comparisons, `&&`/`||`
+and the constants 0 and 1 (`is_flag_expr`, Compile.v — until milestone 3 it
+was `is_bool_const`, the constants only; code `xor_block`: evaluate into
+`S rt`, `XOR rt (S rt)`, unevaluate) and turns everything else into `e != 0`,
+which `_gen_nonzero` / `_nonzero_into` compile as
 
 ```
 nz_block e rf = <eval e -> S rf> ; SLTX rf (S rf) r0 ; SLTX rf r0 (S rf) ; <uneval e>
@@ -249,9 +265,9 @@ Side conditions, all deliberate:
   `BEQ rt r0`, `BNE rt r0` and the `SLTX … r0` of `e != 0` read.
 - **Bodies** are straight-line statements or nested `If`s (`wf_cstmt` is
   `wf_stmt` on the leaves). Loops are in CompileLoop.v — see "Loops" below.
-- **Expressions** are Src.expr (`+ - ^`); so the only tests `_as_flag` leaves
-  alone are the constants 0/1. Comparisons and `&&`/`||` (which it also leaves
-  alone, and which are 0/1-valued) are milestone 3.
+- **Expressions** are Src.expr, comparisons and `&&`/`||` included since
+  milestone 3; the tests `_as_flag` leaves alone are exactly those whose value
+  is 0/1 (`is_flag_expr_01`), which is what `flag_block_spec` needs.
 
 `Print Assumptions` (recorded at build time at the end of CompileIf.v):
 
@@ -404,13 +420,16 @@ checks that the three violating programs get stuck at the `BNE` when no
 `finish` line exists, and the valid ones do not.
 
 **Cross-check.** `tools/rocq_loop_crosscheck.py` asks Rocq (`vm_compute`) for
-`compile_l fin_label st scratch 1`'s code and for `run_l` on the eleven programs
+`compile_l fin_label st scratch 1`'s code and for `run_l` on the programs
 of CompileLoop.v, runs that code on `pisa_interp.py` (between `start:` and
 `finish:`), compiles the same Janus source with `codegen.py` and runs it, and
 compares the control skeleton — labels, `BRA`/`BEQ`/`BNE`, `XORI`, `XOR r r`
-on a flag register, the `SLTX` pairs (flag register and `r0` side), `ADDI r0 0` —
+on a flag register, the `SLTX` (register named only if it is a flag
+register; `r0` side), `ORX`/`ANDX`, `ADDI r0 0` —
 of `codegen.py`'s unoptimised output with the Rocq layout, up to label renaming.
-**11/11 agree** (store, registers r3–r8, `br`, skeleton) against main a1088e2,
+**17/17 agree** (store, registers r3–r8 equal and r9–r31 zero, `br`, skeleton;
+2026-09-26, milestone 3: six programs with comparisons and `&&`/`||` in `if`
+and loop tests added — see "Expressions"); before that 11/11 against main a1088e2,
 including four programs with non-0/1 tests (`prog_if5`: test 5, assertion 10;
 `prog_if_else`: assertion `x0 + x1 - x1`; `prog_loop3`: token 3 through
 entry, exit test and re-entry; `prog_const`: the constants 0/1 path) and the
@@ -665,7 +684,7 @@ count, 25 procedure bodies' skeletons agree, PyJanus agrees on all ten;
 `g_finv` is an ordinary program too since the label fix (Janus x0, x1 =
 2, 200; codegen used to give −2, 0). (Before the S2 fix: 9/9 against main
 a21787a, with `g_s2` expected to fail — verified layout 17, codegen 5 with
-d = 10.) Runs in CI (Rocq job) since PR #9.
+d = 10.) Runs in CI (Rocq job) since PR #9. Since milestone 3 (2026-09-26): **11/11**, with `g_rec_cmp` (comparisons and `&&` in a recursive procedure and a loop test; PyJanus agrees).
 
 `Print Assumptions` (end of CompileProc.v / TestProc.v):
 
@@ -706,6 +725,142 @@ and every `Qed` proof admitted):
 | Rocq: `loop:` line `XORI rt 1` instead of the NOP | fails in `P_D` (CompileLoop.v: layout pinned) | loop 3/11 (every program with a loop DIFF); procedures 6/10 (`g_loop`, `g_loop_if`, `g_s2`, `g_rec_s2` DIFF) |
 | Rocq: drop the re-entry `BNE rt r0 finish` | fails in `P_D` | loop: 7 DIFF, then the script aborts on `prog_v2` (the verified run no longer terminates within the fuel); procedures 6/10 |
 
+## Expressions: comparisons and `&&` / `||` (milestone 3)
+
+Branch `feat/rocq-comparisons` (2026-09-26), against main 2b40697.
+
+### Source (Src.v)
+
+`binop` gains `OEq ONe OLt OGt OLe OGe OAnd OOr`; `denote` is Janus's
+(PyJanus `runtime.py`, `_eval_bin`): a comparison yields `b2z (a <? b)` etc.
+(0/1), `&&` / `||` read their operands as true when nonzero and yield 0/1.
+PyJanus short-circuits `&&`/`||`; expressions are pure, so that is
+unobservable. `Janus.v`'s `OEq`/`OLt` have the same denotation. `arith_op` /
+`arith_expr` / `arith_stmt` pick out the old `+ - ^` fragment.
+
+### Instructions (PISA.v)
+
+| instruction | semantics (= `pisa_interp.py`) | `invert_instr` | `wf_instr` |
+|---|---|---|---|
+| `ISltx rd rs rt` (already there) | `rd ^= (rs < rt)` | itself | `rd ∉ {rs, rt}` |
+| `IOrx rd rs` | `rd := rd lor rs`, then `rs := 0` | itself (as `_invert_instr`) | `False` |
+| `IAndx rd1 rd2 rs` | `rd1 ^= rd2 land rs`, then `rd2 := 0` | itself (as `_invert_instr`) | `False` |
+
+ORX / ANDX are **not reversible**, whatever the operands:
+`orx_not_injective` / `andx_not_injective` give, for every operand choice,
+two different states with the same successor (a state and its successor).
+So there is no "self-inverse under a well-formedness condition" to state;
+`step_invert` holds vacuously for them. (`codegen.py`'s `_invert_instr`
+maps ORX ↦ ORX and ANDX ↦ ANDX, which is wrong; it is reached only through
+`uneval_expr` / `_reverse_code`, and nothing calls `uneval_expr`, and
+`_reverse_code` is applied only to multiplication chains — a latent, not an
+observable, defect.)
+
+### The compiler (Compile.v)
+
+`gen_expr e rt` evaluates into `rt`; `ungen_expr e rt` (mutually recursive)
+clears `rt` again. With `r1 = S rt`, `r2 = S r1`, `r3 = S r2`, …:
+
+| `e` | `gen_expr e rt` | `ungen_expr e rt` |
+|---|---|---|
+| `e1 + e2` (`- ^`) | `gen e1 rt; gen e2 r1; ADD rt r1; ungen e2 r1` (unchanged) | `gen e2 r1; SUB rt r1; ungen e2 r1; ungen e1 rt` |
+| `e != 0` (`_is_nonzero_test`) | `gen e r1; SLTX rt r1 r0; SLTX rt r0 r1; ungen e r1` (`_gen_nonzero`) | the same (self-inverse) |
+| `e1 < e2` etc. | `gen e1 r1; gen e2 r2; <cmp rt r1 r2 [t=r3]>; XOR r1 r1; XOR r2 r2` | `gen e1 r1; gen e2 r2; <cmp r3 r1 r2 [t=r4]>; XOR rt r3; XOR r3 r3; ungen e2 r2; ungen e1 r1` |
+| `e1 && e2` | `fl e1 r1; fl e2 r2; ANDX rt r1 r2; XOR r2 r2` | `fl e1 r1; fl e2 r2; XOR r3 r1; ANDX r4 r3 r2; XOR rt r4; XOR r4 r4; unfl e2 r2; unfl e1 r1` |
+| `e1 \|\| e2` | `fl e1 r1; fl e2 r2; ORX rt r1; ORX rt r2` | `fl e1 r1; fl e2 r2; XOR r3 r1; ORX r5 r3; XOR r4 r2; ORX r5 r4; XOR rt r5; XOR r5 r5; unfl e2 r2; unfl e1 r1` |
+
+`<cmp rd r1 r2 [t]>` is `_gen_binop`'s block: `<` `SLTX rd r1 r2`; `>`
+`SLTX rd r2 r1`; `<=` `SLTX rd r2 r1; XORI rd 1`; `>=` `SLTX rd r1 r2; XORI rd 1`;
+`!=` `SLTX rd r1 r2; SLTX t r2 r1; ORX rd t`; `=` the same then `XORI rd 1`.
+`fl e r` is `_logical_operands`' `_as_flag(e)`: `gen e r` if `e` is 0/1 already
+(`is_flag_expr`: comparison, `&&`/`||`, constant 0/1), else `e != 0`.
+The uneval column is `_gen_uneval_binop` (re-evaluate the operands,
+recompute into `sub_re` (with `rl_copy` / `rr_copy` for `&&`/`||`), `XOR
+result sub_re`, `XOR sub_re sub_re`, unevaluate right then left).
+
+What is deliberately *not* `codegen.py`'s: (1) register numbers — the result
+is the target `rt` with the operands above it, `codegen.py` allocates the
+result after the operands; (2) the operand garbage of a comparison / `&&` is
+zeroed by `XOR r r` right after the operator, `codegen.py`'s
+`_clear_garbage` emits the same `XOR r r` at the end of the statement;
+(3) `+ - ^` keep Compile.v's clean translation (the right operand is
+unevaluated, not left as garbage), so a comparison as the *right* operand of
+`+ - ^` is unevaluated where `codegen.py` leaves garbage; (4) no constant
+folding and no `ADDI`-for-constants fast paths (semantically equal). On `+ - ^`
+expressions `ungen_expr = invert_code ∘ gen_expr` (`ungen_arith`), so the code
+of every pre-milestone-3 program is unchanged.
+
+### Theorems
+
+```coq
+Definition expr_ok (g u : reg -> code) (r : reg) (v : Z) (M : addr -> Z) : Prop :=
+  forall R, R 0%nat = 0 -> clean_above r (mkState R M) ->
+    run (g r) (mkState R M) = mkState (rupd r v R) M /\
+    run (u r) (mkState (rupd r v R) M) = mkState R M.
+
+Theorem gen_ungen_spec : forall σ M, (forall x : var, M (Z.of_nat x) = σ x) ->
+  forall e rt, rt <> 0%nat -> expr_ok (gen_expr e) (ungen_expr e) rt (eval σ e) M.
+```
+
+proved once per shape (`arith_case_ok`, `nz_case_ok`, `cmp_case_ok`,
+`and_case_ok`, `or_case_ok`, over arbitrary correct operand code) from
+`cmp_fwd_spec` (the six comparison blocks), `nz_code_ok` and `flag_code_ok`.
+The clean-translation argument for the new operators is not
+`run_invert_code` (ORX is not invertible) but the state equations: ANDX /
+ORX zero their source exactly when that source is a finished operand.
+
+Statement changes (everything else, in particular `compile_c_spec`,
+`compile_l_spec`, `compile_p_spec`, `compile_p_program` and `flag_block_spec`,
+is literally unchanged — generalised only through the larger `expr`):
+
+| theorem | change |
+|---|---|
+| `compile_spec`, `gen_assign_spec` | `+ regs ms 0 = 0` |
+| `gen_expr_spec` | `+ regs s 0 = 0`, `+ rt <> 0` |
+| `compile_at_spec`, `gen_assign_at_spec` (CompileIf.v) | `+ regs ms 0 = 0`, `+ b <> 0` (the callers had both) |
+| `xor_block_spec` | `+ regs s 0 = 0`, `+ rt <> 0` |
+| `compile_reversible`, `wf_compile`, `wf_gen_expr`, `wf_compile_at`, `wf_flag_block` | `+ arith_… = true` — **false** without it: `compile_not_reversible` (`x0 += (x1 = x2)`, machine-checked by `vm_compute`) |
+
+CompileFixed.v (fixed-width experiment) is restricted to `+ - ^`
+(`expr_vars_ok` now also demands `arith_op`): PISAFixed.v has no
+SLTX/ORX/ANDX, and a comparison does not commute with the wrap.
+
+### Checks
+
+- CompileLoop.v: `ex_cmp_and`, `ex_cmp_or`, `ex_cmp_loop` (`until 3 <= c`),
+  `ex_cmp_loop2` (`from (c = 0) && (d <= 0) … until (c > 5) || (x1 = 7)`),
+  `ex_logic_nonbool` (`x2 && x1` with 1, 2: logical, bitwise would be 0),
+  `ex_cmp_neg` (negative operands) — expected stores hand-computed, all by
+  `vm_compute`. TestProc.v: `g_rec_cmp` (comparisons and `&&` in a recursive
+  procedure, a loop with `=`/`>=`). Test.v: `prog_cmp_run`.
+- `tools/rocq_loop_crosscheck.py` **17/17** (the six programs above added;
+  r9..r31 must be 0 on both sides; the skeleton now also lists the
+  comparisons' SLTX / XORI (value register anonymised) and ORX / ANDX, in
+  order — so it checks that `gen_expr`/`ungen_expr` emit `_gen_binop` /
+  `_gen_uneval_binop`'s operator code in `_gen_flag_xor`'s order).
+- `tools/rocq_proc_crosscheck.py` **11/11** (`g_rec_cmp` added; PyJanus agrees).
+- `tools/rocq_diff.py` **13/13** (`cmp_lt`, `cmp_eq`, `cmp_gt_neg`: all six
+  comparisons on (3,5), (4,4), (−2,−7); `logical`: `1 && 2`, `2 || 0`,
+  `(x-1) && y`, …; `cmp_nested`: comparisons of comparisons, `1 + (x >= y)`,
+  `(x != 0) ^ (y != 0)`); registers r3..r31 checked; a `codegen.py` run that
+  raises (garbage at FINISH) is now reported as a DIFF instead of crashing.
+- `pytest`: 385 passed, 8 skipped (Python unchanged).
+- A random differential test of `codegen.py` + `pisa_interp.py` against
+  Janus semantics (10 000 expressions of depth ≤ 3 over all eleven
+  operators, in `x += e` and in `if e … fi e`; not committed) found no
+  wrong value — only `RegAllocError` (register exhaustion, out of scope).
+  **No Python defect in the lowering of comparisons / `&&` / `||`.**
+
+### Mutation tests (2026-09-26; each applied, checked, restored — `cmp` with the saved copy)
+
+| mutation | proof | cross-check |
+|---|---|---|
+| Rocq: `>` as `SLTX rd r1 r2` (operands swapped) | fails in `cmp_fwd_spec` | — (proof fails first) |
+| Rocq: drop the `XORI rd 1` of `<=` | fails in `cmp_fwd_spec` | — |
+| Rocq: `&&` / `||` bitwise (operands not normalised: `flag_code true`) | fails in `gen_ungen_spec` (no case lemma applies: `and_case_ok` needs 0/1 operands) | — |
+| Python: `_logical_operands` returns `e` (bitwise `&&`/`||`) | — | loop 16/17 (`prog_logic_nonbool`: c = 10, layout differs); `rocq_diff` 12/13 (`logical`: z1 = 0, z3 = 2) |
+| Python: drop the `XORI` of `>=` in `_gen_binop` | — | loop 15/17 (`prog_cmp_or`, `prog_cmp_neg`); `rocq_diff` 9/13 (one run ends with garbage) |
+
 ## Not covered (next milestones)
 
 1. **Control flow** — `If` and **`Loop`** are DONE (above) for the layouts of
@@ -727,7 +882,11 @@ and every `Qed` proof admitted):
    assertions inside procedures (only valid executions are covered).  Both
    Python defects found while writing the proof are fixed (a call in S2; the
    label collisions).
-3. **Arrays**, constant multiplication, comparison operators.
+3. **Arrays**, constant multiplication. (Comparison operators and `&&`/`||`
+   are DONE — see "Expressions". What remains of them: constant folding and
+   `codegen.py`'s register numbering are not modelled; `&` / `|` (bitwise,
+   `ANDX`/`ORX` too) and `!` are not in `Src.expr`; the fixed-width files
+   stay on `+ - ^`.)
 4. **The optimizer** — `peephole` and `remove_nops` are DONE for straight-line
    code (Opt.v: `optimize_run`; writing the proof exposed and fixed an unsound
    cancellation of aliased pairs like `XOR r r ; XOR r r` in `_cancels`), and
@@ -773,11 +932,14 @@ framework there may supply most of milestones 1–2 for free.
   `loop:` is a NOP, no `XORI rt 1` around S2, `has_call c = false` is gone
   from `wf_p` and `rupd b 1 R` from the S2 case, and the loop's round
   invariant carries `has_call a || has_call c = true -> clean_above scratch`.
-- **Comparisons in Src.expr** (milestone 3): `_as_flag` leaves comparisons and
-  `&&`/`||` alone; once Src.expr has them, `is_bool_const` must grow to
-  "comparison or logical operator or 0/1 constant" (and `flag_block_spec`
-  needs those to evaluate to 0/1). The `ISltx` instruction needed for them is
-  already in PISA.v.
+- **Comparisons in Src.expr** (milestone 3): DONE (2026-09-26, branch
+  `feat/rocq-comparisons`, see "Expressions"). When `_gen_binop` /
+  `_gen_uneval_binop` change: edit `cmp_fwd` or the `OAnd`/`OOr` branches of
+  `gen_expr`/`ungen_expr`; each shape has one lemma (`cmp_fwd_spec`,
+  `and_case_ok`, `or_case_ok`) and `tools/rocq_loop_crosscheck.py`'s skeleton
+  lists their SLTX/XORI/ORX/ANDX. Next: `&`/`|`/`!` (same machinery: `ANDX` /
+  `ORX` are there), and constant folding if the skeleton should ever compare
+  straight-line code too.
 - **Later-round violations**: `compile_l_loop_reentry_violation` is stated for
   the first round; the general one is `loop_round`^(k−1) followed by
   `back_violation`, i.e. an induction on `opn_l`.
@@ -821,9 +983,11 @@ make -f Makefile.driver     # extract + build (needs OCaml)
 cd .. && python3 tools/rocq_diff.py
 ```
 
-Currently 8/8 programs agree (re-run 2026-09-25 after `ISltx` was added to
-`PISA.instr`: the extracted `.ml`/`.mli` files were regenerated from
-Extract.v and `driver.ml` prints `SLTX`). `Makefile.driver` used to list only
+Currently **13/13** programs agree (2026-09-26, milestone 3: five programs
+with all six comparisons, `&&`/`||` on non-Boolean operands and nested
+comparisons added; `driver.ml` prints `ORX`/`ANDX` and reports r3..r31; the
+extracted `.ml`/`.mli` files were regenerated from Extract.v). Before that
+8/8 (re-run 2026-09-25 after `ISltx` was added to `PISA.instr`). `Makefile.driver` used to list only
 `PISA.ml Src.ml Compile.ml driver.ml`, which stopped linking (`Unbound module
 "BinInt"`) once the extracted modules started to `open BinInt` etc.; it now
 links every extracted `.ml`/`.mli` in `ocamldep -sort` order and builds the
@@ -937,7 +1101,13 @@ inverter.
 
 `functional_extensionality_dep`, and nothing else (`Print Assumptions` in
 `Test.v` and at the end of `CompileIf.v`, `CompileLoop.v`, `CompileProc.v` and
-`TestProc.v` reports it at build time; PISACtl.v's own lemmas and `steps_relabel` are axiom-free). It is used only to promote pointwise equality
+`TestProc.v` reports it at build time; PISACtl.v's own lemmas and `steps_relabel` are axiom-free).
+Milestone 3 (2026-09-26, clean rebuild of all 18 files): `compile_spec`,
+`gen_expr_spec`, `gen_ungen_spec`, `compile_reversible`, `step_invert`,
+`orx_not_injective`, `andx_not_injective`, `flag_block_spec`,
+`compile_c_spec`, `compile_l_spec`, `compile_l_program`, `compile_p_spec`,
+`compile_p_program`, `s2_call_works`: `functional_extensionality_dep` only;
+`compile_not_reversible`: closed under the global context. It is used only to promote pointwise equality
 of the register file and memory — both higher-order maps, `reg -> Z` and
 `addr -> Z` — to Leibniz equality. Removing it would require a first-order
 machine state (e.g. a bounded vector of registers). This is the same trade-off

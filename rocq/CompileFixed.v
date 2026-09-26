@@ -59,7 +59,7 @@ Definition op_instr (o : binop) (rd rs : reg) : instr :=
   match o with
   | OAdd => IAdd rd rs
   | OSub => ISub rd rs
-  | OXor => IXor rd rs
+  | _    => IXor rd rs   (* OXor; comparisons / logical ops are excluded by [expr_vars_ok] *)
   end.
 
 Definition aop_instr (o : aop) (rd rs : reg) : instr :=
@@ -172,12 +172,18 @@ Local Notation wf_state := (wf_state b).
 Definition models_w (s : state) (σ : store) : Prop :=
   forall x : var, mem s (Z.of_nat x) = wrap (σ x).
 
-(** NEW: every variable used lives at a representable address. *)
+(** NEW: every variable used lives at a representable address.
+
+    Also: only the arithmetic operators [+ - ^] ([arith_op]).  Comparisons
+    and [&&]/[||] (milestone 3, Compile.v) are not carried over to the
+    fixed-width machine: PISAFixed.v has no [SLTX]/[ORX]/[ANDX], and a
+    comparison does not commute with the wrap ([wrap_denote] is false for
+    [<]: [2^(b-1) - 1 < 2^(b-1)] but not after wrapping). *)
 Fixpoint expr_vars_ok (e : expr) : Prop :=
   match e with
   | Cst _ => True
   | Var x => in_window (Z.of_nat x)
-  | Bin _ e1 e2 => expr_vars_ok e1 /\ expr_vars_ok e2
+  | Bin o e1 e2 => arith_op o = true /\ expr_vars_ok e1 /\ expr_vars_ok e2
   end.
 
 Fixpoint stmt_vars_ok (st : stmt) : Prop :=
@@ -200,10 +206,10 @@ Lemma models_w_models : forall s σ,
 Proof. intros s σ H Hσ x; rewrite H; apply wrap_id; [exact Hb | apply Hσ]. Qed.
 
 (** The wrapped ALU agrees with Janus's operators modulo the window. *)
-Lemma wrap_denote : forall o a c,
+Lemma wrap_denote : forall o a c, arith_op o = true ->
   wrap (denote o (wrap a) (wrap c)) = wrap (denote o a c).
 Proof.
-  destruct o; simpl; intros.
+  destruct o; simpl; intros; try discriminate.
   - now rewrite wrap_add_l, wrap_add_r.
   - now rewrite wrap_sub_l, wrap_sub_r.
   - now rewrite wrap_lxor_l, wrap_lxor_r.
@@ -285,7 +291,7 @@ Proof.
   - (* Var *) now apply gen_var_spec.
   - (* Bin *)
     destruct s as [R M]; cbn [regs mem eval gen_expr] in *.
-    destruct Hvars as [Hv1 Hv2].
+    destruct Hvars as [Ho [Hv1 Hv2]].
     rewrite run_app, (IH1 rt (mkState R M) σ Hwf Hv1 Hmod Hcl); cbn [regs mem].
     assert (Hwf1 : wf_state (mkState (rupd rt (wrap (eval σ e1)) R) M))
       by (apply wf_mkState_rupd; [exact Hwf | apply wrap_range; exact Hb]).
@@ -307,7 +313,7 @@ Proof.
                        (mkState (rupd rt (wrap (denote o (eval σ e1) (eval σ e2))) R) M)).
     { rewrite (IH2 (S rt) _ σ HwfX Hv2 HmodX HclX); cbn [regs mem].
       (* the wrapped operands combine to the wrapped result: wrap_denote *)
-      destruct o; simp_state; f_equal.
+      destruct o; try discriminate Ho; simp_state; f_equal.
       - rewrite (rupd_comm rt (S rt)) by lia; rewrite rupd_shadow.
         now rewrite wrap_add_l, wrap_add_r.
       - rewrite (rupd_comm rt (S rt)) by lia; rewrite rupd_shadow.

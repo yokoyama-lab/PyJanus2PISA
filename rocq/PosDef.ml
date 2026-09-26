@@ -165,6 +165,90 @@ module Pos =
       (fun p -> ((fun p->2*p) p))
       n
 
+  (** val coq_lor : int -> int -> int **)
+
+  let rec coq_lor p q =
+    (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> (fun p->1+2*p) (coq_lor p0 q0))
+        (fun q0 -> (fun p->1+2*p) (coq_lor p0 q0))
+        (fun _ -> p)
+        q)
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> (fun p->1+2*p) (coq_lor p0 q0))
+        (fun q0 -> (fun p->2*p) (coq_lor p0 q0))
+        (fun _ -> (fun p->1+2*p) p0)
+        q)
+      (fun _ ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun _ -> q)
+        (fun q0 -> (fun p->1+2*p) q0)
+        (fun _ -> q)
+        q)
+      p
+
+  (** val coq_land : int -> int -> int **)
+
+  let rec coq_land p q =
+    (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> coq_Nsucc_double (coq_land p0 q0))
+        (fun q0 -> coq_Ndouble (coq_land p0 q0))
+        (fun _ -> 1)
+        q)
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> coq_Ndouble (coq_land p0 q0))
+        (fun q0 -> coq_Ndouble (coq_land p0 q0))
+        (fun _ -> 0)
+        q)
+      (fun _ ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun _ -> 1)
+        (fun _ -> 0)
+        (fun _ -> 1)
+        q)
+      p
+
+  (** val ldiff : int -> int -> int **)
+
+  let rec ldiff p q =
+    (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> coq_Ndouble (ldiff p0 q0))
+        (fun q0 -> coq_Nsucc_double (ldiff p0 q0))
+        (fun _ -> ((fun p->2*p) p0))
+        q)
+      (fun p0 ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun q0 -> coq_Ndouble (ldiff p0 q0))
+        (fun q0 -> coq_Ndouble (ldiff p0 q0))
+        (fun _ -> p)
+        q)
+      (fun _ ->
+      (fun f2p1 f2p f1 p ->
+  if p<=1 then f1 () else if p mod 2 = 0 then f2p (p/2) else f2p1 (p/2))
+        (fun _ -> 0)
+        (fun _ -> 1)
+        (fun _ -> 0)
+        q)
+      p
+
   (** val coq_lxor : int -> int -> int **)
 
   let rec coq_lxor p q =

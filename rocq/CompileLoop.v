@@ -1094,7 +1094,7 @@ Proof.
   - (* LBase *)
     intros b n p n' ms pre post Hwf Hcomp Hb Hmod Hcl H0 Hpre Hpost; simpl in Hcomp.
     injection Hcomp as <- <-.
-    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmod Hcl) as [Hm Hr].
+    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmod Hcl H0 Hb) as [Hm Hr].
     exists (run (compile_at b s) ms). split; [| split; assumption].
     rewrite length_ops. eapply steps_ops. reflexivity.
   - (* LSeq *)
@@ -1554,7 +1554,7 @@ Example ex_loop3 :
   run_l prog_loop3 = (true, 0, [0; 0; 3; 3; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
 Proof. vm_compute. reflexivity. Qed.
 
-(** The constants 0 and 1 are left alone by `_as_flag` ([is_bool_const]):
+(** The constants 0 and 1 are left alone by `_as_flag` ([is_flag_expr]):
     [if 1 then c += 1 else skip fi 1 ; from 1 do c += 2 loop skip until 1]. *)
 Definition prog_const : lstmt :=
   LSeq (LIf (Cst 1) (inc 3%nat 1) (LBase Skip) (Cst 1))
@@ -1562,6 +1562,83 @@ Definition prog_const : lstmt :=
 
 Example ex_const :
   run_l prog_const = (true, 0, [0; 0; 0; 3; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** *** Comparisons and [&&] / [||] in tests (milestone 3)
+
+    `_as_flag` leaves these alone ([is_flag_expr]); the expected stores are
+    Janus's (hand-computed, and re-checked against PyJanus by
+    `tools/rocq_loop_crosscheck.py` via codegen.py). *)
+
+(** [x0 += 2 ; x1 += 5 ; if (x0 < 3) && (x1 != 0) then c += 1 else c += 2 fi c = 1] *)
+Definition prog_cmp_and : lstmt :=
+  LSeq (inc 0%nat 2) (LSeq (inc 1%nat 5)
+    (LIf (Bin OAnd (Bin OLt (Var 0%nat) (Cst 3)) (Bin ONe (Var 1%nat) (Cst 0)))
+         (inc 3%nat 1) (inc 3%nat 2) (Bin OEq (Var 3%nat) (Cst 1)))).
+
+Example ex_cmp_and :
+  run_l prog_cmp_and = (true, 0, [2; 5; 0; 1; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** [x0 += 5 ; if (x0 < 3) || (x0 >= 7) then c += 1 else c += 2
+    fi (c = 1) || (c > 5)]: the else path. *)
+Definition prog_cmp_or : lstmt :=
+  LSeq (inc 0%nat 5)
+    (LIf (Bin OOr (Bin OLt (Var 0%nat) (Cst 3)) (Bin OGe (Var 0%nat) (Cst 7)))
+         (inc 3%nat 1) (inc 3%nat 2)
+         (Bin OOr (Bin OEq (Var 3%nat) (Cst 1)) (Bin OGt (Var 3%nat) (Cst 5)))).
+
+Example ex_cmp_or :
+  run_l prog_cmp_or = (true, 0, [5; 0; 0; 2; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** [from c = 0 do c += 1 loop x1 += 1 until 3 <= c]: three rounds. *)
+Definition prog_cmp_loop : lstmt :=
+  LLoop (Bin OEq (Var 3%nat) (Cst 0)) (inc 3%nat 1) (inc 1%nat 1)
+        (Bin OLe (Cst 3) (Var 3%nat)).
+
+Example ex_cmp_loop :
+  run_l prog_cmp_loop = (true, 0, [0; 2; 0; 3; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** [from (c = 0) && (d <= 0) do c += 2 loop d += 1 until (c > 5) || (x1 = 7)] *)
+Definition prog_cmp_loop2 : lstmt :=
+  LLoop (Bin OAnd (Bin OEq (Var 3%nat) (Cst 0)) (Bin OLe (Var 6%nat) (Cst 0)))
+        (inc 3%nat 2) (inc 6%nat 1)
+        (Bin OOr (Bin OGt (Var 3%nat) (Cst 5)) (Bin OEq (Var 1%nat) (Cst 7))).
+
+Example ex_cmp_loop2 :
+  run_l prog_cmp_loop2 = (true, 0, [0; 0; 0; 6; 0; 0; 2], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** [&&] / [||] on non-Boolean operands are logical: [1 && 2] is true
+    (bitwise [1 & 2 = 0]) — `_logical_operands` normalises them with
+    [e != 0] first.
+    [x2 += 1 ; x1 += 2 ; if x2 && x1 then c += 1 else skip fi c ;
+     if x1 || x0 then c += 10 else skip fi c] *)
+Definition prog_logic_nonbool : lstmt :=
+  LSeq (inc 2%nat 1) (LSeq (inc 1%nat 2)
+  (LSeq (LIf (Bin OAnd (Var 2%nat) (Var 1%nat)) (inc 3%nat 1) (LBase Skip) (Var 3%nat))
+        (LIf (Bin OOr (Var 1%nat) (Var 0%nat)) (inc 3%nat 10) (LBase Skip) (Var 3%nat)))).
+
+Example ex_logic_nonbool :
+  run_l prog_logic_nonbool = (true, 0, [0; 2; 1; 11; 0; 0; 0], [0; 0; 0; 0; 0; 0]).
+Proof. vm_compute. reflexivity. Qed.
+
+(** Negative values (the parser writes [-5] as [0 - 5]):
+    [x0 -= 4 ; if (x0 < 0) && (x0 > 0 - 5) then c += 1 else skip fi c = 1 ;
+     if (x0 <= 0 - 4) && (x0 >= 0 - 4) then d += 1 else skip fi d] *)
+Definition prog_cmp_neg : lstmt :=
+  LSeq (LBase (Assign 0%nat ASub (Cst 4)))
+  (LSeq (LIf (Bin OAnd (Bin OLt (Var 0%nat) (Cst 0))
+                       (Bin OGt (Var 0%nat) (Bin OSub (Cst 0) (Cst 5))))
+             (inc 3%nat 1) (LBase Skip) (Bin OEq (Var 3%nat) (Cst 1)))
+        (LIf (Bin OAnd (Bin OLe (Var 0%nat) (Bin OSub (Cst 0) (Cst 4)))
+                       (Bin OGe (Var 0%nat) (Bin OSub (Cst 0) (Cst 4))))
+             (inc 6%nat 1) (LBase Skip) (Var 6%nat))).
+
+Example ex_cmp_neg :
+  run_l prog_cmp_neg = (true, 0, [-4; 0; 0; 1; 0; 0; 1], [0; 0; 0; 0; 0; 0]).
 Proof. vm_compute. reflexivity. Qed.
 
 (** *** Violated assertions are detected

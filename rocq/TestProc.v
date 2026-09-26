@@ -203,6 +203,22 @@ Proof. vm_compute. reflexivity. Qed.
 Example ex_rec_s2 : agrees g_rec_s2 1 = true.
 Proof. vm_compute. reflexivity. Qed.
 
+(** *** 11. Comparisons and [&&] in a recursive procedure (milestone 3):
+    [f: if (x0 > 0) && (c < 100) then x0 -= 1; c += 1; call f; x0 += 1
+        else skip fi x0 > 0], [main: x0 += 3; call f; call f; uncall f;
+        from d = 0 do d += 1 loop skip until d >= 2] *)
+Definition g_rec_cmp : penv :=
+  [ PIf (Bin OAnd (Bin OGt (Var 0) (Cst 0)) (Bin OLt (Var 3) (Cst 100)))
+        (PSeq (dec 0 1) (PSeq (inc 3 1) (PSeq (PCall 0) (inc 0 1))))
+        (PBase Skip) (Bin OGt (Var 0) (Cst 0))
+  ; PSeq (inc 0 3) (PSeq (PCall 0) (PSeq (PCall 0) (PSeq (PUncall 0)
+      (PLoop (Bin OEq (Var 6) (Cst 0)) (inc 6 1) (PBase Skip) (Bin OGe (Var 6) (Cst 2))))))
+  ].
+Example ex_rec_cmp_src : run_src g_rec_cmp 1 = Some [3; 0; 0; 3; 0; 0; 2].
+Proof. vm_compute. reflexivity. Qed.
+Example ex_rec_cmp : agrees g_rec_cmp 1 = true.
+Proof. vm_compute. reflexivity. Qed.
+
 (** Every program above is within the theorem's scope ([wf_p] on every
     body, decided by [wf_pb]). *)
 Fixpoint wf_sb (s : stmt) : bool :=
@@ -247,7 +263,8 @@ Qed.
 
 Example ex_envs_wf :
   forallb (forallb wf_pb)
-    [g_call; g_uncall; g_nested; g_loop; g_if; g_rec; g_loop_if; g_finv; g_s2; g_rec_s2]
+    [g_call; g_uncall; g_nested; g_loop; g_if; g_rec; g_loop_if; g_finv; g_s2; g_rec_s2;
+     g_rec_cmp]
   = true.
 Proof. reflexivity. Qed.
 

@@ -1483,7 +1483,7 @@ Proof.
            H0 H1 Hcall; simpl in Hcomp.
     pose proof Hb as Hb3; unfold scratch in Hb3.
     injection Hcomp as <- <-.
-    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmodel Hcl) as [Hm Hr].
+    destruct (compile_at_spec b s σ σ' ms Hs Hwf Hmodel Hcl H0 ltac:(lia)) as [Hm Hr].
     destruct (compile_at b s) as [| i c] eqn:Ec.
     + assert (σ' = σ) by (eapply compile_at_nil; eassumption). subst σ'.
       destruct lo as [l |].
