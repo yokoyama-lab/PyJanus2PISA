@@ -70,8 +70,8 @@ Mapping decisions (janus2pisa dialect → phpisa PAL):
 | `ADD/SUB/XOR/NEG/ADDI/XORI/EXCH/BRA/RBRA/BEQ/BNE/BGEZ/SWAPBR/DATA/START/FINISH` | same mnemonic | operand order identical (`EXCH rd ra`: `swap(R[d], MEM[R[a]])`) |
 | `SUBI rd c` | `ADDI $d -c` | phpisa has no SUBI |
 | `SLTX rd rs rt` (rd ^= rs<rt) | `SUB $s $t; A: BGEZ $s B; XORI $d 1; B: BGEZ $s A; ADD $s $t` | phpisa (and Frank's PISA) have no SLTX; the BGEZ pair is a valid Pendulum skip; `rs=r0`/`rt=r0` use `BLEZ`/`BGEZ` without the SUB; error if rd aliases a source |
-| `ORX rd rs` (rd \|= rs; rs := 0) | `ANDX $d $d $s; XOR $d $s; XOR $s $s` | exact: `(d & ~s) ^ s = d \| s`; janus2pisa's ORX is *not* PISA's 3-operand `ORX $d $s $t` (d ^= s\|t) |
-| `ANDX rd1 rd2 rs` (rd1 ^= rd2&rs; rd2 := 0) | `ANDX $d1 $d2 $s; XOR $d2 $d2` | exact; PISA's ANDX does not clear rd2 |
+| `ORX rd rs rt` (rd ^= rs\|rt) | `ORX $d $s $t` | direct: since 2026-09 janus2pisa's ORX/ANDX have Pendulum's 3-operand XOR-into-dest semantics (they used to be a clearing 2-operand `ORX rd rs`: rd \|= rs; rs := 0, expanded to `ANDX $d $d $s; XOR $d $s; XOR $s $s`) |
+| `ANDX rd rs rt` (rd ^= rs&rt) | `ANDX $d $s $t` | direct (used to be a clearing `ANDX rd1 rd2 rs`: rd1 ^= rd2&rs; rd2 := 0, expanded to `ANDX $d1 $d2 $s; XOR $d2 $d2`) |
 | `ADDI/XORI` with 1023 < \|c\| ≤ 8184 | several `ADDI` | phpisa immediates are 11-bit two's complement |
 | `ADDI/XORI` with larger \|c\| < 2^32 | built in an unused scratch register with `ADDI`/`RL 10` chunks, applied with `ADD`/`SUB`/`XOR`, then un-computed with `ADDI -c`/`RR 10` | negative XOR constants use `x ^ c = ~(x ^ ~c)`, `~y = NEG; ADDI -1`; > 32-bit patterns are an error |
 | `ADDI r0 0` (labelled NOP) | kept | any other write to r0 is an error (r0 is hard-wired in pisa_interp, ordinary in phpisa) |
@@ -116,10 +116,10 @@ alias `main_bot`); the jumping instruction is retargeted to a fresh label.
 | 6 | immediates | any Python int | 11-bit two's complement; `e_ADDI`/`e_XORI` keep `imm & 0x7FF` silently; labels allowed as `ADDI` immediates (`-LABEL` negates) | `enc_arith_log.php:e_ADDI`, `asm_branch.php:sign_extend11`, `php_functions.php:60` |
 | 7 | branch offsets | label lookup, any distance | 11-bit, silently truncated | `enc_branch.php:5`, `INSTRUCTIONS.md:88,140` |
 | 8 | memory | separate sparse dict; only the *leading* run of `DATA` words is loaded (addresses 0..k-1) | memory **is** the program array: `EXCH` reads instruction words / DATA at that line and `set_mem` overwrites program lines; `DATA` anywhere is addressable | `pisa_interp.py:130-137`; `php_functions.php:13-25`, `INSTRUCTIONS.md:104` |
-| 9 | operand forms | 2-operand `ADD/SUB/XOR`; 2-operand `ORX` and 3-operand `ANDX` with *clearing* semantics; `SLTX`; `SUBI` | 2-operand `ADD/SUB/XOR`; 3-operand XOR-into-dest `ANDX/ORX/NORX`; `ANDIX/ORIX`; shifts/rotates; `BGTZ/BLEZ/BLTZ`; `SHOW/OUTPUT`; no `SLTX`, no `SUBI` | `pisa.py`; `INSTRUCTIONS.md` |
+| 9 | operand forms | 2-operand `ADD/SUB/XOR`; 3-operand XOR-into-dest `ANDX/ORX` (Pendulum's; until 2026-09 a 2-operand `ORX` and a 3-operand `ANDX` with *clearing* semantics); `SLTX`; `SUBI` | 2-operand `ADD/SUB/XOR`; 3-operand XOR-into-dest `ANDX/ORX/NORX`; `ANDIX/ORIX`; shifts/rotates; `BGTZ/BLEZ/BLTZ`; `SHOW/OUTPUT`; no `SLTX`, no `SUBI` | `pisa.py`; `INSTRUCTIONS.md` |
 | 10 | entry / exit | label `start` (required), `FINISH` returns the memory dict; garbage check on r3..r31 optional | `.start L` directive; `FINISH` throws `FinishException`; falling off either end stops silently with `finished=false`; `max_steps` 1,000,000 by default | `pisa_interp.py:140-143, 266-269`; `runner.php:45-66` |
 | 11 | labels | case-sensitive | case-insensitive (`strtoupper`), `;` comments, commas ignored | `php_functions.php:176-179` |
-| 12 | `XOR r r` (clear) | executed (irreversible) | executed (irreversible) | both accept it; codegen emits it for garbage clearing (no longer for the `from` flag, see D8) |
+| 12 | `XOR r r` (clear) | executed (irreversible) | executed (irreversible) | both accept it; codegen no longer emits it at all (2026-09: expressions are uncomputed by running their code backwards, and every emitted instruction satisfies `pisa.is_wf`, see `docs/EXPR_LOWERING.md`); it used to clear garbage registers, and earlier the `from` flag (D8) |
 | 13 | final state | memory dict (+ `regs`, `br`, `dump_state()`) | registers, `pc`, `direction`, `branch_reg`, `finished`, captured output; memory only via the `$program` global (used by `tools/phpisa_dump.php`) | `runner.php:70-77` |
 
 ## Corpus
@@ -149,7 +149,19 @@ purpose (both used to report OK with a garbage note).  `j1-sort` violates its
 `fi perm[j] > perm[j+1]` (checked with a reference evaluator over the same
 AST); it used to loop forever on pisa_interp and is now reported.
 
-Summary over the 26 assembled programs (5 SKIPPED):
+**Rerun 2026-09-26 (branch `fix/reversible-expr`: Pendulum ORX/ANDX, the
+reversible expression lowering of `docs/EXPR_LOWERING.md`, `x op= x`
+rejected).**  Every status is as below except `s9-self-assign`, which is now
+COMPILE-ERROR in both modes; the other changes are phpisa `pc`/`br` values in
+ERROR cells (the code is laid out differently).  Summary over the 25
+assembled programs (5 SKIPPED, 1 COMPILE-ERROR):
+
+| mode | fwd | bwd | rt-pisa | rt-php |
+|---|---|---|---|---|
+| faithful | 0 OK / 0 MISMATCH / 25 ERROR | 0 OK / 0 MISMATCH / 25 ERROR | 23 OK / 2 MISMATCH / 0 ERROR | 0 OK / 0 MISMATCH / 25 ERROR |
+| pendulum-cf | 22 OK / 1 MISMATCH / 2 ERROR | 22 OK / 0 MISMATCH / 3 ERROR | 23 OK / 2 MISMATCH / 0 ERROR | 22 OK / 1 MISMATCH / 2 ERROR |
+
+Before (2026-09-23/24), summary over the 26 assembled programs (5 SKIPPED):
 
 | mode | fwd | bwd | rt-pisa | rt-php |
 |---|---|---|---|---|
@@ -210,8 +222,8 @@ Per program:
 | s7-call-chain | pendulum-cf | OK | OK | OK | OK |
 | s8-compare-negative | faithful | ERROR(phpisa: did not reach FINISH (pc=-242, br=-249, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-242, br=-249, dir=1)) | OK | ERROR(fwd failed) |
 | s8-compare-negative | pendulum-cf | OK | OK | OK | OK |
-| s9-self-assign | faithful | ERROR(phpisa: did not reach FINISH (pc=-10, br=-12, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-10, br=-12, dir=1)) | MISMATCH(mem[0]=0 expected 21) | ERROR(fwd failed) |
-| s9-self-assign | pendulum-cf | OK | OK | MISMATCH(mem[0]=0 expected 21) | MISMATCH(mem[0]=0 expected 21) |
+| s9-self-assign | faithful | COMPILE-ERROR: `x += ...`: the assigned variable must not occur in the right-hand side (Janus) (since 2026-09-26, D9) | | | |
+| s9-self-assign | pendulum-cf | COMPILE-ERROR (as above) | | | |
 | show-array | faithful | ERROR(phpisa: did not reach FINISH (pc=-14, br=-18, dir=1)) | ERROR(phpisa: did not reach FINISH (pc=-14, br=-18, dir=1)) | OK | ERROR(fwd failed) |
 | show-array | pendulum-cf | OK | OK | OK | OK |
 | show-stack | faithful | SKIPPED: stacks (`stack s`, `show(s)`) are not part of pyjanus2pisa's Janus di… | | | |
@@ -352,7 +364,9 @@ program.
 variable on the right-hand side; the "self-referencing assignment
 optimization" compiles it, and `x -= x` is not its inverse.
 `s9-self-assign` (`int x = 21; x += x`): fwd/bwd agree on both interpreters
-(x = 42), round trip gives 0 on both.
+(x = 42), round trip gives 0 on both.  **Fixed 2026-09-26:** `x op= e` with
+`x` in `e` is rejected at compile time (the special case emitted `ADD rd rd` /
+`XOR rd rd`, which are not locally invertible); the row is now COMPILE-ERROR.
 
 **D10 (b, rfcl `rl-to-pisa`) – the emitted text is not PISA.**  Block entries
 are data instructions reached by `BRA` (same defect as D1), `EXCH Ri, Rj` is
@@ -363,8 +377,9 @@ agree with `rl-run` on both interpreters; `hand_countdown`, `hand_if_multi`
 agree on pisa_interp (direct jumps) but run off on phpisa; `fib_bennett`,
 `rgoto_copy` fail on both (phpisa: D1-type jump; pisa_interp: D2).
 
-**D11 (c) – adapter limitations.**  `SLTX`, `ORX`, `ANDX`, `SUBI` are
-pyjanus2pisa pseudo-instructions; their expansions are exact but the SLTX
+**D11 (c) – adapter limitations.**  `SLTX` and `SUBI` are
+pyjanus2pisa pseudo-instructions (`ORX`/`ANDX` were too, until they took
+Pendulum's semantics in 2026-09; they now map directly); their expansions are exact but the SLTX
 idiom uses a conditional-branch pair that pisa_interp would execute as a
 direct jump (so PAL produced from SLTX programs cannot be fed back to
 PISAMachine); constants ≥ 2^32 and branches beyond ±1024 lines are refused;
@@ -395,8 +410,9 @@ Next:
   Pendulum mode to `pisa_interp.py` (`PC += BR`, direction bit, reverse
   templates).  Then `--mode faithful` should be all-OK and
   `pal2pisa ../phpisa/samples/mult.pal` should print `R5 = 3 9 9 3`.
-  ~~Check D8 (verify `from` assertions instead of clearing rt)~~ (done) and D9 (reject
-  `x op= e` with `x ∈ vars(e)`).
+  ~~Check D8 (verify `from` assertions instead of clearing rt)~~ (done) and ~~D9 (reject
+  `x op= e` with `x ∈ vars(e)`)~~ (done 2026-09-26, with the reversible
+  expression lowering).
 * Day 3 – fixed-width registers: `--width 32` in both interpreters and the
   adapter (worker C's `RevSMod` window); rerun `s3-*`; add wrap-around
   programs (`x += 2147483647; x += 1` should give -2147483648).

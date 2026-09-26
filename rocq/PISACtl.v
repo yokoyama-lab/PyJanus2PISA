@@ -249,6 +249,43 @@ Proof. intros; apply length_map. Qed.
 Lemma length_ops_l : forall l c, length (ops_l l c) = length c.
 Proof. intros l [| i t]; simpl; [reflexivity | now rewrite length_ops]. Qed.
 
+(** ** Well-formed labeled programs
+
+    `pisa.is_wf` on every line: a data instruction must satisfy
+    [PISA.wf_instr], [SWAPBR rd] needs [rd <> r0] (r0 would lose [br]), and
+    branches are always well-formed. *)
+Definition wf_cinstr (x : cinstr) : Prop :=
+  match x with
+  | COp i => wf_instr i
+  | CSwapbr rd => rd <> 0%nat
+  | _ => True
+  end.
+
+Definition wf_lprog (p : lprog) : Prop := Forall (fun ln => wf_cinstr (snd ln)) p.
+
+Lemma wf_lprog_app : forall p q, wf_lprog p -> wf_lprog q -> wf_lprog (p ++ q).
+Proof. intros; now apply Forall_app. Qed.
+
+Lemma wf_ops : forall c, wf_code c -> wf_lprog (ops c).
+Proof. intros c H; apply Forall_map, Forall_impl with (P := wf_instr); auto. Qed.
+
+Lemma wf_ops_l : forall l c, wf_code c -> wf_lprog (ops_l l c).
+Proof.
+  intros l [| i t] H; [constructor |].
+  inversion H; subst; constructor; [assumption | now apply wf_ops].
+Qed.
+
+(** Discharge [wf_lprog] of a concrete layout, given its fragments. *)
+Ltac wf_lp :=
+  unfold wf_lprog;
+  repeat first
+    [ apply Forall_nil
+    | assumption
+    | apply wf_ops_l; assumption
+    | apply wf_ops; assumption
+    | apply Forall_app; split
+    | apply Forall_cons; [cbn [snd wf_cinstr wf_instr]; first [exact I | lia] |] ].
+
 Lemma snd_ops : forall c, map snd (ops c) = map COp c.
 Proof. induction c; simpl; congruence. Qed.
 

@@ -20,9 +20,10 @@ Program inversion follows the rules from:
 - PISA interpreter with Pendulum branch semantics and software call stack
 - Program inverter: given P, produces P⁻¹ (the semantic inverse) at the AST level
 - CLI with `--inverse`, `--ast`, and `--tokens` flags
-- Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, procedure inlining (with size limit; branch-free bodies only for `uncall` safety), and self-referencing assignment optimization
+- Optimization passes: peephole cancellation with store-block fusion (EXCH/EXCH), NOP removal, unreferenced-label removal, and procedure inlining (with size limit; branch-free bodies only for `uncall` safety)
+- Instruction-level reversibility: every emitted instruction is locally invertible (`pisa.is_wf`, checked by `compile_program`); expressions are uncomputed by running their code backwards, never by clearing registers (`docs/EXPR_LOWERING.md`).  `ORX`/`ANDX` are Pendulum's 3-operand `rd ^= rs | rt` / `rd ^= rs & rt`
 - Multiplication by a compile-time constant, compiled to a branch-free shift-and-add chain
-- 381 tests (380 passing, 1 skipped without an rfcl checkout)
+- 416 tests (415 passing, 1 skipped without an rfcl checkout)
 
 On a representative program exercising conditionals, loops, arrays, and procedure calls, the optimization passes reduce code size from 268 to 217 instructions (≈19%); see `program_stats` in `codegen.py`.
 
@@ -139,13 +140,19 @@ the proof is about a compiler that has drifted from `codegen.py`:
 
 ```bash
 make -C rocq -f Makefile.driver   # needs OCaml
-python3 tools/rocq_diff.py        # 8/8 programs agree
+python3 tools/rocq_diff.py        # 14/14 programs agree
 ```
 
 It checks both directions at once: the verified compiler's instructions run on
 `pisa_interp.py` must give what the formal machine model gives (validating the
 Python *interpreter*), and `codegen.py`'s output on the same source must give
 the same store (validating the Python *compiler*).
+
+The Rocq model compiles expressions with the reversible lowering of
+`docs/EXPR_LOWERING.md` (Pendulum 3-operand `ORX`/`ANDX`, operands uncomputed
+at once, no `XOR r r` clears), proves every emitted instruction locally
+invertible, and proves `compile_reversible` for every straight-line program.
+All three cross-check tools also check the verified code against `pisa.is_wf`.
 
 ## Cross-checking against PyJanus
 
@@ -230,7 +237,7 @@ main: SUBI r1 1
 | `parser.py` | Recursive-descent parser; produces AST |
 | `syntax.py` | AST node definitions |
 | `codegen.py` | AST → PISA instruction list (Axelsen CC 2011, Figs. 5, 6, 11, 12) |
-| `regalloc.py` | Three-category register allocator (free / committed / garbage) |
+| `regalloc.py` | Register allocator (free / committed; the garbage category is no longer used by codegen) |
 | `pisa.py` | PISA instruction set dataclasses and text printer |
 | `pisa_interp.py` | PISA interpreter with Pendulum branch semantics |
 | `inverse.py` | Janus program inverter (Yokoyama & Glück PEPM 2007) |

@@ -44,11 +44,17 @@ def test_subi_becomes_addi_negative():
     assert "ADDI $3 -5" in pisa2pal.convert(ir).pal
 
 
-def test_orx_andx_expansions_are_exact():
-    ir = pisa2pal.parse_pyjanus("start: START\n ORX r3 r4\n ANDX r5 r6 r7\n FINISH\n")
+def test_orx_andx_map_directly():
+    # pisa.py's ORX / ANDX are Pendulum's (rd ^= rs | rt, rd ^= rs & rt)
+    ir = pisa2pal.parse_pyjanus("start: START\n ORX r3 r4 r5\n ANDX r5 r6 r7\n FINISH\n")
     lines = pal_lines(pisa2pal.convert(ir).pal)
-    assert lines[1:4] == ["ANDX $3 $3 $4", "XOR $3 $4", "XOR $4 $4"]
-    assert lines[4:6] == ["ANDX $5 $6 $7", "XOR $6 $6"]
+    assert lines[1:3] == ["ORX $3 $4 $5", "ANDX $5 $6 $7"]
+
+
+def test_legacy_two_operand_orx_rejected():
+    ir = pisa2pal.parse_pyjanus("start: START\n ORX r3 r4\n FINISH\n")
+    with pytest.raises(pisa2pal.ConvertError):
+        pisa2pal.convert(ir)
 
 
 def test_sltx_branch_idiom():

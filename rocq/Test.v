@@ -73,7 +73,7 @@ Proof. reflexivity. Qed.
 (** ** Machine-level reversibility, on this concrete program *)
 
 Example prog_reversible : run (invert_code (compile prog)) final = zero_state.
-Proof. apply compile_reversible. reflexivity. Qed.
+Proof. apply compile_reversible. Qed.
 
 (** ** The store block of an assignment really is a paired exchange *)
 
@@ -99,9 +99,6 @@ Print Assumptions compile_reversible.
 Print Assumptions gen_expr_spec.
 Print Assumptions Compile.gen_ungen_spec.
 Print Assumptions Compile.ungen_expr_spec.
-Print Assumptions Compile.compile_not_reversible.
-Print Assumptions PISA.orx_not_injective.
-Print Assumptions PISA.andx_not_injective.
 
 (** ** Milestone 3: comparisons and [&&] / [||] on the machine
 
@@ -119,3 +116,69 @@ Example prog_cmp_run :
   map (mem s) [0; 1; 2; 3] = [3; 5; 1; 0]
   /\ map (regs s) (seq 3 10) = repeat 0 10.
 Proof. vm_compute. split; reflexivity. Qed.
+
+(** ** The reversible lowering of docs/EXPR_LOWERING.md, instruction by instruction *)
+
+(** [x < y] into r3: result register first, operands above it, both
+    uncomputed right after the [SLTX], right before left. *)
+Example gen_lt_shape :
+  gen_expr (Bin OLt (Var 0%nat) (Var 1%nat)) 3%nat
+  = gen_var 0%nat 4%nat ++ gen_var 1%nat 5%nat ++ [ISltx 3 4 5]%nat
+    ++ invert_code (gen_var 1%nat 5%nat) ++ invert_code (gen_var 0%nat 4%nat).
+Proof. reflexivity. Qed.
+
+(** [x = y]: two exclusive [SLTX] and [XORI 1] — no extra register, no ORX. *)
+Example gen_eq_shape :
+  gen_expr (Bin OEq (Var 0%nat) (Var 1%nat)) 3%nat
+  = gen_var 0%nat 4%nat ++ gen_var 1%nat 5%nat
+    ++ [ISltx 3 4 5; ISltx 3 5 4; IXori 3 1]%nat
+    ++ invert_code (gen_var 1%nat 5%nat) ++ invert_code (gen_var 0%nat 4%nat).
+Proof. reflexivity. Qed.
+
+(** A constant right operand of [+ - ^] is an immediate ([x - 3]: [SUBI]). *)
+Example gen_imm_shape :
+  gen_expr (Bin OSub (Var 0%nat) (Cst 3)) 3%nat = gen_var 0%nat 3%nat ++ [ISubi 3%nat 3].
+Proof. reflexivity. Qed.
+
+(** [x + y]: in place, only the right operand is uncomputed. *)
+Example gen_add_shape :
+  gen_expr (Bin OAdd (Var 0%nat) (Var 1%nat)) 3%nat
+  = gen_var 0%nat 3%nat ++ gen_var 1%nat 4%nat ++ [IAdd 3 4]%nat
+    ++ invert_code (gen_var 1%nat 4%nat).
+Proof. reflexivity. Qed.
+
+(** [x != 0]: `_gen_nonzero`; its uncomputation runs the SLTX pair in the
+    opposite order. *)
+Example gen_nz_shape :
+  gen_expr (Bin ONe (Var 0%nat) (Cst 0)) 3%nat
+  = gen_var 0%nat 4%nat ++ [ISltx 3 4 0; ISltx 3 0 4]%nat ++ invert_code (gen_var 0%nat 4%nat)
+  /\ ungen_expr (Bin ONe (Var 0%nat) (Cst 0)) 3%nat
+  = gen_var 0%nat 4%nat ++ [ISltx 3 0 4; ISltx 3 4 0]%nat ++ invert_code (gen_var 0%nat 4%nat).
+Proof. split; reflexivity. Qed.
+
+(** [x && 5]: `_logical_operands` makes [x] into [x != 0] and folds [5 != 0]
+    to the literal 1; Pendulum [ANDX] combines. *)
+Example gen_and_shape :
+  gen_expr (Bin OAnd (Var 0%nat) (Cst 5)) 3%nat
+  = nz_code (gen_var 0%nat) 4%nat ++ [IAddi 5%nat 1] ++ [IAndx 3 4 5]%nat
+    ++ [ISubi 5%nat 1] ++ invert_code (nz_code (gen_var 0%nat) 4%nat).
+Proof. reflexivity. Qed.
+
+(** Literal operands are folded ([3 <= 5] is the constant 1). *)
+Example gen_fold_shape : gen_expr (Bin OLe (Cst 3) (Cst 5)) 3%nat = [IAddi 3%nat 1].
+Proof. reflexivity. Qed.
+
+(** Comparisons and [&&]/[||] are reversible at the instruction level now
+    (the former [compile_not_reversible] was this program). *)
+Example prog_cmp_reversible :
+  run (invert_code (compile prog_cmp)) (run (compile prog_cmp) zero_state) = zero_state.
+Proof. apply compile_reversible. Qed.
+
+Example eq_reversible_vm :
+  let st := Assign 0%nat AAdd (Bin OEq (Var 1%nat) (Var 2%nat)) in
+  let s := run (invert_code (compile st)) (run (compile st) zero_state) in
+  map (mem s) [0; 1; 2] = [0; 0; 0] /\ map (regs s) (seq 0 12) = repeat 0 12.
+Proof. vm_compute. split; reflexivity. Qed.
+
+Print Assumptions wf_compile.
+Print Assumptions wf_gen_expr.

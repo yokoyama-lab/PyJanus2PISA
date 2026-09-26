@@ -19,6 +19,47 @@ let aop_instr o rd rs =
   | ASub -> ISub (rd, rs)
   | AXor -> IXor (rd, rs)
 
+(** val cst_code : int -> reg -> code **)
+
+let cst_code n rt =
+  if Z.eqb n 0
+  then []
+  else if Z.ltb 0 n
+       then (IAddi (rt, n)) :: []
+       else (ISubi (rt, (Z.opp n))) :: []
+
+(** val imm_code : binop -> int -> reg -> code **)
+
+let imm_code o k rt =
+  match o with
+  | OSub -> cst_code (Z.opp k) rt
+  | OXor -> if Z.eqb k 0 then [] else (IXori (rt, k)) :: []
+  | _ -> cst_code k rt
+
+(** val const_value : expr -> int option **)
+
+let rec const_value = function
+| Cst n -> Some n
+| Var _ -> None
+| Bin (o, e1, e2) ->
+  if arith_op o
+  then (match const_value e1 with
+        | Some a ->
+          (match const_value e2 with
+           | Some b -> Some (denote o a b)
+           | None -> None)
+        | None -> None)
+  else None
+
+(** val fold_csts : binop -> expr -> expr -> int option **)
+
+let fold_csts o e1 e2 =
+  match e1 with
+  | Cst a -> (match e2 with
+              | Cst b -> Some (denote o a b)
+              | _ -> None)
+  | _ -> None
+
 (** val gen_var : var -> reg -> code **)
 
 let gen_var x rt =
@@ -44,173 +85,85 @@ let is_nz_test o e2 =
             | _ -> false)
   | _ -> false
 
-(** val nz_code : (reg -> code) -> (reg -> code) -> reg -> code **)
+(** val is_logic : binop -> bool **)
 
-let nz_code g u r =
-  app (g (Stdlib.Int.succ r)) ((ISltx (r, (Stdlib.Int.succ r), 0)) :: ((ISltx
-    (r, 0, (Stdlib.Int.succ r))) :: (u (Stdlib.Int.succ r))))
+let is_logic = function
+| OAnd -> true
+| OOr -> true
+| _ -> false
 
-(** val flag_code : bool -> (reg -> code) -> (reg -> code) -> reg -> code **)
+(** val nz_code : (reg -> code) -> reg -> code **)
 
-let flag_code p g u r =
-  if p then g r else nz_code g u r
+let nz_code g r =
+  app (g (Stdlib.Int.succ r))
+    (app ((ISltx (r, (Stdlib.Int.succ r), 0)) :: ((ISltx (r, 0,
+      (Stdlib.Int.succ r))) :: [])) (invert_code (g (Stdlib.Int.succ r))))
 
-(** val unflag_code :
-    bool -> (reg -> code) -> (reg -> code) -> reg -> code **)
+(** val flag_gen : expr -> (reg -> code) -> reg -> code **)
 
-let unflag_code p g u r =
-  if p then u r else nz_code g u r
+let flag_gen e g =
+  if is_flag_expr e
+  then g
+  else (match e with
+        | Cst k -> cst_code (b2z (negb (Z.eqb k 0)))
+        | _ -> nz_code g)
 
-(** val cmp_fwd : binop -> reg -> reg -> reg -> reg -> code **)
+(** val comb_code : binop -> reg -> reg -> reg -> code **)
 
-let cmp_fwd o rd r1 r2 t =
+let comb_code o re rl rr =
   match o with
   | OEq ->
-    (ISltx (rd, r1, r2)) :: ((ISltx (t, r2, r1)) :: ((IOrx (rd,
-      t)) :: ((IXori (rd, 1)) :: [])))
-  | ONe ->
-    (ISltx (rd, r1, r2)) :: ((ISltx (t, r2, r1)) :: ((IOrx (rd, t)) :: []))
-  | OLt -> (ISltx (rd, r1, r2)) :: []
-  | OGt -> (ISltx (rd, r2, r1)) :: []
-  | OLe -> (ISltx (rd, r2, r1)) :: ((IXori (rd, 1)) :: [])
-  | OGe -> (ISltx (rd, r1, r2)) :: ((IXori (rd, 1)) :: [])
+    (ISltx (re, rl, rr)) :: ((ISltx (re, rr, rl)) :: ((IXori (re, 1)) :: []))
+  | ONe -> (ISltx (re, rl, rr)) :: ((ISltx (re, rr, rl)) :: [])
+  | OLt -> (ISltx (re, rl, rr)) :: []
+  | OGt -> (ISltx (re, rr, rl)) :: []
+  | OLe -> (ISltx (re, rr, rl)) :: ((IXori (re, 1)) :: [])
+  | OGe -> (ISltx (re, rl, rr)) :: ((IXori (re, 1)) :: [])
+  | OAnd -> (IAndx (re, rl, rr)) :: []
+  | OOr -> (IOrx (re, rl, rr)) :: []
   | _ -> []
+
+(** val comb_block :
+    binop -> (reg -> code) -> (reg -> code) -> reg -> code **)
+
+let comb_block o g1 g2 rt =
+  app (g1 (Stdlib.Int.succ rt))
+    (app (g2 (Stdlib.Int.succ (Stdlib.Int.succ rt)))
+      (app
+        (comb_code o rt (Stdlib.Int.succ rt) (Stdlib.Int.succ
+          (Stdlib.Int.succ rt)))
+        (app (invert_code (g2 (Stdlib.Int.succ (Stdlib.Int.succ rt))))
+          (invert_code (g1 (Stdlib.Int.succ rt))))))
 
 (** val gen_expr : expr -> reg -> code **)
 
 let rec gen_expr e rt =
   match e with
-  | Cst n -> (IAddi (rt, n)) :: []
+  | Cst n -> cst_code n rt
   | Var x -> gen_var x rt
   | Bin (o, e1, e2) ->
-    if arith_op o
-    then app (gen_expr e1 rt)
-           (app (gen_expr e2 (Stdlib.Int.succ rt))
-             (app ((op_instr o rt (Stdlib.Int.succ rt)) :: [])
-               (ungen_expr e2 (Stdlib.Int.succ rt))))
-    else if is_nz_test o e2
-         then nz_code (gen_expr e1) (ungen_expr e1) rt
-         else (match o with
-               | OAnd ->
-                 app
-                   (flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1)
-                     (Stdlib.Int.succ rt))
-                   (app
-                     (flag_code (is_flag_expr e2) (gen_expr e2)
-                       (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     ((IAndx (rt, (Stdlib.Int.succ rt), (Stdlib.Int.succ
-                     (Stdlib.Int.succ rt)))) :: ((IXor ((Stdlib.Int.succ
-                     (Stdlib.Int.succ rt)), (Stdlib.Int.succ (Stdlib.Int.succ
-                     rt)))) :: [])))
-               | OOr ->
-                 app
-                   (flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1)
-                     (Stdlib.Int.succ rt))
-                   (app
-                     (flag_code (is_flag_expr e2) (gen_expr e2)
-                       (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     ((IOrx (rt, (Stdlib.Int.succ rt))) :: ((IOrx (rt,
-                     (Stdlib.Int.succ (Stdlib.Int.succ rt)))) :: [])))
-               | _ ->
-                 app (gen_expr e1 (Stdlib.Int.succ rt))
-                   (app (gen_expr e2 (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     (app
-                       (cmp_fwd o rt (Stdlib.Int.succ rt) (Stdlib.Int.succ
-                         (Stdlib.Int.succ rt)) (Stdlib.Int.succ
-                         (Stdlib.Int.succ (Stdlib.Int.succ rt))))
-                       ((IXor ((Stdlib.Int.succ rt), (Stdlib.Int.succ
-                       rt))) :: ((IXor ((Stdlib.Int.succ (Stdlib.Int.succ
-                       rt)), (Stdlib.Int.succ (Stdlib.Int.succ rt)))) :: [])))))
+    (match fold_csts o e1 e2 with
+     | Some k -> cst_code k rt
+     | None ->
+       if is_nz_test o e2
+       then nz_code (gen_expr e1) rt
+       else if arith_op o
+            then app (gen_expr e1 rt)
+                   (match const_value e2 with
+                    | Some k -> imm_code o k rt
+                    | None ->
+                      app (gen_expr e2 (Stdlib.Int.succ rt))
+                        (app ((op_instr o rt (Stdlib.Int.succ rt)) :: [])
+                          (invert_code (gen_expr e2 (Stdlib.Int.succ rt)))))
+            else if is_logic o
+                 then comb_block o (flag_gen e1 (gen_expr e1))
+                        (flag_gen e2 (gen_expr e2)) rt
+                 else comb_block o (gen_expr e1) (gen_expr e2) rt)
 
 (** val ungen_expr : expr -> reg -> code **)
 
-and ungen_expr e rt =
-  match e with
-  | Cst n -> (ISubi (rt, n)) :: []
-  | Var x -> invert_code (gen_var x rt)
-  | Bin (o, e1, e2) ->
-    if arith_op o
-    then app (gen_expr e2 (Stdlib.Int.succ rt))
-           (app ((invert_instr (op_instr o rt (Stdlib.Int.succ rt))) :: [])
-             (app (ungen_expr e2 (Stdlib.Int.succ rt)) (ungen_expr e1 rt)))
-    else if is_nz_test o e2
-         then nz_code (gen_expr e1) (ungen_expr e1) rt
-         else (match o with
-               | OAnd ->
-                 app
-                   (flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1)
-                     (Stdlib.Int.succ rt))
-                   (app
-                     (flag_code (is_flag_expr e2) (gen_expr e2)
-                       (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     (app ((IXor ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ rt))), (Stdlib.Int.succ
-                       rt))) :: ((IAndx ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ rt)))),
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))), (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt)))) :: ((IXor (rt, (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt)))))) :: ((IXor ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ rt)))),
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ rt)))))) :: []))))
-                       (app
-                         (unflag_code (is_flag_expr e2) (gen_expr e2)
-                           (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ
-                           rt)))
-                         (unflag_code (is_flag_expr e1) (gen_expr e1)
-                           (ungen_expr e1) (Stdlib.Int.succ rt)))))
-               | OOr ->
-                 app
-                   (flag_code (is_flag_expr e1) (gen_expr e1) (ungen_expr e1)
-                     (Stdlib.Int.succ rt))
-                   (app
-                     (flag_code (is_flag_expr e2) (gen_expr e2)
-                       (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     (app ((IXor ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ rt))), (Stdlib.Int.succ
-                       rt))) :: ((IOrx ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))))), (Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ rt))))) :: ((IXor ((Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt)))), (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt)))) :: ((IOrx ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))))), (Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ rt)))))) :: ((IXor
-                       (rt, (Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))))))) :: ((IXor ((Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))))), (Stdlib.Int.succ (Stdlib.Int.succ
-                       (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                       rt))))))) :: []))))))
-                       (app
-                         (unflag_code (is_flag_expr e2) (gen_expr e2)
-                           (ungen_expr e2) (Stdlib.Int.succ (Stdlib.Int.succ
-                           rt)))
-                         (unflag_code (is_flag_expr e1) (gen_expr e1)
-                           (ungen_expr e1) (Stdlib.Int.succ rt)))))
-               | _ ->
-                 app (gen_expr e1 (Stdlib.Int.succ rt))
-                   (app (gen_expr e2 (Stdlib.Int.succ (Stdlib.Int.succ rt)))
-                     (app
-                       (cmp_fwd o (Stdlib.Int.succ (Stdlib.Int.succ
-                         (Stdlib.Int.succ rt))) (Stdlib.Int.succ rt)
-                         (Stdlib.Int.succ (Stdlib.Int.succ rt))
-                         (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                         (Stdlib.Int.succ rt)))))
-                       (app ((IXor (rt, (Stdlib.Int.succ (Stdlib.Int.succ
-                         (Stdlib.Int.succ rt))))) :: ((IXor ((Stdlib.Int.succ
-                         (Stdlib.Int.succ (Stdlib.Int.succ rt))),
-                         (Stdlib.Int.succ (Stdlib.Int.succ (Stdlib.Int.succ
-                         rt))))) :: []))
-                         (app
-                           (ungen_expr e2 (Stdlib.Int.succ (Stdlib.Int.succ
-                             rt)))
-                           (ungen_expr e1 (Stdlib.Int.succ rt)))))))
+let ungen_expr e rt =
+  invert_code (gen_expr e rt)
 
 (** val gen_assign : var -> aop -> expr -> code **)
 

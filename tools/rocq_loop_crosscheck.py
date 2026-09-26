@@ -19,7 +19,10 @@ For each of those programs this script
      ANDX of comparisons and `&&` / `||`, in order) of `codegen.py`'s
      *unoptimized* output with the Rocq layout, up to label renaming — i.e.
      that `compile_l` really is `_gen_if` / `_gen_from`'s layout and emits
-     `_gen_binop` / `_gen_uneval_binop`'s operator code.
+     the operator code of `_gen_combine` / `_gen_nonzero` and its reverse
+     (docs/EXPR_LOWERING.md);
+  5. checks that every instruction of the verified code is locally
+     invertible (`pisa.is_wf`), as rocq/Compile.v proves.
 
 The last three programs violate an entry / re-entry / `fi` assertion.  Janus
 rejects them; both compilers jump to `finish` with the flag r3 = 1, which
@@ -39,13 +42,14 @@ import tempfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lexer import tokenize                      # noqa: E402
 from parser import parse                        # noqa: E402
 from codegen import CodeGen, compile_program    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
-                  ORX, ANDX, BRA, BEQ, BNE, START, FINISH, LabeledInstr)
+                  ORX, ANDX, BRA, BEQ, BNE, START, FINISH, LabeledInstr, is_wf)
 
 # Overridable so that a mutated copy of the development can be checked
 # (mutation testing of this script itself).
@@ -141,7 +145,7 @@ def parse_lprog(term: str) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
+                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
                 "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](args)
         else:
@@ -155,6 +159,16 @@ def parse_lprog(term: str) -> list:
                 instr = BNE(f"r{args[0]}", f"r{args[1]}", lab(args[2]))
         out.append(LabeledInstr(label, instr))
     return out
+
+
+def ill_formed(code: list) -> list:
+    """The instructions of `code` that are not locally invertible (`pisa.is_wf`).
+
+    The verified compiler proves every instruction it emits well-formed
+    (rocq/Compile.v `wf_gen_expr`, CompileProc.v `wf_whole`); this re-checks
+    the extracted code against the Python definition.
+    """
+    return [li.instr for li in code if not is_wf(li.instr)]
 
 
 def parse_result(term: str) -> dict:
@@ -199,19 +213,20 @@ def skeleton(code: list) -> list:
 
     SLTX / XORI name their register only when it is a flag register (one
     that is branched on): the value registers of comparisons differ, because
-    Compile.v puts an operator's result in its target register and the
-    operands above it, while `codegen.py` allocates the result after the
-    operands.  ORX / ANDX (`=`, `!=`, `&&`, `||`) are listed by name.
+    Compile.v puts an operator's result in its target register and every
+    temporary above it, while `codegen.py`'s allocator takes the lowest
+    free register (e.g. a variable load's address register sits between
+    its result and value registers).  ORX / ANDX (`||`, `&&`) are listed by
+    name.
     """
     names = {}
 
     def ren(lab):
         return names.setdefault(lab, f"l{len(names)}")
-    # Flag registers: the ones branched on.  `XOR r r` on a flag register is
-    # a layout-level flag clear (what `_gen_from` used to emit) and is kept;
-    # on any other register it is codegen.py's straight-line garbage clear
-    # (`_clear_garbage` / `_nonzero_into` after a binary operator), which
-    # Compile.v's expression code avoids by unevaluating operands instead.
+    # Flag registers: the ones branched on.  A `XOR r r` (a register clear,
+    # not locally invertible) is listed wherever it occurs: neither compiler
+    # emits one any more (docs/EXPR_LOWERING.md), so one on either side is a
+    # layout difference.
     flags = {li.instr.rd for li in code if isinstance(li.instr, (BEQ, BNE))}
     out = []
     for li in code:
@@ -221,7 +236,7 @@ def skeleton(code: list) -> list:
             out.append((lb, "BRA", ren(i.label)))
         elif isinstance(i, (BEQ, BNE)):
             out.append((lb, kind, i.rd, i.rs, ren(i.label)))
-        elif isinstance(i, XOR) and i.rd == i.rs and i.rd in flags:
+        elif isinstance(i, XOR) and i.rd == i.rs:
             out.append((lb, "XOR", i.rd, i.rs))
         elif isinstance(i, XORI):
             out.append((lb, "XORI", i.rd if i.rd in flags else "v", i.c))
@@ -263,6 +278,9 @@ def main() -> int:
         py_mem, py_regs = run_codegen(src)
         if (py_mem, py_regs) != (want["mem"], padded(want["regs"])):
             problems.append(f"codegen.py: {py_mem} {py_regs} != verified")
+        bad = ill_formed(code)
+        if bad:
+            problems.append(f"verified code is not locally invertible (is_wf): {bad}")
         sk_rocq, sk_py = skeleton(code), skeleton(codegen_body(src))
         if sk_rocq != sk_py:
             problems.append(f"layout differs:\n  rocq {sk_rocq}\n  py   {sk_py}")

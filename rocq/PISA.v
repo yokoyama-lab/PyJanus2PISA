@@ -88,12 +88,14 @@ Qed.
 (** ** Instructions
 
     The straight-line fragment of PISA: the arithmetic/logic updates, the
-    memory exchange, [SLTX] (the comparisons, and the normalisation of a
-    non-Boolean `if`/`from` test to [e != 0]; see CompileIf.v), and the two
-    compiler pseudo-instructions [ORX] / [ANDX] with exactly the semantics
-    `pisa_interp.py` gives them (they zero a source register, so they are
-    not reversible; `=`/`!=`/`&&`/`||` use them — Compile.v).  Control flow (BRA/RBRA/BEQ/…) is deliberately absent —
-    see MANIFEST.md for the milestone structure. *)
+    memory exchange, and the three XOR-accumulating instructions [SLTX],
+    [ORX], [ANDX] of Pendulum (and of `pisa_interp.py` since 2026-09):
+    [rd ^= f(rs, rt)].  [SLTX] computes the comparisons and the [e != 0]
+    normalisation of a non-Boolean `if`/`from` test (CompileIf.v); [ORX] /
+    [ANDX] compute [||] / [&&] on 0/1 operands.  With [rd] distinct from
+    [rs] and [rt] each of the three is its own inverse.  Control flow
+    (BRA/RBRA/BEQ/…) is deliberately absent — see PISACtl.v and
+    MANIFEST.md for the milestone structure. *)
 
 Inductive instr : Type :=
 | IAdd  (rd rs : reg)
@@ -105,8 +107,8 @@ Inductive instr : Type :=
 | INeg  (rd : reg)
 | IExch (rd ra : reg)    (** swap register [rd] with the memory cell addressed by [ra] *)
 | ISltx (rd rs rt : reg) (** [rd ^= (rs < rt)]: comparisons, and the [e != 0] normalisation *)
-| IOrx  (rd rs : reg)    (** `pisa_interp.py`'s ORX: [rd := rd lor rs; rs := 0] — NOT reversible *)
-| IAndx (rd1 rd2 rs : reg). (** `pisa_interp.py`'s ANDX: [rd1 ^= rd2 land rs; rd2 := 0] — NOT reversible *)
+| IOrx  (rd rs rt : reg) (** Pendulum ORX:  [rd ^= rs lor rt] *)
+| IAndx (rd rs rt : reg). (** Pendulum ANDX: [rd ^= rs land rt] *)
 
 Definition code := list instr.
 
@@ -129,14 +131,12 @@ Definition step (i : instr) (s : state) : state :=
   | ISltx rd rs rt =>
       mkState (rupd rd (Z.lxor (regs s rd) (if regs s rs <? regs s rt then 1 else 0))
                     (regs s)) (mem s)
-  (* pisa_interp.py: write rd := rd | rs, then write rs := 0 (in this order,
-     so [IOrx r r] leaves r = 0, as there) *)
-  | IOrx rd rs =>
-      mkState (rupd rs 0 (rupd rd (Z.lor (regs s rd) (regs s rs)) (regs s))) (mem s)
-  (* pisa_interp.py: val := rd2 & rs; write rd1 := rd1 ^ val; write rd2 := 0 *)
-  | IAndx rd1 rd2 rs =>
-      mkState (rupd rd2 0 (rupd rd1 (Z.lxor (regs s rd1) (Z.land (regs s rd2) (regs s rs)))
-                                (regs s))) (mem s)
+  (* pisa_interp.py: val := rs | rt; write rd := rd ^ val *)
+  | IOrx rd rs rt =>
+      mkState (rupd rd (Z.lxor (regs s rd) (Z.lor (regs s rs) (regs s rt))) (regs s)) (mem s)
+  (* pisa_interp.py: val := rs & rt; write rd := rd ^ val *)
+  | IAndx rd rs rt =>
+      mkState (rupd rd (Z.lxor (regs s rd) (Z.land (regs s rs) (regs s rt))) (regs s)) (mem s)
   end.
 
 Definition run (c : code) (s : state) : state := fold_left (fun st i => step i st) c s.
@@ -166,27 +166,33 @@ Definition invert_instr (i : instr) : instr :=
   | INeg  rd    => INeg  rd         (* self-inverse *)
   | IExch rd ra => IExch rd ra      (* self-inverse *)
   | ISltx rd rs rt => ISltx rd rs rt  (* self-inverse *)
-  | IOrx  rd rs    => IOrx rd rs      (* codegen.py's _invert_instr; NOT an inverse *)
-  | IAndx a b c    => IAndx a b c     (* likewise: see [orx_not_injective] *)
+  | IOrx  rd rs rt => IOrx  rd rs rt  (* self-inverse *)
+  | IAndx rd rs rt => IAndx rd rs rt  (* self-inverse *)
   end.
 
 Definition invert_code (c : code) : code := rev (map invert_instr c).
 
-(** An instruction is well-formed when its operand registers are distinct.
-    [IAdd rd rd] would compute [rd := 2*rd], which [ISub rd rd] does not undo;
-    [IXor rd rd] would clear [rd] irreversibly; and [IExch rd rd] would use the
-    value being overwritten as its own address. *)
+(** An instruction is well-formed when it is locally invertible.  This is
+    the Rocq counterpart of `pisa.is_wf`, clause by clause:
+
+    - [IAdd]/[ISub]/[IXor rd rs]: [rd <> rs].  [IAdd rd rd] would compute
+      [rd := 2*rd], which [ISub rd rd] does not undo; [IXor rd rd] would
+      clear [rd] irreversibly.
+    - [ISltx]/[IOrx]/[IAndx rd rs rt]: [rd] is neither source, so
+      [rd ^= f(rs, rt)] is self-inverse ([rs = rt] is allowed).
+    - [IExch rd ra]: [rd <> ra] ([IExch rd rd] would use the value being
+      overwritten as its own address) and [rd <> 0].  The second clause is
+      `is_wf`'s: `pisa_interp.py` hard-wires r0 to 0, so [EXCH r0 ra] loses
+      the memory word there.  This model does not hard-wire r0, so
+      [step_invert] does not need the clause; it is kept so that [wf_instr]
+      is exactly `is_wf` on the instructions modelled here.
+    - [IAddi]/[ISubi]/[IXori]/[INeg]: always. *)
 Definition wf_instr (i : instr) : Prop :=
   match i with
-  | IAdd  rd rs | ISub rd rs | IXor rd rs | IExch rd rs => rd <> rs
+  | IAdd  rd rs | ISub rd rs | IXor rd rs => rd <> rs
+  | IExch rd ra => rd <> ra /\ rd <> 0%nat
   | IAddi _ _ | ISubi _ _ | IXori _ _ | INeg _ => True
-  | ISltx rd rs rt => rd <> rs /\ rd <> rt
-  (* ORX / ANDX zero a source register: no operand condition makes them
-     invertible ([orx_not_injective], [andx_not_injective]), so they are
-     never well-formed.  Code containing them (comparisons `=`/`!=`, `&&`,
-     `||`) is proved correct by state equations on the states the compiler
-     actually reaches (Compile.v, [gen_expr_spec]), not by [step_invert]. *)
-  | IOrx _ _ | IAndx _ _ _ => False
+  | ISltx rd rs rt | IOrx rd rs rt | IAndx rd rs rt => rd <> rs /\ rd <> rt
   end.
 
 Definition wf_code (c : code) : Prop := Forall wf_instr c.
@@ -196,8 +202,21 @@ Proof.
   intros; rewrite Z.lxor_assoc, Z.lxor_nilpotent; apply Z.lxor_0_r.
 Qed.
 
-(** Each well-formed instruction is undone by its inverse. *)
-Theorem step_invert : forall i s, wf_instr i -> step (invert_instr i) (step i s) = s.
+(** The operand condition this model needs for local invertibility:
+    [wf_instr] without the [rd <> 0] clause of [IExch] (r0 is not hard-wired
+    here).  Opt.v's [cancels] mirrors `codegen._cancels`, which does not
+    exclude r0 either. *)
+Definition inv_instr (i : instr) : Prop :=
+  match i with
+  | IExch rd ra => rd <> ra
+  | _ => wf_instr i
+  end.
+
+Lemma wf_inv_instr : forall i, wf_instr i -> inv_instr i.
+Proof. intros [] H; cbn in *; tauto. Qed.
+
+(** Each such instruction is undone by its inverse. *)
+Theorem step_invert_inv : forall i s, inv_instr i -> step (invert_instr i) (step i s) = s.
 Proof.
   intros i s Hwf; destruct s as [R M]; destruct i; simpl in *.
   - (* IAdd *) rewrite rupd_same, rupd_other by (now apply not_eq_sym).
@@ -215,56 +234,54 @@ Proof.
   - (* IXori *) rewrite rupd_same, rupd_shadow, xor_involutive. now rewrite rupd_id.
   - (* INeg *) rewrite rupd_same, rupd_shadow.
     replace (- - R rd) with (R rd) by ring. now rewrite rupd_id.
-  - (* IExch *) rewrite rupd_other by (now apply not_eq_sym).
+  - (* IExch *)
+    rewrite rupd_other by (now apply not_eq_sym).
     rewrite mupd_same, rupd_same, rupd_shadow, mupd_shadow.
     now rewrite rupd_id, mupd_id.
   - (* ISltx *) destruct Hwf as [H1 H2].
     rewrite rupd_same, (rupd_other rd rs), (rupd_other rd rt)
       by (now apply not_eq_sym).
     rewrite rupd_shadow, xor_involutive. now rewrite rupd_id.
-  - (* IOrx *) contradiction.
-  - (* IAndx *) contradiction.
+  - (* IOrx *) destruct Hwf as [H1 H2].
+    rewrite rupd_same, (rupd_other rd rs), (rupd_other rd rt)
+      by (now apply not_eq_sym).
+    rewrite rupd_shadow, xor_involutive. now rewrite rupd_id.
+  - (* IAndx *) destruct Hwf as [H1 H2].
+    rewrite rupd_same, (rupd_other rd rs), (rupd_other rd rt)
+      by (now apply not_eq_sym).
+    rewrite rupd_shadow, xor_involutive. now rewrite rupd_id.
 Qed.
 
-(** ORX and ANDX, with `pisa_interp.py`'s semantics, are not injective for
-    ANY choice of operand registers: a state and its successor step to the
-    same state.  So no instruction undoes them — in particular not
-    [invert_instr], which mirrors `codegen.py`'s [_invert_instr]
-    (ORX ↦ ORX, ANDX ↦ ANDX) — and excluding them from [wf_instr] loses
-    nothing. *)
-Lemma orx_src_zero : forall rd rs t, regs t rs = 0 -> step (IOrx rd rs) t = t.
+(** Each well-formed instruction is undone by its inverse. *)
+Theorem step_invert : forall i s, wf_instr i -> step (invert_instr i) (step i s) = s.
+Proof. intros i s H; apply step_invert_inv, wf_inv_instr, H. Qed.
+
+(** ORX / ANDX / SLTX with [rd] among the sources are not invertible: e.g.
+    [ANDX r r r] maps [r] to [r ^ r = 0].  (`pisa.is_wf` rejects them for
+    that reason.) *)
+Example andx_self_not_injective :
+  let s1 := mkState (rupd 3%nat 5 (fun _ => 0)) (fun _ => 0) in
+  let s2 := mkState (fun _ => 0) (fun _ => 0) in
+  s1 <> s2 /\ step (IAndx 3 3 3)%nat s1 = step (IAndx 3 3 3)%nat s2.
 Proof.
-  intros rd rs [R M] H; cbn [step regs mem] in *.
-  rewrite H, Z.lor_0_r, rupd_id. f_equal. rewrite <- H. apply rupd_id.
+  split.
+  - intro H. apply (f_equal (fun s => regs s 3%nat)) in H.
+    cbn [regs] in H. rewrite rupd_same in H. discriminate.
+  - cbn [step regs mem]. rewrite rupd_same, Z.land_diag, Z.lxor_nilpotent.
+    f_equal. rewrite rupd_shadow. apply functional_extensionality; intro r.
+    unfold rupd; destruct (Nat.eqb r 3%nat); reflexivity.
 Qed.
 
-Lemma andx_src_zero : forall rd1 rd2 rs t, regs t rd2 = 0 -> step (IAndx rd1 rd2 rs) t = t.
-Proof.
-  intros rd1 rd2 rs [R M] H; cbn [step regs mem] in *.
-  rewrite H, Z.land_0_l, Z.lxor_0_r, rupd_id. f_equal. rewrite <- H. apply rupd_id.
-Qed.
-
-Lemma orx_not_injective : forall rd rs, exists s1 s2,
-  s1 <> s2 /\ step (IOrx rd rs) s1 = step (IOrx rd rs) s2.
-Proof.
-  intros rd rs.
-  set (s2 := mkState (rupd rs 1 (fun _ => 0)) (fun _ => 0)).
-  exists (step (IOrx rd rs) s2), s2. split.
-  - intro H. apply (f_equal (fun s => regs s rs)) in H.
-    unfold s2 in H; cbn [step regs] in H. rewrite !rupd_same in H. discriminate.
-  - apply orx_src_zero. unfold s2; cbn [step regs]. apply rupd_same.
-Qed.
-
-Lemma andx_not_injective : forall rd1 rd2 rs, exists s1 s2,
-  s1 <> s2 /\ step (IAndx rd1 rd2 rs) s1 = step (IAndx rd1 rd2 rs) s2.
-Proof.
-  intros rd1 rd2 rs.
-  set (s2 := mkState (rupd rd2 1 (fun _ => 0)) (fun _ => 0)).
-  exists (step (IAndx rd1 rd2 rs) s2), s2. split.
-  - intro H. apply (f_equal (fun s => regs s rd2)) in H.
-    unfold s2 in H; cbn [step regs] in H. rewrite !rupd_same in H. discriminate.
-  - apply andx_src_zero. unfold s2; cbn [step regs]. apply rupd_same.
-Qed.
+(** Historical note.  Until 2026-09 this file modelled the compiler
+    pseudo-instructions `pisa_interp.py` then had, [ORX rd rs: rd |= rs;
+    rs := 0] and [ANDX rd1 rd2 rs: rd1 ^= rd2 land rs; rd2 := 0].  Both zero
+    a source register, so they were not injective for any choice of operand
+    registers (the lemmas [orx_not_injective] / [andx_not_injective] of that
+    version exhibited two distinct states with the same successor), were
+    excluded from [wf_instr], and made comparisons and [&&]/[||] irreversible
+    at the instruction level (the former [Compile.compile_not_reversible]).
+    They were replaced by Pendulum's 3-operand XOR-accumulating forms above
+    (docs/EXPR_LOWERING.md §1). *)
 
 Lemma wf_code_app : forall c1 c2, wf_code c1 -> wf_code c2 -> wf_code (c1 ++ c2).
 Proof. intros; now apply Forall_app. Qed.

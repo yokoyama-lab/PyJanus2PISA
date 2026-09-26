@@ -59,7 +59,7 @@ from codegen import CodeGen, compile_program, _proc_label    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
                   ORX, ANDX, BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
-from rocq_loop_crosscheck import skeleton, split_evals   # noqa: E402
+from rocq_loop_crosscheck import skeleton, split_evals, ill_formed   # noqa: E402
 
 ROCQ_DIR = os.environ.get("ROCQ_DIR", os.path.join(ROOT, "rocq"))
 PYJANUS_DIR = os.environ.get(
@@ -191,7 +191,7 @@ def parse_lprog(term: str, np: int) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
+                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
                 "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](a)
         else:
@@ -293,6 +293,10 @@ def main() -> int:
             problems.append(f"verified machine {want['mem']} != source {source}")
         if (py_mem, (py_regs or [None] * 8)[2:]) != (source, [0] * 6):
             problems.append(f"codegen.py: {py_mem} {py_regs} != source {source}")
+        # 3b. every verified instruction is locally invertible (is_wf)
+        bad = ill_formed(code)
+        if bad:
+            problems.append(f"verified code is not locally invertible (is_wf): {bad}")
         # 4. layout: prologue, body skeleton, wrapper
         gen = CodeGen().gen_program(parse(tokenize(src)))
         compared = 0

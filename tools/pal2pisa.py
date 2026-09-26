@@ -16,17 +16,17 @@ PAL constructs and how they are handled
                                   is the program array)
   ``OUTPUT $r`` / ``SHOW $r``     recorded as "Rn = v" lines (PALMachine.output)
   ``START``                       no-op
-  ``RL RR RLV RRV SLLX SRLX SRAX SLLVX SRLVX SRAVX ANDX(3-op) ORX(3-op) NORX
+  ``RL RR RLV RRV SLLX SRLX SRAX SLLVX SRLVX SRAVX NORX
   ANDIX ORIX``                    implemented in PALMachine with phpisa's
                                   semantics (32-bit rotates, XOR-into-dest)
   ``BGTZ BLEZ BLTZ``              NOT supported: PISAMachine.run dispatches
                                   conditionals by class (BEQ/BNE/BGEZ only)
   ``SUBI``                        does not exist in PAL (phpisa has no SUBI)
 
-Note that phpisa's 3-operand ``ANDX $d $s $t`` (d ^= s & t) is NOT
-pisa.ANDX (janus2pisa's ``ANDX rd1 rd2 rs``: rd1 ^= rd2 & rs; rd2 := 0), and
-phpisa's ``ORX $d $s $t`` is not pisa.ORX (rd |= rs; rs := 0).  Separate
-classes ANDX3 / ORX3 are used here.
+phpisa's 3-operand ``ANDX $d $s $t`` (d ^= s & t) and ``ORX $d $s $t``
+(d ^= s | t) are pisa.ANDX / pisa.ORX: since 2026-09 janus2pisa uses the same
+Pendulum semantics (it used to have a clearing 2-operand ORX and a clearing
+ANDX, for which this module needed separate classes).
 
 Usage:  python3 tools/pal2pisa.py file.pal [--max-steps N] [--regs R1=5,...]
 """
@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from pisa import (Instr, LabeledInstr, ADD, SUB, NEG, XOR, ADDI, XORI, EXCH,   # noqa: E402
-                  BRA, RBRA, BEQ, BNE, BGEZ, SWAPBR, DATA, START, FINISH)
+                  ANDX, ORX, BRA, RBRA, BEQ, BNE, BGEZ, SWAPBR, DATA, START, FINISH)
 from pisa_interp import PISAMachine, PISAError                                # noqa: E402
 
 
@@ -56,14 +56,6 @@ class LoadError(Exception):
 @dataclass
 class OUTPUT(Instr):
     rd: str
-
-@dataclass
-class ANDX3(Instr):
-    rd: str; rs: str; rt: str
-
-@dataclass
-class ORX3(Instr):
-    rd: str; rs: str; rt: str
 
 @dataclass
 class NORX(Instr):
@@ -101,10 +93,6 @@ class PALMachine(PISAMachine):
     def _exec_data(self, instr: Instr) -> None:
         if isinstance(instr, OUTPUT):
             self.output.append(f"R{int(instr.rd[1:])} = {self._read_reg(instr.rd)}")
-        elif isinstance(instr, ANDX3):
-            self._write_reg(instr.rd, self._read_reg(instr.rd) ^ (self._read_reg(instr.rs) & self._read_reg(instr.rt)))
-        elif isinstance(instr, ORX3):
-            self._write_reg(instr.rd, self._read_reg(instr.rd) ^ (self._read_reg(instr.rs) | self._read_reg(instr.rt)))
         elif isinstance(instr, NORX):
             self._write_reg(instr.rd, self._read_reg(instr.rd) ^ ~(self._read_reg(instr.rs) | self._read_reg(instr.rt)))
         elif isinstance(instr, ANDIX):
@@ -231,8 +219,8 @@ def parse_pal(text: str) -> Loaded:
             elif op in ("OUTPUT", "SHOW"): ins = OUTPUT(_reg(a[0], lineno))
             elif op == "SUBI":
                 raise LoadError(f"line {lineno}: SUBI is not a PAL instruction (phpisa has no SUBI)")
-            elif op == "ANDX":  ins = ANDX3(_reg(a[0], lineno), _reg(a[1], lineno), _reg(a[2], lineno))
-            elif op == "ORX":   ins = ORX3(_reg(a[0], lineno), _reg(a[1], lineno), _reg(a[2], lineno))
+            elif op == "ANDX":  ins = ANDX(_reg(a[0], lineno), _reg(a[1], lineno), _reg(a[2], lineno))
+            elif op == "ORX":   ins = ORX(_reg(a[0], lineno), _reg(a[1], lineno), _reg(a[2], lineno))
             elif op == "NORX":  ins = NORX(_reg(a[0], lineno), _reg(a[1], lineno), _reg(a[2], lineno))
             elif op == "ANDIX": ins = ANDIX(_reg(a[0], lineno), _reg(a[1], lineno), imm(a[2], lineno, False))
             elif op == "ORIX":  ins = ORIX(_reg(a[0], lineno), _reg(a[1], lineno), imm(a[2], lineno, False))

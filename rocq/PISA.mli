@@ -22,7 +22,7 @@ type instr =
 | INeg of reg
 | IExch of reg * reg
 | ISltx of reg * reg * reg
-| IOrx of reg * reg
+| IOrx of reg * reg * reg
 | IAndx of reg * reg * reg
 
 type code = instr list

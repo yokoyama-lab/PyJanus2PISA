@@ -138,20 +138,6 @@ Fixpoint occurs (x : var) (e : expr) : bool :=
   | Bin _ e1 e2 => orb (occurs x e1) (occurs x e2)
   end.
 
-(** Expressions / statements of the original fragment: [+ - ^] only. *)
-Fixpoint arith_expr (e : expr) : bool :=
-  match e with
-  | Bin o e1 e2 => arith_op o && arith_expr e1 && arith_expr e2
-  | _ => true
-  end.
-
-Fixpoint arith_stmt (st : stmt) : bool :=
-  match st with
-  | Assign _ _ e => arith_expr e
-  | Seq s1 s2 => arith_stmt s1 && arith_stmt s2
-  | _ => true
-  end.
-
 Lemma eval_update_notin : forall x v s e,
   occurs x e = false -> eval (update s x v) e = eval s e.
 Proof.

@@ -1293,6 +1293,45 @@ Proof.
   exists fuel. rewrite Hlen. auto.
 Qed.
 
+(** ** Every line the compiler emits is well-formed (`pisa.is_wf`) *)
+
+Lemma wf_label_first : forall l p, wf_lprog p -> wf_lprog (label_first l p).
+Proof.
+  intros l [| [lo x] t] H; cbn [label_first].
+  - constructor; [cbn; exact I | constructor].
+  - inversion H; subst; constructor; assumption.
+Qed.
+
+Lemma wf_loop_code : forall fin b n e1 e2 pa pb,
+  wf_lprog pa -> wf_lprog pb -> wf_lprog (loop_code fin b n e1 e2 pa pb).
+Proof.
+  intros fin b n e1 e2 pa pb Ha Hb.
+  pose proof (wf_flag_block e1 b). pose proof (wf_flag_block e2 b).
+  pose proof (wf_label_first (n + 3)%nat pa Ha).
+  unfold loop_code; wf_lp.
+Qed.
+
+Theorem wf_compile_l : forall fin st b n p n', b <> 0%nat ->
+  compile_l fin st b n = (p, n') -> wf_lprog p.
+Proof.
+  intro fin.
+  induction st as [s | a IHa c IHc | e1 a IHa c IHc e2 | e1 a IHa c IHc e2];
+    intros b n p n' Hb Hc; simpl in Hc.
+  - injection Hc as <- <-. now apply wf_ops, wf_compile_at.
+  - destruct (compile_l fin a b n) as [p1 n1] eqn:E1.
+    destruct (compile_l fin c b n1) as [p2 n2] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_lprog_app; [exact (IHa b n p1 n1 Hb E1) | exact (IHc b n1 p2 n2 Hb E2)].
+  - destruct (compile_l fin a (S b) (n + 5)%nat) as [pa na] eqn:E1.
+    destruct (compile_l fin c (S b) na) as [pc nc] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_if_code; [exact (IHa (S b) _ _ _ ltac:(lia) E1) | exact (IHc (S b) _ _ _ ltac:(lia) E2)].
+  - destruct (compile_l fin a (S b) (n + 4)%nat) as [pa na] eqn:E1.
+    destruct (compile_l fin c (S b) na) as [pc nc] eqn:E2.
+    injection Hc as <- <-.
+    apply wf_loop_code; [exact (IHa (S b) _ _ _ ltac:(lia) E1) | exact (IHc (S b) _ _ _ ltac:(lia) E2)].
+Qed.
+
 (** ** Violated assertions reach [finish] with a dirty flag
 
     Each theorem below starts the compiled statement in a state from which
@@ -1740,5 +1779,6 @@ Print Assumptions compile_l_program.
 Print Assumptions compile_l_if_violation.
 Print Assumptions compile_l_loop_entry_violation.
 Print Assumptions compile_l_loop_reentry_violation.
+Print Assumptions wf_compile_l.
 Print Assumptions exec_l_rev.
 Print Assumptions steps_relabel.

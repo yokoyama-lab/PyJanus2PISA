@@ -5,8 +5,7 @@ Input dialects
 --------------
   pyjanus  (default)  the text printed by janus2pisa.py / pisa.print_program:
                       ``label: OP rN ...``, registers ``r0..r31``, leading
-                      ``DATA`` words, ``SLTX``/``ORX``/``ANDX`` compiler
-                      pseudo-instructions, ``start: START`` / ``finish: FINISH``.
+                      ``DATA`` words, the ``SLTX`` compiler pseudo-instruction, ``start: START`` / ``finish: FINISH``.
   rfcl                the "PISA-flavoured" 3-operand comma dialect printed by
                       ``python3 -m pyrev_fl.cli rl-to-pisa`` (rfcl):
                       ``XOR R2, R1, R0``, ``ADD R2, #1, R0``, ``EXCH R3, R4``
@@ -21,10 +20,9 @@ The important ones:
   * ``SUBI rd c``           -> ``ADDI $d -c``            (phpisa has no SUBI)
   * ``SLTX rd rs rt``       -> Pendulum branch idiom     (phpisa has no SLTX;
                                ``SUB rs rt; A: BGEZ rs B; XORI rd 1; B: BGEZ rs A; ADD rs rt``)
-  * ``ORX rd rs`` (pyjanus: rd |= rs; rs := 0)
-                            -> ``ANDX $d $d $s; XOR $d $s; XOR $s $s``   (exact)
-  * ``ANDX rd1 rd2 rs`` (pyjanus: rd1 ^= rd2 & rs; rd2 := 0)
-                            -> ``ANDX $d1 $d2 $s; XOR $d2 $d2``         (exact)
+  * ``ORX rd rs rt`` / ``ANDX rd rs rt`` (rd ^= rs | rt / rd ^= rs & rt)
+                            -> ``ORX $d $s $t`` / ``ANDX $d $s $t``     (direct:
+                               both sides use Pendulum's 3-operand semantics)
   * immediates are 11-bit two's complement in phpisa (encoder truncates
     silently!) so ``ADDI``/``XORI`` with |c| > 1023 are expanded: small ones
     into several ``ADDI``, large ones (< 2^32) through a scratch register that
@@ -615,24 +613,14 @@ class Emitter:
                 elif op == "XORI":
                     self.check_r0_write(ins, a[0])
                     self.emit_xori(a[0], int(a[1]), label)
-                elif op == "ORX":                     # pyjanus: rd |= rs ; rs := 0
-                    if len(a) != 2:
-                        raise ConvertError(f"{ins.src.strip()!r}: pyjanus ORX takes 2 registers "
-                                           f"(phpisa's 3-operand ORX has different semantics)")
-                    self.check_r0_write(ins, a[0]); self.check_r0_write(ins, a[1])
-                    d, s = _pal_reg(a[0]), _pal_reg(a[1])
-                    self.emit(f"ANDX {d} {d} {s}", label)   # d ^= d & s      -> d & ~s
-                    self.emit(f"XOR {d} {s}")               # (d & ~s) ^ s    -> d | s
-                    self.emit(f"XOR {s} {s}")               # s := 0 (irreversible, as in pisa_interp)
-                    self.notes.append(f"ORX {a[0]} {a[1]}: pyjanus 'or-and-clear' expanded to ANDX/XOR/XOR")
-                elif op == "ANDX":                    # pyjanus: rd1 ^= rd2 & rs ; rd2 := 0
+                elif op in ("ORX", "ANDX"):          # rd ^= rs | rt  /  rd ^= rs & rt
+                    # Same 3-operand XOR-accumulating semantics as phpisa's
+                    # (Pendulum's) ORX / ANDX, so the mapping is direct.
                     if len(a) != 3:
-                        raise ConvertError(f"{ins.src.strip()!r}: pyjanus ANDX takes 3 registers")
-                    self.check_r0_write(ins, a[0]); self.check_r0_write(ins, a[1])
-                    d1, d2, s = _pal_reg(a[0]), _pal_reg(a[1]), _pal_reg(a[2])
-                    self.emit(f"ANDX {d1} {d2} {s}", label)
-                    self.emit(f"XOR {d2} {d2}")
-                    self.notes.append(f"ANDX {a[0]} {a[1]} {a[2]}: pyjanus 'and-and-clear' expanded to ANDX/XOR")
+                        raise ConvertError(f"{ins.src.strip()!r}: {op} takes 3 registers "
+                                           f"(rd ^= rs {'|' if op == 'ORX' else '&'} rt)")
+                    self.check_r0_write(ins, a[0])
+                    self.emit(f"{op} {_pal_reg(a[0])} {_pal_reg(a[1])} {_pal_reg(a[2])}", label)
                 elif op == "SLTX":
                     self.check_r0_write(ins, a[0])
                     self.emit_sltx(a[0], a[1], a[2], label)
