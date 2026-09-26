@@ -39,11 +39,13 @@ import tempfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lexer import tokenize                      # noqa: E402
 from parser import parse                        # noqa: E402
 from codegen import CodeGen, compile_program    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
+from rocq_legacy import legacy_orx, legacy_andx  # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
                   ORX, ANDX, BRA, BEQ, BNE, START, FINISH, LabeledInstr)
 
@@ -141,8 +143,9 @@ def parse_lprog(term: str) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
-                "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+                # legacy ORX / ANDX of the Rocq model (rocq_legacy.py)
+                "IOrx": lambda a: legacy_orx(f"r{a[0]}", f"r{a[1]}"),
+                "IAndx": lambda a: legacy_andx(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](args)
         else:
             args = [int(a) for a in m.group(7).split()]
@@ -153,7 +156,11 @@ def parse_lprog(term: str) -> list:
                 instr = BEQ(f"r{args[0]}", f"r{args[1]}", lab(args[2]))
             else:
                 instr = BNE(f"r{args[0]}", f"r{args[1]}", lab(args[2]))
-        out.append(LabeledInstr(label, instr))
+        if isinstance(instr, list):             # a legacy expansion
+            out.append(LabeledInstr(label, instr[0]))
+            out.extend(LabeledInstr(None, i) for i in instr[1:])
+        else:
+            out.append(LabeledInstr(label, instr))
     return out
 
 
@@ -209,9 +216,9 @@ def skeleton(code: list) -> list:
         return names.setdefault(lab, f"l{len(names)}")
     # Flag registers: the ones branched on.  `XOR r r` on a flag register is
     # a layout-level flag clear (what `_gen_from` used to emit) and is kept;
-    # on any other register it is codegen.py's straight-line garbage clear
-    # (`_clear_garbage` / `_nonzero_into` after a binary operator), which
-    # Compile.v's expression code avoids by unevaluating operands instead.
+    # on any other register it is a straight-line garbage clear, which
+    # codegen.py no longer emits at all (docs/EXPR_LOWERING.md) and which
+    # the legacy ORX / ANDX expansions of rocq_legacy.py contain.
     flags = {li.instr.rd for li in code if isinstance(li.instr, (BEQ, BNE))}
     out = []
     for li in code:

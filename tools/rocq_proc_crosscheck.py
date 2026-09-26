@@ -58,8 +58,9 @@ from parser import parse                        # noqa: E402
 from codegen import CodeGen, compile_program, _proc_label    # noqa: E402
 from pisa_interp import PISAMachine             # noqa: E402
 from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,  # noqa: E402
-                  ORX, ANDX, BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
+                  BRA, BEQ, BNE, SWAPBR, START, FINISH, LabeledInstr)
 from rocq_loop_crosscheck import skeleton, split_evals   # noqa: E402
+from rocq_legacy import legacy_orx, legacy_andx  # noqa: E402
 
 ROCQ_DIR = os.environ.get("ROCQ_DIR", os.path.join(ROOT, "rocq"))
 PYJANUS_DIR = os.environ.get(
@@ -191,8 +192,9 @@ def parse_lprog(term: str, np: int) -> list:
                 "INeg": lambda a: NEG(f"r{a[0]}"),
                 "IExch": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
                 "ISltx": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-                "IOrx": lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
-                "IAndx": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+                # legacy ORX / ANDX of the Rocq model (rocq_legacy.py)
+                "IOrx": lambda a: legacy_orx(f"r{a[0]}", f"r{a[1]}"),
+                "IAndx": lambda a: legacy_andx(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
             }[op](a)
         else:
             kind = m.group(5)
@@ -205,7 +207,11 @@ def parse_lprog(term: str, np: int) -> list:
                 instr = BNE(f"r{a[0]}", f"r{a[1]}", label_name(a[2], np))
             else:
                 instr = SWAPBR(f"r{a[0]}")
-        out.append(LabeledInstr(label, instr))
+        if isinstance(instr, list):             # a legacy expansion
+            out.append(LabeledInstr(label, instr[0]))
+            out.extend(LabeledInstr(None, i) for i in instr[1:])
+        else:
+            out.append(LabeledInstr(label, instr))
     # the wrapper: `start: START; ADDI r1 k; BRA main; finish: FINISH`
     assert out[-4].label is None and out[-1].label == "finish"
     out[-4] = LabeledInstr("start", START())

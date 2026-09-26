@@ -190,6 +190,20 @@ PROGRAMS = {
                           "    from xs[d] = 0 do xs[d] += 1 loop call q until xs[d] = 2\n"
                           "    xs[d] -= 2\n    d -= 1\n  else\n    skip\n  fi d < 2\n"
                           "procedure main\n  call q\n  call q"),
+    # every comparison on negative / equal / unequal operands, and nested
+    # expressions (the reversible lowering of docs/EXPR_LOWERING.md)
+    "comparisons": ("int a\nint b\nint r\nint s\nint t\nprocedure main\n"
+                    "  a -= 3\n  b += 2\n"
+                    "  r += (a < b) + (a > b) * 2 + (a <= b) * 4 + (a >= b) * 8"
+                    " + (a = b) * 16 + (a != b) * 32\n"
+                    "  s += (a - b) * 3 - (b ^ a) + (a & 6) + (b | 5)\n"
+                    "  t += (a + 3 = 0) + (b - 2 >= 0) * 2 + (0 - a = 3) * 4"),
+    "logical-nested": ("int a\nint b\nint c\nint r\nint i\nprocedure main\n"
+                       "  a += 4\n  b -= 1\n"
+                       "  if ((a > 0) && (b < 0)) || (c != 0) then r += 1 else r += 2 fi r = 1\n"
+                       "  from (i = 0) && (a = 4) do i += 1\n"
+                       "  loop c += (i < 2) + ((a != i) && (b <= 0)) * 10\n"
+                       "  until (i >= 3) || (c > 100)"),
 }
 
 # Divergences that are known compiler bugs rather than test-harness problems.

@@ -219,13 +219,12 @@ class PISAMachine:
             self._write_reg(instr.rd, self._read_reg(instr.rd) - instr.c)
         elif isinstance(instr, XORI):
             self._write_reg(instr.rd, self._read_reg(instr.rd) ^ instr.c)
-        elif isinstance(instr, ORX):
-            self._write_reg(instr.rd, self._read_reg(instr.rd) | self._read_reg(instr.rs))
-            self._write_reg(instr.rs, 0)
-        elif isinstance(instr, ANDX):
-            val = self._read_reg(instr.rd2) & self._read_reg(instr.rs)
-            self._write_reg(instr.rd1, self._read_reg(instr.rd1) ^ val)
-            self._write_reg(instr.rd2, 0)
+        elif isinstance(instr, ORX):      # Pendulum: rd ^= rs | rt
+            val = self._read_reg(instr.rs) | self._read_reg(instr.rt)
+            self._write_reg(instr.rd, self._read_reg(instr.rd) ^ val)
+        elif isinstance(instr, ANDX):     # Pendulum: rd ^= rs & rt
+            val = self._read_reg(instr.rs) & self._read_reg(instr.rt)
+            self._write_reg(instr.rd, self._read_reg(instr.rd) ^ val)
         elif isinstance(instr, SLTX):
             bit = 1 if self._read_reg(instr.rs) < self._read_reg(instr.rt) else 0
             self._write_reg(instr.rd, self._read_reg(instr.rd) ^ bit)

@@ -5,6 +5,10 @@ Implements the 3-category register management from Section 4.5 of the paper:
 - Commit registers: hold values needed later
 - Garbage registers: hold unneeded values, not yet cleared
 
+codegen.py no longer leaves garbage: every expression is uncomputed by
+running its code backwards, and registers are never cleared by `XOR r r`
+(see docs/EXPR_LOWERING.md).  The garbage category is kept for the API only.
+
 Registers:
   r0  = constant 0
   r1  = rsp (stack pointer)

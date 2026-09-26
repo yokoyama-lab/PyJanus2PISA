@@ -815,7 +815,7 @@ class TestPISAAllInstructions(unittest.TestCase):
         self.assertEqual(format_instr(XORI("r3", 1)), "XORI r3 1")
 
     def test_format_orx(self):
-        self.assertEqual(format_instr(ORX("r3", "r4")), "ORX r3 r4")
+        self.assertEqual(format_instr(ORX("r3", "r4", "r5")), "ORX r3 r4 r5")
 
     def test_format_andx(self):
         self.assertEqual(format_instr(ANDX("r3", "r4", "r5")), "ANDX r3 r4 r5")
@@ -984,12 +984,14 @@ class TestCodeGenExpressions(unittest.TestCase):
         self.assertIn("SLTX", types)
         self.assertIn("XORI", types)
 
-    def test_binop_neq_uses_sltx_and_orx(self):
+    def test_binop_neq_uses_two_sltx(self):
+        # a != b  =  (a < b) XOR (b < a): the two bits are exclusive, so no
+        # ORX is needed (and none may clear its operands).
         cg = self._cg()
         code, _ = cg.gen_expr(BinOp('!=', Var('x'), Var('y')))
         types = self._itypes(code)
-        self.assertIn("SLTX", types)
-        self.assertIn("ORX", types)
+        self.assertEqual(types.count("SLTX"), 2)
+        self.assertNotIn("ORX", types)
 
     def test_binop_lt_uses_sltx(self):
         cg = self._cg()
@@ -1869,7 +1871,11 @@ class TestProgramStats(unittest.TestCase):
 
 
 class TestSelfReferenceAssign(unittest.TestCase):
-    """Opt S: x op= x  specialization (no eval/uneval overhead)."""
+    """x op= e with x in e is not Janus and is rejected at compile time.
+
+    It used to be compiled by an `x op= x` special case (Opt S) emitting
+    `ADD rd rd` / `XOR rd rd`, which are not locally invertible (is_wf).
+    """
 
     def _compile(self, src):
         return compile_program(parse(tokenize(src)))
@@ -1881,33 +1887,16 @@ class TestSelfReferenceAssign(unittest.TestCase):
         m.run()
         return dict(m.mem)
 
-    def test_double_x(self):
-        """x += x doubles x."""
-        mem = self._run("int x\nprocedure main\n  x += 5\n  x += x")
+    def test_self_reference_rejected(self):
+        for src in ("x += x", "x -= x", "x ^= x", "x += x + 1",
+                    "x += a[x]", "x -= 2 * x", "x ^= (x = 0)"):
+            with self.subTest(src=src):
+                with self.assertRaises(CodeGenError):
+                    self._compile("int x\nint a[2]\nprocedure main\n  " + src)
+
+    def test_other_variable_still_fine(self):
+        mem = self._run("int x\nint y\nprocedure main\n  y += 5\n  x += y + y")
         self.assertEqual(mem.get(0, 0), 10)
-
-    def test_zero_via_minus(self):
-        """x -= x zeroes x regardless of initial value."""
-        mem = self._run("int x\nprocedure main\n  x += 7\n  x -= x")
-        self.assertEqual(mem.get(0, 0), 0)
-
-    def test_zero_via_xor(self):
-        """x ^= x zeroes x."""
-        mem = self._run("int x\nprocedure main\n  x += 3\n  x ^= x")
-        self.assertEqual(mem.get(0, 0), 0)
-
-    def test_self_ref_fewer_instrs_than_general(self):
-        """x += x (self-ref) generates fewer data instructions than x += y (general)."""
-        src_self = "int x\nprocedure main\n  x += x"
-        src_gen  = "int x\nint y\nprocedure main\n  x += y"
-        s_self = program_stats(self._compile(src_self))["code_instructions"]
-        s_gen  = program_stats(self._compile(src_gen))["code_instructions"]
-        self.assertLess(s_self, s_gen)
-
-    def test_self_ref_roundtrip(self):
-        """Round-trip: x += x followed by x -= x restores x = 0."""
-        mem = self._run("int x\nprocedure main\n  x += 3\n  x += x\n  x -= x")
-        self.assertEqual(mem.get(0, 0), 0)
 
 
 class TestInlineSizeLimit(unittest.TestCase):

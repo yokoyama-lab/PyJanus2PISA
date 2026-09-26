@@ -29,12 +29,14 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lexer import tokenize
 from parser import parse
 from codegen import compile_program
 from pisa_interp import PISAMachine
-from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX, ORX, ANDX,
+from rocq_legacy import legacy_orx, legacy_andx
+from pisa import (ADD, SUB, XOR, ADDI, SUBI, XORI, NEG, EXCH, SLTX,
                   LabeledInstr)
 
 DRIVER = os.path.join(os.path.dirname(__file__), "..", "rocq", "driver")
@@ -50,8 +52,9 @@ _BUILD = {
     "NEG":  lambda a: NEG(f"r{a[0]}"),
     "EXCH": lambda a: EXCH(f"r{a[0]}", f"r{a[1]}"),
     "SLTX": lambda a: SLTX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
-    "ORX":  lambda a: ORX(f"r{a[0]}", f"r{a[1]}"),
-    "ANDX": lambda a: ANDX(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
+    # legacy 2-operand ORX / clearing ANDX of the Rocq model (rocq_legacy.py)
+    "ORX":  lambda a: legacy_orx(f"r{a[0]}", f"r{a[1]}"),
+    "ANDX": lambda a: legacy_andx(f"r{a[0]}", f"r{a[1]}", f"r{a[2]}"),
 }
 
 
@@ -69,7 +72,8 @@ def parse_driver_output(text: str) -> list:
             cur["nvars"] = int(rest)
         elif head == "I":
             op, *args = rest.split()
-            cur["instrs"].append(_BUILD[op]([int(a) for a in args]))
+            built = _BUILD[op]([int(a) for a in args])
+            cur["instrs"].extend(built if isinstance(built, list) else [built])
         elif head == "VAR":
             k, v = rest.split()
             cur["vars"][int(k)] = int(v)

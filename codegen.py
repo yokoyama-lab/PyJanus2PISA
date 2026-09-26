@@ -18,6 +18,7 @@ from pisa import (
     ORX, ANDX, SLTX,
     EXCH, BRA, RBRA, BEQ, BNE, BGEZ, SWAPBR,
     DATA, START, FINISH,
+    is_wf, format_instr,
 )
 from regalloc import RegAlloc
 from inverse import invert_stmt
@@ -25,6 +26,39 @@ from inverse import invert_stmt
 
 _COMPARISONS = ('=', '!=', '<', '>', '<=', '>=')
 _LOGICAL = ('&&', '||')
+
+# `+ - ^`: result combined into the left operand's register, rl op= rr
+# (CodeGen._gen_inplace).
+_INPLACE = {'+': ADD, '-': SUB, '^': XOR}
+
+# The other binary operators: re ^= f(rl, rr) into a fresh zero register re,
+# with re, rl, rr pairwise distinct (CodeGen._gen_combine).  Each block is
+# self-inverse and only reads rl, rr.  For `!=`, (rl < rr) and (rr < rl) are
+# never both 1, so XOR-ing the two bits is their OR.  `&&` / `||` receive 0/1
+# operands (_logical_operands), on which bitwise ANDX / ORX are logical.
+_COMBINE = {
+    '<':  lambda re, a, b: [SLTX(re, a, b)],
+    '>':  lambda re, a, b: [SLTX(re, b, a)],
+    '<=': lambda re, a, b: [SLTX(re, b, a), XORI(re, 1)],
+    '>=': lambda re, a, b: [SLTX(re, a, b), XORI(re, 1)],
+    '!=': lambda re, a, b: [SLTX(re, a, b), SLTX(re, b, a)],
+    '=':  lambda re, a, b: [SLTX(re, a, b), SLTX(re, b, a), XORI(re, 1)],
+    '&&': lambda re, a, b: [ANDX(re, a, b)],
+    '||': lambda re, a, b: [ORX(re, a, b)],
+    '&':  lambda re, a, b: [ANDX(re, a, b)],
+    '|':  lambda re, a, b: [ORX(re, a, b)],
+}
+
+
+def _expr_vars(e: Expr) -> set:
+    """Names of the variables and arrays read by e (indices included)."""
+    if isinstance(e, Var):
+        return {e.name}
+    if isinstance(e, ArrayAccess):
+        return {e.name} | _expr_vars(e.index)
+    if isinstance(e, BinOp):
+        return _expr_vars(e.left) | _expr_vars(e.right)
+    return set()
 
 # Jump target for a violated `fi` or loop assertion (the FINISH of gen_program).
 ASSERT_FAIL_LABEL = "finish"
@@ -52,10 +86,9 @@ def _logical_operands(e: BinOp) -> BinOp:
     result is 0/1.  They are lowered to the bitwise ANDX / ORX, which agree
     only on 0/1 operands (`1 && 2` used to give 1 & 2 = 0, `1 || 2` gave 3).
     Operands that are already 0/1 (comparisons, logical ops, 0/1 constants),
-    the usual case, compile exactly as before.  The others become
-    `operand != 0`, which _gen_nonzero evaluates, uncomputes and cleans up
-    on the spot, so the extra flag costs code but not registers.  gen and
-    uneval must apply the same rewrite.
+    the usual case, are kept.  The others become `operand != 0`, which
+    _gen_nonzero evaluates and uncomputes on the spot, so the extra flag
+    costs code but not registers.
     """
     if e.op in _LOGICAL:
         return BinOp(e.op, _as_flag(e.left), _as_flag(e.right))
@@ -119,13 +152,45 @@ class CodeGen:
         return self._var_offsets[name]
 
     # --- Expression evaluation (Section 4.5) ---
+    #
+    # Every expression is compiled *cleanly* (Axelsen, CC 2011, Sec. 4.5):
+    #
+    #   gen_expr(e) = (code, r)   with r a register allocated for the result.
+    #
+    #   Pre:  r and every free register hold 0.
+    #   Post: r holds the value of e; every other register and all of memory
+    #         are as before.  All temporaries are back in the free pool.
+    #
+    # The value is removed again by `_uneval(code, r)`, i.e. by running the
+    # same code backwards (`_reverse_code`), never by clearing a register.
+    # The caller must keep the memory cells e reads unchanged in between
+    # (Janus: in `x op= e`, x must not occur in e).
+    #
+    # Every emitted instruction satisfies pisa.is_wf (locally invertible).
+    # The lowering of each operator is listed in docs/EXPR_LOWERING.md, which
+    # is the specification for the Rocq model (rocq/Compile.v).
 
     def gen_expr(self, expr: Expr) -> Tuple[List[LabeledInstr], str]:
-        """Evaluate expression into a register.
+        """Evaluate expression into a register (clean; see above).
 
-        Returns (code, result_register).
-        The result register is committed.
+        Returns (code, result_register).  The result register is committed;
+        it is released by `_uneval(code, result_register)`.
         """
+        free_before = set(self.reg.free)
+        code, r = self._gen_expr(expr)
+        leaked = free_before - self.reg.free - {r}
+        if leaked or r not in free_before:          # pragma: no cover
+            raise CodeGenError(
+                f"internal: expression code leaked registers {sorted(leaked)}")
+        return code, r
+
+    def _uneval(self, code: List[LabeledInstr], r: str) -> List[LabeledInstr]:
+        """Uncompute an expression: `code` run backwards clears `r`."""
+        inv = self._reverse_code(code)
+        self.reg.free_reg(r)
+        return inv
+
+    def _gen_expr(self, expr: Expr) -> Tuple[List[LabeledInstr], str]:
         if isinstance(expr, Const):
             return self._gen_const(expr)
         if isinstance(expr, Var):
@@ -171,12 +236,16 @@ class CodeGen:
         return code, rd
 
     def _gen_array_access(self, expr: ArrayAccess) -> Tuple[List[LabeledInstr], str]:
-        """Read array element x[e]."""
+        """Read array element x[e] into a fresh register rd.
+
+        rd is allocated before the index is evaluated, so that it is none of
+        the index code's temporaries: the index is uncomputed (its code run
+        backwards) after the read, and needs those registers to be 0.
+        """
         base_offset = self._var_offset(expr.name)
-        # Evaluate index
+        rd = self.reg.alloc()
         idx_code, ri = self.gen_expr(expr.index)
         ra = self.reg.alloc()
-        rd = self.reg.alloc()
         rv = self.reg.alloc()
         code = list(idx_code)
         code += [
@@ -190,8 +259,7 @@ class CodeGen:
         ]
         self.reg.free_reg(ra)
         self.reg.free_reg(rv)
-        # ri is garbage (from index evaluation) - keep for uncomputation
-        self.reg.to_garbage(ri)
+        code += self._uneval(idx_code, ri)   # index register back to 0
         self.reg.commit_reg(rd)
         return code, rd
 
@@ -223,58 +291,8 @@ class CodeGen:
             if op == '|': return lv | rv
         return None
 
-    def _split_const_mul(self, expr: BinOp, rl: str, rr: str) -> Tuple[str, int]:
-        """For a multiplication, return (value register, constant multiplier).
-
-        PISA has no MUL instruction, and a data-dependent multiply loop cannot
-        be inverted by the straight-line _reverse_code machinery, so at least
-        one operand must be a compile-time constant.
-        """
-        k = self._const_value(expr.right)
-        if k is not None:
-            return rl, k
-        k = self._const_value(expr.left)
-        if k is not None:
-            return rr, k
-        raise CodeGenError(
-            "Multiplication requires a constant operand; "
-            "variable * variable is not supported in PISA codegen"
-        )
-
-    def _gen_const_mul(self, rv: str, k: int) -> Tuple[List[LabeledInstr], str, List[str]]:
-        """Emit `re = rv * k` for a compile-time constant k (shift-and-add).
-
-        `rv` is only read, never written, so the caller's value survives.
-        Returns (code, re, temps), where each temp holds rv*2^i; the caller
-        disposes of them (marks them garbage, or reverses the code to zero
-        them).  Doubling uses a fresh zeroed register and two ADDs rather than
-        `ADD p p`, which is not reversible on PISA.
-        """
-        if abs(k) >= (1 << self.MUL_MAX_BITS):
-            raise CodeGenError(
-                f"Multiplier {k} exceeds {self.MUL_MAX_BITS}-bit limit "
-                f"for constant multiplication"
-            )
-        code: List[LabeledInstr] = []
-        re = self.reg.alloc()
-        temps: List[str] = []
-        n, p = abs(k), rv
-        while n:
-            if n & 1:
-                code.append(self._emit(ADD(re, p)))
-            n >>= 1
-            if n:
-                q = self.reg.alloc()
-                code.append(self._emit(ADD(q, p)))
-                code.append(self._emit(ADD(q, p)))  # q = 2p
-                temps.append(q)
-                p = q
-        if k < 0:
-            code.append(self._emit(NEG(re)))
-        return code, re, temps
-
     def _gen_binop(self, expr: BinOp) -> Tuple[List[LabeledInstr], str]:
-        """Generate code for binary operation."""
+        """Generate code for binary operation (clean; see docs/EXPR_LOWERING.md)."""
         # Constant folding: evaluate at compile time when both operands are constants
         if isinstance(expr.left, Const) and isinstance(expr.right, Const):
             lv, rv, op = expr.left.value, expr.right.value, expr.op
@@ -300,187 +318,153 @@ class CodeGen:
         if _is_nonzero_test(expr):
             return self._gen_nonzero(expr.left)
 
+        op = expr.op
+        if op in _INPLACE:
+            return self._gen_inplace(expr)
+        if op == '*':
+            return self._gen_mul(expr)
+        if op in _COMBINE:
+            return self._gen_combine(expr)
+        raise CodeGenError(f"Unknown operator: {op}")
+
+    def _gen_inplace(self, expr: BinOp) -> Tuple[List[LabeledInstr], str]:
+        """`+`, `-`, `^`: combine into the left operand's register.
+
+        These operators are injective in the left operand for a fixed right
+        operand, so the right operand can be uncomputed at once and the left
+        register simply keeps the result (Axelsen's `rl op= rr`):
+
+            <l -> rl> ; <r -> rr> ; OP rl rr ; <r -> rr>^-1        (rl != rr)
+
+        A compile-time constant right operand k needs no register:
+
+            <l -> rl> ; ADDI/SUBI/XORI rl k       (nothing when k = 0)
+        """
+        code, rl = self.gen_expr(expr.left)
+        k = self._const_value(expr.right)
+        if k is not None:
+            code.extend(self._inplace_imm(expr.op, rl, k))
+            return code, rl
+        right_code, rr = self.gen_expr(expr.right)
+        code.extend(right_code)
+        code.append(self._emit(_INPLACE[expr.op](rl, rr)))
+        code.extend(self._uneval(right_code, rr))
+        return code, rl
+
+    def _inplace_imm(self, op: str, r: str, k: int) -> List[LabeledInstr]:
+        """r := r op k for a constant k (no instruction when k = 0)."""
+        if k == 0:
+            return []
+        if op == '^':
+            return [self._emit(XORI(r, k))]
+        if op == '-':
+            k = -k
+        return [self._emit(ADDI(r, k) if k > 0 else SUBI(r, -k))]
+
+    def _gen_mul(self, expr: BinOp) -> Tuple[List[LabeledInstr], str]:
+        """`e * k` / `k * e` for a compile-time constant k (shift and add).
+
+        PISA has no MUL instruction, and a data-dependent multiply loop cannot
+        be inverted by the straight-line machinery, so one operand must be a
+        compile-time constant.  With n = |k| and p0 = rv, p(i+1) = 2 p(i):
+
+            re                                  ; fresh, allocated first
+            <e -> rv>
+            ADD q1 rv ; ADD q1 rv               ; q1 = 2 rv   (fresh, q1 != rv)
+            ADD q2 q1 ; ADD q2 q1               ; q2 = 4 rv   ... up to the top bit
+            ADD re p(i)       for every bit i set in n
+            NEG re            if k < 0
+            (the doubling chain)^-1             ; q's back to 0
+            <e -> rv>^-1
+
+        `ADD p p` would double in one instruction but is not invertible.
+        k = 0 emits nothing (re is already 0).
+        """
+        k = self._const_value(expr.right)
+        side = expr.left
+        if k is None:
+            k = self._const_value(expr.left)
+            side = expr.right
+        if k is None:
+            raise CodeGenError(
+                "Multiplication requires a constant operand; "
+                "variable * variable is not supported in PISA codegen"
+            )
+        if abs(k) >= (1 << self.MUL_MAX_BITS):
+            raise CodeGenError(
+                f"Multiplier {k} exceeds {self.MUL_MAX_BITS}-bit limit "
+                f"for constant multiplication"
+            )
+        re = self.reg.alloc()
+        self.reg.commit_reg(re)
+        if k == 0:
+            return [], re
+        n = abs(k)
+        val_code, rv = self.gen_expr(side)
+        chain: List[LabeledInstr] = []
+        powers = [rv]
+        for _ in range(n.bit_length() - 1):
+            q = self.reg.alloc()
+            chain.append(self._emit(ADD(q, powers[-1])))
+            chain.append(self._emit(ADD(q, powers[-1])))   # q = 2 * previous
+            powers.append(q)
+        code = list(val_code) + chain
+        for i, p in enumerate(powers):
+            if (n >> i) & 1:
+                code.append(self._emit(ADD(re, p)))
+        if k < 0:
+            code.append(self._emit(NEG(re)))
+        code.extend(self._reverse_code(chain))
+        for q in powers[1:]:
+            self.reg.free_reg(q)
+        code.extend(self._uneval(val_code, rv))
+        return code, re
+
+    def _gen_combine(self, expr: BinOp) -> Tuple[List[LabeledInstr], str]:
+        """Comparisons, `&&`, `||`, `&`, `|`: combine into a fresh register.
+
+            re                                  ; fresh, allocated first
+            <l -> rl> ; <r -> rr>
+            <combine re rl rr>                  ; re ^= f(rl, rr), see _COMBINE
+            <r -> rr>^-1 ; <l -> rl>^-1
+
+        re is allocated before the operands so that it is none of their
+        temporaries (their code is run backwards afterwards and needs those
+        registers to be 0); re, rl, rr are pairwise distinct.  The operands
+        of `&&` / `||` are 0/1 here (`_logical_operands`).
+        """
+        re = self.reg.alloc()
         left_code, rl = self.gen_expr(expr.left)
         right_code, rr = self.gen_expr(expr.right)
         code = list(left_code) + list(right_code)
-
-        op = expr.op
-
-        if op == '+':
-            # Result in rl, rl += rr
-            code.append(self._emit(ADD(rl, rr)))
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(rl)
-            return code, rl
-
-        if op == '-':
-            code.append(self._emit(SUB(rl, rr)))
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(rl)
-            return code, rl
-
-        if op == '^':
-            code.append(self._emit(XOR(rl, rr)))
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(rl)
-            return code, rl
-
-        if op == '*':
-            rv, k = self._split_const_mul(expr, rl, rr)
-            mul_code, re, temps = self._gen_const_mul(rv, k)
-            code.extend(mul_code)
-            for t in temps:
-                self.reg.to_garbage(t)
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op in ('=', '!='):
-            # x = y  →  !(x < y) && !(y < x)
-            # Using SLTX: rd = (rs < rt) ? 1 : 0
-            re = self.reg.alloc()
-            rt = self.reg.alloc()
-            code.append(self._emit(SLTX(re, rl, rr)))   # re = (rl < rr)
-            code.append(self._emit(SLTX(rt, rr, rl)))   # rt = (rr < rl)
-            code.append(self._emit(ORX(re, rt)))         # re |= rt (re = rl!=rr)
-            self.reg.free_reg(rt)
-            if op == '=':
-                code.append(self._emit(XORI(re, 1)))     # flip: re = (rl==rr)
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '<':
-            re = self.reg.alloc()
-            code.append(self._emit(SLTX(re, rl, rr)))
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '>':
-            re = self.reg.alloc()
-            code.append(self._emit(SLTX(re, rr, rl)))  # swap operands
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '<=':
-            # x <= y  ↔  !(y < x)
-            re = self.reg.alloc()
-            code.append(self._emit(SLTX(re, rr, rl)))
-            code.append(self._emit(XORI(re, 1)))
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '>=':
-            re = self.reg.alloc()
-            code.append(self._emit(SLTX(re, rl, rr)))
-            code.append(self._emit(XORI(re, 1)))
-            self.reg.to_garbage(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '&&':
-            re = self.reg.alloc()
-            code.append(self._emit(ANDX(re, rl, rr)))
-            # ANDX zeroes rl as side effect
-            self.reg.to_garbage(rr)
-            self.reg.free_reg(rl)  # ANDX clears rd1
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '||':
-            re = self.reg.alloc()
-            code.append(self._emit(ORX(re, rl)))
-            code.append(self._emit(ORX(re, rr)))
-            # ORX zeroes its source, so rl and rr are clean and can be reused.
-            self.reg.free_reg(rl)
-            self.reg.free_reg(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '&':
-            re = self.reg.alloc()
-            code.append(self._emit(ANDX(re, rl, rr)))
-            self.reg.free_reg(rl)
-            self.reg.to_garbage(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        if op == '|':
-            re = self.reg.alloc()
-            code.append(self._emit(ORX(re, rl)))
-            code.append(self._emit(ORX(re, rr)))
-            # ORX zeroes its source, so rl and rr are clean and can be reused.
-            self.reg.free_reg(rl)
-            self.reg.free_reg(rr)
-            self.reg.commit_reg(re)
-            return code, re
-
-        raise CodeGenError(f"Unknown operator: {op}")
-
-    def _flag_of(self, rf: str, rv: str) -> List[LabeledInstr]:
-        """rf ^= (rv != 0), rv unchanged.  Self-inverse.
-
-        (rv < 0) and (0 < rv) are mutually exclusive, so XOR-ing both SLTX
-        bits adds exactly (rv != 0); no NEG, so INT_MIN is fine under fixed
-        width.  r0 as an SLTX operand is special-cased by the PAL expansion
-        (tools/pisa2pal.py), which never writes it.
-        """
-        return [self._emit(SLTX(rf, rv, "r0")),     # rf ^= (rv < 0)
-                self._emit(SLTX(rf, "r0", rv))]     # rf ^= (0 < rv)
-
-    def _nonzero_into(self, rf: str, e: Expr) -> List[LabeledInstr]:
-        """rf ^= (e != 0), leaving every other register as it was.
-
-        e's value is uncomputed straight away and the garbage its
-        evaluation and uncomputation produced is cleared here, so the flag
-        costs one register.  (The general `!=` path keeps both operands as
-        garbage until the end of the statement, which exhausted the
-        registers for `a && b && c`.)  Self-inverse: running it again with
-        the same e clears rf, which is how the uneval pass uses it.
-        """
-        before = set(self.reg.garbage)
-        code, rv = self.gen_expr(e)
-        code.extend(self._flag_of(rf, rv))
-        code.extend(self._gen_uneval_expr(e, rv))
-        for r in sorted(self.reg.garbage - before, key=lambda r: int(r[1:])):
-            code.append(self._emit(XOR(r, r)))
-            self.reg.free_reg(r)
-        return code
+        code.extend(self._emit(i) for i in _COMBINE[expr.op](re, rl, rr))
+        code.extend(self._uneval(right_code, rr))
+        code.extend(self._uneval(left_code, rl))
+        self.reg.commit_reg(re)
+        return code, re
 
     def _gen_nonzero(self, e: Expr) -> Tuple[List[LabeledInstr], str]:
-        """Evaluate (e != 0) into a fresh register holding only the 0/1 flag."""
+        """Evaluate (e != 0) into a fresh register holding only the 0/1 flag.
+
+            rf                                  ; fresh, allocated first
+            <e -> rv>
+            SLTX rf rv r0                       ; rf ^= (v < 0)
+            SLTX rf r0 rv                       ; rf ^= (0 < v)
+            <e -> rv>^-1
+
+        (v < 0) and (0 < v) are mutually exclusive, so XOR-ing both bits adds
+        exactly (v != 0); no NEG, so INT_MIN is fine under fixed width.  r0 as
+        an SLTX operand is special-cased by the PAL expansion
+        (tools/pisa2pal.py), which never writes it.
+        """
         rf = self.reg.alloc()
-        code = self._nonzero_into(rf, e)
+        val_code, rv = self.gen_expr(e)
+        code = list(val_code)
+        code.append(self._emit(SLTX(rf, rv, "r0")))
+        code.append(self._emit(SLTX(rf, "r0", rv)))
+        code.extend(self._uneval(val_code, rv))
         self.reg.commit_reg(rf)
         return code, rf
-
-    def uneval_expr(self, expr: Expr, result_reg: str) -> List[LabeledInstr]:
-        """Generate code to unevaluate an expression (reverse of gen_expr).
-
-        This clears the result register and any garbage produced during evaluation.
-        Implements the inverse computation for clean translation.
-        """
-        # The inverse of evaluation: run the evaluation code backwards.
-        # For simplicity, re-generate and reverse.
-        # Save register state, generate forward, reverse instructions.
-        fwd_code, _ = self._gen_expr_for_uneval(expr, result_reg)
-        return self._reverse_code(fwd_code)
-
-    def _gen_expr_for_uneval(self, expr: Expr, target_reg: str) -> Tuple[List[LabeledInstr], str]:
-        """Re-generate expression code targeting a specific register for reversal."""
-        # For unevaluation, we generate the same forward code
-        # and then reverse it. This is a simplified approach.
-        # In practice, we track which registers were used during gen_expr.
-        return self.gen_expr(expr)
 
     def _reverse_code(self, code: List[LabeledInstr]) -> List[LabeledInstr]:
         """Reverse a sequence of instructions (run backwards, invert each)."""
@@ -509,11 +493,11 @@ class CodeGen:
         if isinstance(instr, EXCH):
             return EXCH(instr.rd, instr.rs)  # self-inverse
         if isinstance(instr, ORX):
-            return ORX(instr.rd, instr.rs)
+            return ORX(instr.rd, instr.rs, instr.rt)    # self-inverse (is_wf)
         if isinstance(instr, ANDX):
-            return ANDX(instr.rd1, instr.rd2, instr.rs)
+            return ANDX(instr.rd, instr.rs, instr.rt)   # self-inverse (is_wf)
         if isinstance(instr, SLTX):
-            return SLTX(instr.rd, instr.rs, instr.rt)
+            return SLTX(instr.rd, instr.rs, instr.rt)   # self-inverse (is_wf)
         if isinstance(instr, BRA):
             return RBRA(instr.label)
         if isinstance(instr, RBRA):
@@ -521,14 +505,6 @@ class CodeGen:
         if isinstance(instr, SWAPBR):
             return SWAPBR(instr.rd)
         raise CodeGenError(f"Cannot invert instruction: {type(instr).__name__}")
-
-    def _clear_garbage(self) -> List[LabeledInstr]:
-        """Zero all garbage registers (XOR r r → 0) and return them to the free pool."""
-        code = []
-        for r in sorted(self.reg.garbage, key=lambda r: int(r[1:])):
-            code.append(self._emit(XOR(r, r)))
-            self.reg.free_reg(r)
-        return code
 
     # --- Statement code generation ---
 
@@ -573,27 +549,15 @@ class CodeGen:
         """Generate code for x ⊕= e (Fig. 6)."""
         offset = self._var_offset(stmt.var)
 
-        # Self-reference: x op= x.  Avoids the full eval/uneval cycle entirely.
-        #   x += x  →  EXCH rd ra; ADD rd rd; EXCH rd ra  (double in-place)
-        #   x -= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
-        #   x ^= x  →  EXCH rd ra; XOR rd rd; EXCH rd ra  (zero in-place)
-        if isinstance(stmt.expr, Var) and stmt.expr.name == stmt.var:
-            ra = self.reg.alloc()
-            rd = self.reg.alloc()
-            code = []
-            code.append(self._emit(ADDI(ra, offset)))
-            code.append(self._emit(EXCH(rd, ra)))
-            if stmt.op == '+=':
-                code.append(self._emit(ADD(rd, rd)))
-            elif stmt.op in ('-=', '^='):
-                code.append(self._emit(XOR(rd, rd)))
-            else:
-                raise CodeGenError(f"Unknown assign op: {stmt.op}")
-            code.append(self._emit(EXCH(rd, ra)))
-            code.append(self._emit(SUBI(ra, offset)))
-            self.reg.free_reg(ra)
-            self.reg.free_reg(rd)
-            return code
+        # Janus forbids the assigned variable in its own right-hand side:
+        # `x -= x` would zero x (not invertible), and e must still have the
+        # same value when it is uncomputed after the update.  (An `x op= x`
+        # special case used to emit `ADD rd rd` / `XOR rd rd`, which are not
+        # locally invertible.)
+        if stmt.var in _expr_vars(stmt.expr):
+            raise CodeGenError(
+                f"`{stmt.var} {stmt.op} ...`: the assigned variable must not "
+                f"occur in the right-hand side (Janus)")
 
         # Fast path: constant RHS avoids a register and two instructions.
         # x += k  →  EXCH rd ra; ADDI rd k; EXCH rd ra  (no re needed)
@@ -648,266 +612,9 @@ class CodeGen:
         self.reg.free_reg(ra)
         self.reg.free_reg(rd)
 
-        # 7. Unevaluate e (clear re and garbage)
-        uneval_code = self._gen_uneval_expr(stmt.expr, re)
-        code.extend(uneval_code)
-        code.extend(self._clear_garbage())
+        # 7. Unevaluate e: run its code backwards (clears re)
+        code.extend(self._uneval(eval_code, re))
 
-        return code
-
-    def _gen_uneval_expr(self, expr: Expr, result_reg: str) -> List[LabeledInstr]:
-        """Unevaluate expression: reverse the evaluation to clear registers.
-
-        Uses the EXCH-XOR-EXCH pattern in reverse for variables,
-        SUBI for constants, etc.
-        """
-        if isinstance(expr, Const):
-            code = []
-            if expr.value != 0:
-                if expr.value > 0:
-                    code.append(self._emit(SUBI(result_reg, expr.value)))
-                else:
-                    code.append(self._emit(ADDI(result_reg, -expr.value)))
-            self.reg.free_reg(result_reg)
-            return code
-
-        if isinstance(expr, Var):
-            offset = self._var_offset(expr.name)
-            ra = self.reg.alloc()
-            rv = self.reg.alloc()
-            code = [
-                self._emit(ADDI(ra, offset)),
-                self._emit(EXCH(rv, ra)),         # rv = mem[ra]
-                self._emit(XOR(result_reg, rv)),   # clear result_reg (was copy of rv)
-                self._emit(EXCH(rv, ra)),          # restore mem
-                self._emit(SUBI(ra, offset)),
-            ]
-            self.reg.free_reg(ra)
-            self.reg.free_reg(rv)
-            self.reg.free_reg(result_reg)
-            return code
-
-        if isinstance(expr, BinOp):
-            return self._gen_uneval_binop(expr, result_reg)
-
-        if isinstance(expr, ArrayAccess):
-            # Similar to var but with index computation
-            # For now, simplified version
-            return self._gen_uneval_array(expr, result_reg)
-
-        raise CodeGenError(f"Cannot unevaluate: {type(expr)}")
-
-    def _gen_uneval_binop(self, expr: BinOp, result_reg: str) -> List[LabeledInstr]:
-        """Unevaluate binary operation.
-
-        We re-evaluate the operands, undo the operation, then unevaluate operands.
-        For arithmetic ops (+, -, ^) with a constant operand, we skip the register
-        load/unload and use an immediate instruction directly (saves 2 instructions).
-        """
-        expr = _logical_operands(expr)
-        op = expr.op
-
-        if _is_nonzero_test(expr):
-            code = self._nonzero_into(result_reg, expr.left)   # result_reg -> 0
-            self.reg.free_reg(result_reg)
-            return code
-
-        # Fast path for arithmetic with constant operand(s).
-        # Avoids allocating a register and two instructions per const operand.
-        if op in ('+', '-', '^'):
-            left_is_const = isinstance(expr.left, Const)
-            right_is_const = isinstance(expr.right, Const)
-
-            if left_is_const or right_is_const:
-                code = []
-                # Load the non-const side (if any) into a register
-                if not left_is_const:
-                    left_code, rl = self.gen_expr(expr.left)
-                    code.extend(left_code)
-                else:
-                    rl = None
-                if not right_is_const:
-                    right_code, rr = self.gen_expr(expr.right)
-                    code.extend(right_code)
-                else:
-                    rr = None
-
-                kl = expr.left.value  if left_is_const  else None
-                kr = expr.right.value if right_is_const else None
-
-                # Undo: result = left op right  →  result -= right, result -= left  (for +)
-                if op == '+':
-                    # result -= right
-                    if rr is None:
-                        if kr != 0: code.append(self._emit(SUBI(result_reg, kr)))
-                    else:
-                        code.append(self._emit(SUB(result_reg, rr)))
-                    # result -= left
-                    if rl is None:
-                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
-                    else:
-                        code.append(self._emit(SUB(result_reg, rl)))
-                elif op == '-':
-                    # result = left - right  →  result += right; result -= left
-                    if rr is None:
-                        if kr != 0: code.append(self._emit(ADDI(result_reg, kr)))
-                    else:
-                        code.append(self._emit(ADD(result_reg, rr)))
-                    if rl is None:
-                        if kl != 0: code.append(self._emit(SUBI(result_reg, kl)))
-                    else:
-                        code.append(self._emit(SUB(result_reg, rl)))
-                elif op == '^':
-                    if rr is None:
-                        if kr != 0: code.append(self._emit(XORI(result_reg, kr)))
-                    else:
-                        code.append(self._emit(XOR(result_reg, rr)))
-                    if rl is None:
-                        if kl != 0: code.append(self._emit(XORI(result_reg, kl)))
-                    else:
-                        code.append(self._emit(XOR(result_reg, rl)))
-
-                # Unevaluate non-const operands
-                if rr is not None:
-                    code.extend(self._gen_uneval_expr(expr.right, rr))
-                if rl is not None:
-                    code.extend(self._gen_uneval_expr(expr.left, rl))
-                self.reg.free_reg(result_reg)
-                return code
-
-        # General path: re-evaluate left and right to get their values
-        left_code, rl = self.gen_expr(expr.left)
-        right_code, rr = self.gen_expr(expr.right)
-        code = list(left_code) + list(right_code)
-
-        # Undo the operation on result_reg
-        if op == '+':
-            code.append(self._emit(SUB(result_reg, rr)))
-            # Now result_reg should equal rl
-            code.append(self._emit(SUB(result_reg, rl)))
-            # Now result_reg should be 0
-        elif op == '-':
-            code.append(self._emit(ADD(result_reg, rr)))
-            code.append(self._emit(SUB(result_reg, rl)))
-        elif op == '^':
-            code.append(self._emit(XOR(result_reg, rr)))
-            code.append(self._emit(XOR(result_reg, rl)))
-        elif op == '*':
-            # Recompute the product into a temp, subtract it to zero result_reg,
-            # then run the product code backwards to zero the temp and its chain.
-            rv, k = self._split_const_mul(expr, rl, rr)
-            mul_code, sub_re, temps = self._gen_const_mul(rv, k)
-            code.extend(mul_code)
-            code.append(self._emit(SUB(result_reg, sub_re)))
-            code.extend(self._reverse_code(mul_code))
-            for t in temps:
-                self.reg.free_reg(t)
-            self.reg.free_reg(sub_re)
-        elif op == '<':
-            sub_re = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rl, rr)))
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op == '>':
-            sub_re = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rr, rl)))
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op == '<=':
-            sub_re = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rr, rl)))
-            code.append(self._emit(XORI(sub_re, 1)))
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op == '>=':
-            sub_re = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rl, rr)))
-            code.append(self._emit(XORI(sub_re, 1)))
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op == '=':
-            sub_re = self.reg.alloc()
-            sub_rt = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rl, rr)))
-            code.append(self._emit(SLTX(sub_rt, rr, rl)))
-            code.append(self._emit(ORX(sub_re, sub_rt)))
-            self.reg.free_reg(sub_rt)
-            code.append(self._emit(XORI(sub_re, 1)))
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op == '!=':
-            sub_re = self.reg.alloc()
-            sub_rt = self.reg.alloc()
-            code.append(self._emit(SLTX(sub_re, rl, rr)))
-            code.append(self._emit(SLTX(sub_rt, rr, rl)))
-            code.append(self._emit(ORX(sub_re, sub_rt)))
-            self.reg.free_reg(sub_rt)
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        elif op in ('&&', '&'):
-            # ANDX zeroes rd2; copy rl to a temp to preserve it for subsequent uneval
-            rl_copy = self.reg.alloc()
-            code.append(self._emit(XOR(rl_copy, rl)))  # rl_copy = rl_val (rl unchanged)
-            sub_re = self.reg.alloc()
-            code.append(self._emit(ANDX(sub_re, rl_copy, rr)))  # sub_re ^= rl_copy & rr; rl_copy = 0
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-            self.reg.free_reg(rl_copy)
-        elif op in ('||', '|'):
-            # ORX zeroes its source register; copy rl and rr to temps to preserve
-            # their values for the subsequent uneval calls (same pattern as && / &).
-            rl_copy = self.reg.alloc()
-            rr_copy = self.reg.alloc()
-            sub_re = self.reg.alloc()
-            code.append(self._emit(XOR(rl_copy, rl)))      # rl_copy = rl_val (rl unchanged)
-            code.append(self._emit(ORX(sub_re, rl_copy)))  # sub_re |= rl_copy; rl_copy = 0
-            self.reg.free_reg(rl_copy)
-            code.append(self._emit(XOR(rr_copy, rr)))      # rr_copy = rr_val (rr unchanged)
-            code.append(self._emit(ORX(sub_re, rr_copy)))  # sub_re |= rr_copy; rr_copy = 0
-            self.reg.free_reg(rr_copy)
-            code.append(self._emit(XOR(result_reg, sub_re)))
-            code.append(self._emit(XOR(sub_re, sub_re)))   # zero sub_re before freeing
-            self.reg.free_reg(sub_re)
-        else:
-            raise CodeGenError(f"Cannot unevaluate operator: {op}")
-
-        # Unevaluate right, then left
-        right_uneval = self._gen_uneval_expr(expr.right, rr)
-        left_uneval = self._gen_uneval_expr(expr.left, rl)
-        code.extend(right_uneval)
-        code.extend(left_uneval)
-
-        self.reg.free_reg(result_reg)
-        return code
-
-    def _gen_uneval_array(self, expr: ArrayAccess, result_reg: str) -> List[LabeledInstr]:
-        """Unevaluate array access."""
-        base_offset = self._var_offset(expr.name)
-        idx_code, ri = self.gen_expr(expr.index)
-        ra = self.reg.alloc()
-        rv = self.reg.alloc()
-        code = list(idx_code)
-        code += [
-            self._emit(ADDI(ra, base_offset)),
-            self._emit(ADD(ra, ri)),
-            self._emit(EXCH(rv, ra)),
-            self._emit(XOR(result_reg, rv)),
-            self._emit(EXCH(rv, ra)),
-            self._emit(SUB(ra, ri)),
-            self._emit(SUBI(ra, base_offset)),
-        ]
-        self.reg.free_reg(ra)
-        self.reg.free_reg(rv)
-        idx_uneval = self._gen_uneval_expr(expr.index, ri)
-        code.extend(idx_uneval)
-        self.reg.free_reg(result_reg)
         return code
 
     def _gen_assign_arr(self, stmt: AssignArr) -> List[LabeledInstr]:
@@ -943,18 +650,15 @@ class CodeGen:
         code.append(self._emit(EXCH(rd, ra)))
         self.reg.free_reg(rd)
 
-        # 7. Unevaluate e2
-        uneval_e2 = self._gen_uneval_expr(stmt.expr, re)
-        code.extend(uneval_e2)
+        # 7. Unevaluate e2 (its code backwards; rd is 0 again)
+        code.extend(self._uneval(eval_code, re))
 
         # 8-9. Clear address and unevaluate index
         code.append(self._emit(SUB(ra, ri)))
         code.append(self._emit(SUBI(ra, base_offset)))
         self.reg.free_reg(ra)
 
-        uneval_idx = self._gen_uneval_expr(stmt.idx, ri)
-        code.extend(uneval_idx)
-        code.extend(self._clear_garbage())
+        code.extend(self._uneval(idx_code, ri))
 
         return code
 
@@ -968,14 +672,15 @@ class CodeGen:
             ra = self.reg.alloc()
             addr_code = [self._emit(ADDI(ra, offset))]
             ri = None
+            idx_code: List[LabeledInstr] = []
             if idx_expr is not None:
                 idx_code, ri = self.gen_expr(idx_expr)
                 addr_code = list(idx_code) + addr_code
                 addr_code.append(self._emit(ADD(ra, ri)))
-            return addr_code, ra, ri
+            return addr_code, ra, ri, idx_code
 
-        lhs_code, la, li = get_addr(stmt.lhs, stmt.lhs_idx)
-        rhs_code, ra2, ri2 = get_addr(stmt.rhs, stmt.rhs_idx)
+        lhs_code, la, li, lhs_idx_code = get_addr(stmt.lhs, stmt.lhs_idx)
+        rhs_code, ra2, ri2, rhs_idx_code = get_addr(stmt.rhs, stmt.rhs_idx)
 
         code.extend(lhs_code)
         code.extend(rhs_code)
@@ -1000,8 +705,7 @@ class CodeGen:
         code.append(self._emit(SUBI(ra2, rhs_offset)))
         self.reg.free_reg(ra2)
         if ri2 is not None:
-            uneval_ri2 = self._gen_uneval_expr(stmt.rhs_idx, ri2)
-            code.extend(uneval_ri2)
+            code.extend(self._uneval(rhs_idx_code, ri2))
 
         if li is not None:
             code.append(self._emit(SUB(la, li)))
@@ -1009,9 +713,7 @@ class CodeGen:
         code.append(self._emit(SUBI(la, lhs_offset)))
         self.reg.free_reg(la)
         if li is not None:
-            uneval_li = self._gen_uneval_expr(stmt.lhs_idx, li)
-            code.extend(uneval_li)
-        code.extend(self._clear_garbage())
+            code.extend(self._uneval(lhs_idx_code, li))
 
         return code
 
@@ -1232,8 +934,7 @@ class CodeGen:
         eval_code, re = self.gen_expr(e)
         code = list(eval_code)
         code.append(self._emit(XOR(rt, re)))
-        code.extend(self._gen_uneval_expr(e, re))
-        code.extend(self._clear_garbage())
+        code.extend(self._uneval(eval_code, re))
         return code
 
     # --- Procedure code generation (Fig. 5) ---
@@ -1742,11 +1443,30 @@ def remove_unused_labels(code: List[LabeledInstr]) -> List[LabeledInstr]:
     ]
 
 
+def check_wf(code: List[LabeledInstr], stage: str = "") -> None:
+    """Raise CodeGenError unless every instruction satisfies pisa.is_wf.
+
+    compile_program calls this on the unoptimised and the optimised code, so
+    a lowering that emits a non-invertible instruction (`XOR r r`, `ADD r r`,
+    `SLTX r r s`, ...) fails at compile time instead of silently producing a
+    program that is reversible only as a whole, or not at all.
+    """
+    bad = [(i, format_instr(li.instr)) for i, li in enumerate(code)
+           if not is_wf(li.instr)]
+    if bad:
+        shown = ", ".join(f"#{i} {t}" for i, t in bad[:5])
+        raise CodeGenError(
+            f"internal: {len(bad)} instruction(s) not locally invertible"
+            f"{' (' + stage + ')' if stage else ''}: {shown}")
+
+
 def compile_program(prog: Program) -> List[LabeledInstr]:
     """Compile a Janus Program AST to PISA instructions."""
     cg = CodeGen()
     code = cg.gen_program(prog)
+    check_wf(code, "unoptimised")
     code = peephole(code)
     code = remove_nops(code)
     code = remove_unused_labels(code)
+    check_wf(code, "optimised")
     return code
